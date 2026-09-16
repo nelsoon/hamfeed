@@ -53,18 +53,33 @@ impl std::fmt::Display for SttErr {
     }
 }
 
+/// Default whisper initial prompt: bilingual (FR/EN) amateur-repeater
+/// context. Steers the decoder toward callsigns, NATO words, and Q codes
+/// instead of same-sounding everyday words. Overridable via
+/// `[stt] initial_prompt`; pass `None` to [`Transcriber::open`] for this.
+pub const DEFAULT_INITIAL_PROMPT: &str = "VE2DEM, Victor Echo Two Delta \
+    Echo Mike, bonsoir, je vous reçois cinq neuf, QTH Montréal, 73, à la \
+    prochaine, over. Yeah, good evening, thanks for the call, QSB tonight, \
+    seventy-three.";
+
 /// Local transcriber bound to one model file + language whitelist.
 pub struct Transcriber {
     ctx: WhisperContext,
     whitelist: Vec<String>,
     threads: usize,
+    prompt: String,
 }
 
 impl Transcriber {
     /// Open `model_path` (ggml whisper model). A missing file returns
     /// [`SttErr::ModelMissing`] with download + drop-in instructions —
     /// the pipeline turns this into a loud startup refusal (S11).
-    pub fn open(model_path: &Path, whitelist: &[String]) -> Result<Self, SttErr> {
+    /// `prompt` overrides [`DEFAULT_INITIAL_PROMPT`] (`None` keeps it).
+    pub fn open(
+        model_path: &Path,
+        whitelist: &[String],
+        prompt: Option<&str>,
+    ) -> Result<Self, SttErr> {
         if !model_path.exists() {
             return Err(SttErr::ModelMissing(hamfeed_config::missing_model_hint(
                 &model_path.to_string_lossy(),
@@ -80,6 +95,7 @@ impl Transcriber {
             ctx,
             whitelist: whitelist.to_vec(),
             threads,
+            prompt: prompt.unwrap_or(DEFAULT_INITIAL_PROMPT).to_string(),
         })
     }
 
@@ -117,8 +133,10 @@ impl Transcriber {
             });
         }
 
-        // Constrained decode in the detected language; never translate.
+        // Constrained decode in the detected language; never translate. The
+        // initial prompt biases vocabulary toward repeater traffic.
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_initial_prompt(&self.prompt);
         params.set_n_threads(self.threads as std::ffi::c_int);
         params.set_language(Some(&lang));
         params.set_translate(false);
@@ -313,7 +331,8 @@ pub(crate) fn test_transcriber() -> Transcriber {
             path.display()
         );
     }
-    Transcriber::open(&path, &["fr".to_string(), "en".to_string()]).expect("test model must load")
+    Transcriber::open(&path, &["fr".to_string(), "en".to_string()], None)
+        .expect("test model must load")
 }
 
 #[cfg(test)]
@@ -344,6 +363,21 @@ mod tests {
         let t = test_transcriber();
         let out = t.transcribe(&fixture("fr.ogg")).expect("fr transcribes");
         assert_eq!(out.lang, "fr", "lang must be fr, got {}", out.lang);
+        assert!(!out.transcript.is_empty(), "transcript must be non-empty");
+    }
+
+    #[test]
+    fn custom_prompt_transcribes() {
+        // A custom initial prompt must flow into the decoder without
+        // breaking it: same fixture, still English, still non-empty.
+        let from_env = std::env::var("HAMFEED_TEST_MODEL").ok();
+        let fallback =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/ggml-tiny.bin");
+        let path = from_env.map(std::path::PathBuf::from).unwrap_or(fallback);
+        let t = Transcriber::open(&path, &["en".to_string()], Some("VE2ABC net, over"))
+            .expect("prompted model must load");
+        let out = t.transcribe(&fixture("en.ogg")).expect("en transcribes");
+        assert_eq!(out.lang, "en", "lang must be en, got {}", out.lang);
         assert!(!out.transcript.is_empty(), "transcript must be non-empty");
     }
 
@@ -380,11 +414,14 @@ mod tests {
 
     #[test]
     fn missing_model_is_loud() {
-        let err =
-            match Transcriber::open(Path::new("/nonexistent/ggml-tiny.bin"), &["fr".to_string()]) {
-                Ok(_) => panic!("must refuse a missing model"),
-                Err(e) => e,
-            };
+        let err = match Transcriber::open(
+            Path::new("/nonexistent/ggml-tiny.bin"),
+            &["fr".to_string()],
+            None,
+        ) {
+            Ok(_) => panic!("must refuse a missing model"),
+            Err(e) => e,
+        };
         match err {
             SttErr::ModelMissing(hint) => {
                 assert!(hint.contains("scripts/download-model.sh"));
