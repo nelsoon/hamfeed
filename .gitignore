@@ -1,0 +1,15 @@
+# Rust artifacts
+/target/
+# Runtime data (never commit)
+/spill/
+*.db
+*.db-journal
+*.tmp
+# Local models + databases (download helper or manual drop-in; see docs)
+/models/
+# Regenerable fixture sources (re-downloaded by the fixture gen script);
+# the encoded en/fr.ogg fixtures themselves ARE committed.
+/crates/hamfeed-stt/tests/fixtures/.src/
+# Local overrides
+hamfeed.toml
+.env

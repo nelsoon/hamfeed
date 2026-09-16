@@ -1,0 +1,13 @@
+[package]
+name = "hamfeed-stt"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hamfeed-config = { path = "../hamfeed-config" }
+hamfeed-ingest = { path = "../hamfeed-ingest", features = ["opus"] }
+whisper-rs = "0.13"
+
+[dev-dependencies]
+minimp3 = "0.6"

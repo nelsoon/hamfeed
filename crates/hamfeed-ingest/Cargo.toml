@@ -1,0 +1,17 @@
+[package]
+name = "hamfeed-ingest"
+version.workspace = true
+edition.workspace = true
+
+[features]
+opus = ["dep:audiopus", "dep:ogg"]
+capture = ["dep:rubato"]
+
+[dependencies]
+anyhow.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+audiopus = { version = "0.2", optional = true }
+ogg = { version = "0.9", optional = true }
+rubato = { version = "5", optional = true }

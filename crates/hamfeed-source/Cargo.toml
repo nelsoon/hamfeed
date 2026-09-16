@@ -1,0 +1,12 @@
+[package]
+name = "hamfeed-source"
+version.workspace = true
+edition.workspace = true
+
+[features]
+capture = ["dep:cpal"]
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+cpal = { version = "0.15", optional = true }

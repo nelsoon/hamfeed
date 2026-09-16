@@ -1,0 +1,25 @@
+[package]
+name = "hamfeed-web"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs"] }
+futures-core = "0.3"
+futures-util = "0.3"
+hamfeed-store = { path = "../hamfeed-store" }
+hamfeed-pipeline = { path = "../hamfeed-pipeline" }
+
+[dev-dependencies]
+hamfeed-config = { path = "../hamfeed-config" }
+hamfeed-source = { path = "../hamfeed-source" }
+hamfeed-ingest = { path = "../hamfeed-ingest", features = ["opus"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-manual-roots",
+] }

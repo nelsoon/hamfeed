@@ -1,0 +1,16 @@
+[package]
+name = "hamfeed-pipeline"
+version.workspace = true
+edition.workspace = true
+
+[features]
+capture = ["hamfeed-source/capture"]
+
+[dependencies]
+anyhow.workspace = true
+uuid.workspace = true
+hamfeed-config = { path = "../hamfeed-config" }
+hamfeed-source = { path = "../hamfeed-source" }
+hamfeed-ingest = { path = "../hamfeed-ingest", features = ["opus"] }
+hamfeed-stt = { path = "../hamfeed-stt" }
+hamfeed-store = { path = "../hamfeed-store" }

@@ -1,0 +1,72 @@
+# hamfeed CI: Rust (cheap -> costly). Promoted from private template (T2).
+# Chain: fmt -> clippy -> build -> test. System deps for cpal (ALSA)
+# and audiopus (libopus) come from apt. STT tests need a whisper model:
+# cached across runs, fetched by scripts/download-model.sh on miss.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MODEL_SIZE: tiny
+  MODEL_DIR: models
+
+jobs:
+  fmt: # seconds: rustfmt check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy: # tens of seconds: lint, needs build info
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install system deps
+        run: sudo apt-get update -y && sudo apt-get install -y libasound2-dev libopus-dev cmake
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  build: # minutes: compile (whisper.cpp + sqlite bundled land here)
+    needs: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system deps
+        run: sudo apt-get update -y && sudo apt-get install -y libasound2-dev libopus-dev cmake
+      - run: cargo build --locked --all-features
+
+  test: # most expensive: unit + integration tests (fixture-backed, no hardware)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system deps
+        run: sudo apt-get update -y && sudo apt-get install -y libasound2-dev libopus-dev cmake
+      - name: Restore whisper model cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MODEL_DIR }}
+          key: whisper-${{ env.MODEL_SIZE }}-v1
+      - name: Fetch whisper model (cache miss)
+        run: sh scripts/download-model.sh "${{ env.MODEL_SIZE }}" "${{ env.MODEL_DIR }}"
+      - run: cargo test --locked --all-features
+
+  # ai-review: runs only on green code (needs: test). Wire a reviewer action
+  # here. Human review stays last via branch protection on main.

@@ -1,0 +1,29 @@
+# hamfeed.toml (example — copy to hamfeed.toml and adjust; real file is gitignored)
+
+[audio]
+device = "default"
+sample_rate = 16000
+
+[vad]
+engine = "energy"
+hang_ms = 800
+[vad.profiles.repeater]
+hang_ms = 800
+[vad.profiles.simplex]
+hang_ms = 1200
+
+[segment]
+max_s = 120
+
+[stt]
+model_path = "models/whisper-small.bin"
+lang_whitelist = ["fr", "en"]
+
+[storage]
+dir = "./data/audio"
+db_path = "./data/hamfeed.db"
+retention_days = 90
+delete_audio_on_drop = false
+
+[station]
+freq_label = "REPEATER-XXX.XXX"

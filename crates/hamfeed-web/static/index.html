@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hamfeed — live feed</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="filterbar">
+    <input type="search" id="q" placeholder="Search history" aria-label="Search history">
+    <input type="date" id="from" aria-label="From date">
+    <input type="date" id="to" aria-label="To date">
+    <label><input type="checkbox" id="hidenoise"> hide noise</label>
+    <button class="apply" id="apply">Search</button>
+    <button class="paused" id="pause" aria-pressed="false">pause live</button>
+    <button class="pill-live" id="jumpLive"></button>
+  </div>
+  <div id="feed"></div>
+  <div class="more-wrap"><button id="more" style="display:none">load more</button></div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
