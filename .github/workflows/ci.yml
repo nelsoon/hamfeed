@@ -1,7 +1,6 @@
-# hamfeed CI: Rust (cheap -> costly). Promoted from private template (T2).
-# Chain: fmt -> clippy -> build -> test. System deps for cpal (ALSA)
-# and audiopus (libopus) come from apt. STT tests need a whisper model:
-# cached across runs, fetched by scripts/download-model.sh on miss.
+# hamfeed CI: Rust (cheap -> costly). From the private template
+# (projects/example/templates/ci-rust.yml) + audio system deps, whisper
+# model cache, and a static-UI check. Chain: fmt -> clippy -> build -> test.
 name: ci
 on:
   pull_request:
@@ -16,6 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  SYSTEM_DEPS: "libasound2-dev libopus-dev cmake"
   MODEL_SIZE: tiny
   MODEL_DIR: models
 
@@ -29,6 +29,13 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  static: # seconds: feed UI syntax (no browser needed; Rust tests cover serving)
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --check crates/hamfeed-web/static/app.js
+
   clippy: # tens of seconds: lint, needs build info
     needs: fmt
     runs-on: ubuntu-latest
@@ -37,8 +44,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Prepare apt cache dir
+        run: |
+          sudo mkdir -p /var/cache/apt/archives/partial
+          sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives
+      - name: Cache apt archives
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Install system deps
-        run: sudo apt-get update -y && sudo apt-get install -y libasound2-dev libopus-dev cmake
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends $SYSTEM_DEPS
+      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   build: # minutes: compile (whisper.cpp + sqlite bundled land here)
@@ -47,8 +66,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare apt cache dir
+        run: |
+          sudo mkdir -p /var/cache/apt/archives/partial
+          sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives
+      - name: Cache apt archives
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Install system deps
-        run: sudo apt-get update -y && sudo apt-get install -y libasound2-dev libopus-dev cmake
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends $SYSTEM_DEPS
+      - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --all-features
 
   test: # most expensive: unit + integration tests (fixture-backed, no hardware)
@@ -57,8 +88,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare apt cache dir
+        run: |
+          sudo mkdir -p /var/cache/apt/archives/partial
+          sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives
+      - name: Cache apt archives
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Install system deps
-        run: sudo apt-get update -y && sudo apt-get install -y libasound2-dev libopus-dev cmake
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends $SYSTEM_DEPS
+      - uses: Swatinem/rust-cache@v2
       - name: Restore whisper model cache
         uses: actions/cache@v4
         with:

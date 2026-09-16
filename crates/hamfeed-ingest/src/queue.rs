@@ -67,6 +67,11 @@ impl IngestQueue {
         self.items.pop_front()
     }
 
+    /// Drop any queued item with `id` (e.g. operator dropped it mid-flight).
+    pub fn remove(&mut self, id: &str) {
+        self.items.retain(|i| i.id != id);
+    }
+
     pub fn drain(&mut self) -> Vec<QueueItem> {
         self.items.drain(..).collect()
     }

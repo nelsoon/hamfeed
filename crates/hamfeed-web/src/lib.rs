@@ -501,6 +501,46 @@ freq_label = "TEST"
     }
 
     #[tokio::test]
+    async fn static_ui_serves() {
+        // The approved feed UI serves with its markers intact (frontend
+        // regression net: runs in CI, no browser needed).
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        // NOTE: test_server points static_dir at an empty temp dir, so seed
+        // the approved files for this test.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static");
+        let dst = _h.dir.join("static");
+        std::fs::create_dir_all(&dst).unwrap();
+        for f in ["index.html", "app.js", "style.css"] {
+            std::fs::copy(src.join(f), dst.join(f)).unwrap();
+        }
+        let index = client
+            .get(format!("{base}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(index.contains("id=\"feed\""), "feed root must serve");
+        assert!(index.contains("/app.js"), "bundle reference must serve");
+        for asset in ["app.js", "style.css"] {
+            let r = client.get(format!("{base}/{asset}")).send().await.unwrap();
+            assert_eq!(r.status(), 200, "{asset} must serve");
+        }
+        let js = client
+            .get(format!("{base}/app.js"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(js.contains("/api/events"), "SSE wiring must ship");
+        assert!(js.contains("/api/messages"), "REST wiring must ship");
+    }
+
+    #[tokio::test]
     async fn status_and_search() {
         let (base, _h) = test_server().await;
         let client = reqwest::Client::new();

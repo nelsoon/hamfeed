@@ -183,6 +183,13 @@ impl Pipeline {
     /// Web helper: [`drop_with_config`] resolves the config default.
     pub fn set_triage(&mut self, id: &str, action: TriageAction) -> Result<()> {
         match &action {
+            TriageAction::Drop { .. } => {
+                self.store.set_triage(id, &action)?;
+                // A retry may still be queued or draining: the row stays
+                // dropped (upsert skips dropped rows) and the queue entry
+                // goes away so it is never re-processed.
+                self.queue.remove(id);
+            }
             TriageAction::Retry => {
                 self.store.set_triage(id, &TriageAction::Retry)?;
                 let msg: Message = self

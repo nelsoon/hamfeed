@@ -215,7 +215,8 @@ impl Store {
               audio_path=excluded.audio_path,
               duration_ms=excluded.duration_ms,
               size_bytes=excluded.size_bytes,
-              short_flag=excluded.short_flag",
+              short_flag=excluded.short_flag
+             WHERE messages.status <> 'dropped'",
             rusqlite::params![
                 m.id,
                 m.ts_start_ms as i64,
@@ -667,6 +668,48 @@ mod tests {
         }
         assert_eq!(seen.len(), 6);
         assert_eq!(seen[0], "m-fr-ok");
+    }
+
+    #[test]
+    fn upsert_keeps_drop() {
+        // A late re-transcription must never resurrect a dropped row: the
+        // operator's drop wins over an in-flight retry drain.
+        let store = Store::open_memory().unwrap();
+        seed_messages(&store);
+        store
+            .set_triage(
+                "m-fr-ok",
+                &TriageAction::Drop {
+                    delete_audio: false,
+                },
+            )
+            .unwrap();
+        let mut msg = store.get("m-fr-ok").unwrap().unwrap();
+        assert_eq!(msg.status, "dropped");
+        store
+            .upsert(&NewMessage {
+                id: msg.id.clone(),
+                ts_start_ms: msg.ts_start_ms,
+                ts_end_ms: msg.ts_end_ms,
+                freq_label: msg.freq_label.clone(),
+                lang: "en".into(),
+                lang_conf: 1.0,
+                transcript: "late re-transcription".into(),
+                stt_conf: 1.0,
+                conf_flag: "ok".into(),
+                status: "ok".into(),
+                fail_reason: None,
+                audio_path: msg.audio_path.clone(),
+                duration_ms: msg.duration_ms,
+                size_bytes: msg.size_bytes,
+                short_flag: false,
+                group_id: msg.group_id.clone(),
+                seq: msg.seq,
+            })
+            .unwrap();
+        msg = store.get("m-fr-ok").unwrap().unwrap();
+        assert_eq!(msg.status, "dropped");
+        assert_ne!(msg.transcript, "late re-transcription");
     }
 
     #[test]
