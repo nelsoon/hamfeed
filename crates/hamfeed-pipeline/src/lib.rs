@@ -28,6 +28,7 @@ pub struct Pipeline {
     queue: IngestQueue,
     spill: SpillDir,
     storage_dir: PathBuf,
+    drains: u64,
 }
 
 impl Pipeline {
@@ -56,6 +57,7 @@ impl Pipeline {
             store,
             transcriber,
             queue: IngestQueue::new(100),
+            drains: 0,
             spill,
             storage_dir,
         })
@@ -121,6 +123,7 @@ impl Pipeline {
     /// number of clips processed. Spilled-then-replayed items are removed
     /// from the spill dir once stored.
     pub fn drain(&mut self) -> Result<usize> {
+        self.drains += 1;
         let mut n = 0;
         while let Some(item) = self.queue.pop() {
             self.process_item(&item)?;
@@ -128,6 +131,11 @@ impl Pipeline {
             n += 1;
         }
         Ok(n)
+    }
+
+    /// How many times the queue was drained (live loop drains per segment).
+    pub fn drain_count(&self) -> u64 {
+        self.drains
     }
 
     fn process_item(&self, item: &QueueItem) -> Result<()> {
@@ -273,16 +281,23 @@ impl Pipeline {
             },
             now_ms(),
         );
+        let mut total = 0;
         let stream = source.stream();
         for frame in stream {
             for s in seg.push(&frame.samples) {
                 self.enqueue_segment(&s)?;
+                // Drain per segment: a live mic never ends its stream, so a
+                // drain-only-at-end would buffer forever and store nothing.
+                // STT latency only delays the feed; capture keeps buffering
+                // frames in order behind it.
+                total += self.drain()?;
             }
         }
         for s in seg.flush() {
             self.enqueue_segment(&s)?;
         }
-        self.drain()
+        total += self.drain()?;
+        Ok(total)
     }
 }
 
@@ -480,6 +495,34 @@ freq_label = "TEST"
             "must name the helper: {msg}"
         );
         assert!(msg.contains("models"), "must name the drop-in: {msg}");
+    }
+
+    #[test]
+    fn live_loop_drains_per_segment() {
+        // Regression: a never-ending mic stream must still store rows as
+        // segments close — draining only at end-of-stream would buffer
+        // forever. Three bursts must trigger at least three drains.
+        let dir = test_dir("livedrain");
+        let mut pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let mut pcm = Vec::new();
+        for _ in 0..3 {
+            pcm.extend(fixture::speech_like(2));
+            pcm.extend(fixture::silence_ms(1200));
+        }
+        let frames = fixture::chunks(&pcm, 1600);
+        let mut src = FakeSource::once(
+            frames
+                .into_iter()
+                .map(|c| hamfeed_source::PcmFrame { samples: c })
+                .collect(),
+        );
+        let n = pipe.run_source(&mut src, 400, 120).unwrap();
+        assert!(n >= 3, "three bursts, got {n} segments");
+        assert!(
+            pipe.drain_count() >= 3,
+            "must drain per segment, drained {}",
+            pipe.drain_count()
+        );
     }
 
     #[test]
