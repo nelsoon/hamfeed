@@ -39,7 +39,8 @@ async fn main() {
     let dir = static_dir.unwrap_or_else(|| "crates/hamfeed-web/static".into());
     let state = AppState::new(pipe, dir);
     let app = create_app(state);
-    let addr = format!("127.0.0.1:{port}");
+    // LAN-reachable: the feed is meant to be opened from other machines.
+    let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| {
