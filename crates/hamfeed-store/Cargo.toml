@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json.workspace = true

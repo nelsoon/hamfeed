@@ -154,6 +154,15 @@ CREATE TABLE IF NOT EXISTS speaker_alias(
   confidence REAL NOT NULL, updated_ts INT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS profiles(name TEXT PRIMARY KEY, cues TEXT NOT NULL DEFAULT '[]');
+-- Seeded idempotently: fresh files get them from this batch, pre-existing
+-- files (whose profiles table is just created above) from the same lines.
+INSERT OR IGNORE INTO profiles(name, cues) VALUES('Normal', '[]');
+INSERT OR IGNORE INTO profiles(name, cues) VALUES('ARES Net',
+  '[\"emergency traffic\", \"tactical\", \"net control\", \"priority traffic\", \"ares\"]');
+INSERT OR IGNORE INTO profiles(name, cues) VALUES('Severe Weather',
+  '[\"tornado\", \"flood\", \"spotter\", \"severe thunderstorm\", \"flash flood\"]');
+INSERT OR IGNORE INTO settings(key, value) VALUES('active_profile', 'Normal');
 CREATE INDEX IF NOT EXISTS idx_ts ON messages(ts_start);
 CREATE INDEX IF NOT EXISTS idx_sender ON messages(sender_callsign);
 CREATE INDEX IF NOT EXISTS idx_alert ON messages(alert);
@@ -186,6 +195,27 @@ fn like_escape(text: &str) -> String {
         .replace('%', "\\%")
         .replace('_', "\\_")
 }
+
+/// Disaster profile: name + extra emergency cue phrases (Slice 3).
+/// `Normal` carries no extra cues (baseline behavior unchanged).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Profile {
+    pub name: String,
+    pub cues: Vec<String>,
+}
+
+/// `set_active_profile` rejection: the name matches no seeded profile.
+/// Web maps this to 404 (verdict pattern); anything else is 500.
+#[derive(Debug)]
+pub struct UnknownProfile(pub String);
+
+impl std::fmt::Display for UnknownProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown profile: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownProfile {}
 
 impl Store {
     fn init(conn: &Connection) -> Result<()> {
@@ -674,6 +704,86 @@ impl Store {
             rusqlite::params![key, next.to_string()],
         )?;
         Ok(next)
+    }
+
+    /// Parse the JSON cue list; a corrupt row fails loudly rather than
+    /// silently narrowing disaster detection.
+    fn parse_cues(name: &str, raw: &str) -> Result<Vec<String>> {
+        serde_json::from_str(raw)
+            .with_context(|| format!("bad cues JSON for profile {name}"))
+            .and_then(|v: serde_json::Value| {
+                v.as_array()
+                    .context(format!("cues for profile {name} are not an array"))
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|c| c.as_str().map(str::to_string))
+                            .collect()
+                    })
+            })
+    }
+
+    /// All profiles in seed order. Seeded idempotently at open (T1).
+    pub fn list_profiles(&self) -> Result<Vec<Profile>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let mut stmt = conn.prepare("SELECT name, cues FROM profiles ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| {
+            let name: String = r.get(0)?;
+            let cues: String = r.get(1)?;
+            Ok((name, cues))
+        })?;
+        rows.map(|r| {
+            let (name, cues) = r?;
+            Ok(Profile {
+                cues: Self::parse_cues(&name, &cues)?,
+                name,
+            })
+        })
+        .collect()
+    }
+
+    /// Active profile name; always present (seeded `'Normal'` at open).
+    pub fn active_profile(&self) -> Result<String> {
+        let conn = self.conn.lock().expect("store mutex");
+        conn.query_row(
+            "SELECT value FROM settings WHERE key='active_profile'",
+            [],
+            |r| r.get(0),
+        )
+        .context("active_profile missing")
+    }
+
+    /// Extra emergency cues of the active disaster profile, in one round
+    /// trip (Slice 3, T2). Empty under Normal. The live loop reads this per
+    /// segment so a profile switch applies without restart or cache flush.
+    pub fn active_cues(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let (name, raw): (String, String) = conn.query_row(
+            "SELECT p.name, p.cues FROM profiles p
+             JOIN settings s ON s.key='active_profile' AND s.value=p.name",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Self::parse_cues(&name, &raw)
+    }
+
+    /// Switch the active profile (new traffic only; history untouched, R5).
+    /// Unknown names are [`UnknownProfile`], never a silent no-op.
+    pub fn set_active_profile(&self, name: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex");
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM profiles WHERE name=?)",
+            [name],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(UnknownProfile(name.to_string()).into());
+        }
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES('active_profile',?)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [name],
+        )?;
+        Ok(())
     }
 
     /// Drop voice aliases last touched before the retention bound (Slice 2
@@ -1813,6 +1923,56 @@ mod tests {
         assert_eq!(fts_hits(&store, "zagreb"), 0);
         assert_eq!(fts_hits(&store, "sorel"), 0);
         drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profiles_seed_exact_and_normal_default() {
+        let store = Store::open_memory().unwrap();
+        let names: Vec<String> = store
+            .list_profiles()
+            .unwrap()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        assert_eq!(names, vec!["Normal", "ARES Net", "Severe Weather"]);
+        let normal = &store.list_profiles().unwrap()[0];
+        assert!(normal.cues.is_empty());
+        let ares = &store.list_profiles().unwrap()[1];
+        assert!(ares.cues.contains(&"net control".to_string()));
+        assert_eq!(store.active_profile().unwrap(), "Normal");
+    }
+
+    #[test]
+    fn profile_switch_roundtrip_and_unknown_rejected() {
+        let store = Store::open_memory().unwrap();
+        store.set_active_profile("ARES Net").unwrap();
+        assert_eq!(store.active_profile().unwrap(), "ARES Net");
+        store.set_active_profile("Normal").unwrap();
+        assert_eq!(store.active_profile().unwrap(), "Normal");
+        let err = store.set_active_profile("Nope").unwrap_err();
+        assert!(err.downcast_ref::<UnknownProfile>().is_some());
+        // Rejected switch leaves the previous profile in place.
+        assert_eq!(store.active_profile().unwrap(), "Normal");
+    }
+
+    #[test]
+    fn active_profile_survives_reopen() {
+        // G4: the mode is still on after a restart mid-event.
+        let dir = std::env::temp_dir().join(format!("hamfeed-prof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("feed.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store.set_active_profile("Severe Weather").unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.active_profile().unwrap(), "Severe Weather");
+            // Old file, new code: profiles seed on open, switch works.
+            assert_eq!(store.list_profiles().unwrap().len(), 3);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

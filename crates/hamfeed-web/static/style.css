@@ -11,6 +11,7 @@
   --failed: #f85149;
   --foryou: #58a6ff;
   --emergency: #ff7b72;
+  --disaster: #d2a8ff;
   --radius: 10px;
 }
 * { box-sizing: border-box; }
@@ -45,6 +46,15 @@ body {
 }
 .filterbar label { font-size: 13px; color: var(--muted); }
 .filterbar a.apply { text-decoration: none; display: inline-block; }
+.modebar button.apply {
+  background: #242c35;
+  color: var(--text);
+  border: 1px solid var(--card-edge);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
 .filterbar button.apply {
   background: #242c35;
   color: var(--text);
@@ -150,6 +160,54 @@ audio { flex: 1; min-width: 0; height: 34px; }
   color: var(--emergency);
   background: rgba(248, 81, 73, 0.12);
   border-left-color: var(--emergency);
+}
+.banner.disaster {
+  color: var(--disaster);
+  background: rgba(210, 168, 255, 0.10);
+  border-left-color: var(--disaster);
+}
+.modebar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+.modebar select {
+  background: var(--card);
+  border: 1px solid var(--card-edge);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+.modebar button.apply[aria-pressed="true"] {
+  border-color: var(--disaster);
+  color: var(--disaster);
+}
+.modebanner {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  color: var(--disaster);
+  background: rgba(210, 168, 255, 0.10);
+  border: 1px solid var(--disaster);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 4px 0 8px;
+}
+.modebanner button {
+  background: none;
+  border: 1px solid var(--disaster);
+  color: var(--disaster);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
 }
 .banner svg { flex: none; }
 .foot {

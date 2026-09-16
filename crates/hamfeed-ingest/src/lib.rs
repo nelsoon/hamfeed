@@ -13,7 +13,9 @@ pub mod segmenter;
 pub mod spill;
 
 #[cfg(feature = "opus")]
-pub use encode::{clip_path, decode_ogg_to_pcm, encode_pcm_to_ogg, write_clip_atomic, ClipMeta};
+pub use encode::{
+    clip_path, decode_ogg_to_pcm, encode_pcm_to_ogg, write_clip_atomic, ClipMeta, LiveEncoder,
+};
 pub use queue::{IngestQueue, QueueItem};
 pub use segmenter::{Segment, Segmenter, SegmenterConfig};
 pub use spill::{SpillDir, SpillRow};

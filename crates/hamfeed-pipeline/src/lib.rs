@@ -5,7 +5,9 @@
 //! (S11). Group contract: web may call the `enrich`/triage helpers here, but
 //! pipeline never depends on web.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use hamfeed_callbook::Callbook;
@@ -209,6 +211,10 @@ impl CarryState {
 pub const ALERT_ME: i32 = 1;
 /// Alert bit: the message matches an emergency cue (R6).
 pub const ALERT_EMERGENCY: i32 = 2;
+/// Alert bit: the message matches a disaster-profile cue (Slice 3).
+/// Set alone, never alongside ALERT_EMERGENCY (ADR-8): Normal vs
+/// disaster classifications stay distinguishable and G5 is exact.
+pub const ALERT_DISASTER: i32 = 4;
 
 /// True when the transcript addresses my callsign — plain or spelled
 /// (both resolve through the same extractor, so `VE2ABC` and `victor
@@ -249,6 +255,29 @@ pub fn enrich(
     my_callsign: Option<&str>,
     emergency_cues: &[String],
 ) -> Enrichment {
+    enrich_profiled(
+        transcript,
+        lang,
+        carry,
+        lookup,
+        my_callsign,
+        emergency_cues,
+        &[],
+    )
+}
+
+/// Profile-aware enrichment (Slice 3): `disaster_cues` is the active
+/// profile's extra set (empty under Normal). A disaster hit sets ONLY
+/// ALERT_DISASTER (ADR-8), so baseline callers see bit-identical output.
+pub fn enrich_profiled(
+    transcript: &str,
+    lang: &str,
+    carry: Option<&str>,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    my_callsign: Option<&str>,
+    emergency_cues: &[String],
+    disaster_cues: &[String],
+) -> Enrichment {
     let mut alert = 0;
     if let Some(mine) = my_callsign {
         if matches_me(transcript, lang, mine) {
@@ -257,6 +286,9 @@ pub fn enrich(
     }
     if matches_emergency(transcript, emergency_cues) {
         alert |= ALERT_EMERGENCY;
+    }
+    if matches_emergency(transcript, disaster_cues) {
+        alert |= ALERT_DISASTER;
     }
     if let Some(hit) = hamfeed_callsign::extract(transcript, lang).first() {
         let cs = hit.normalized.clone();
@@ -285,6 +317,64 @@ pub fn enrich(
 /// Language recorded when detection was skipped (failed/system rows).
 pub const LANG_UNKNOWN: &str = "und";
 
+/// Live monitor tap (Slice 3, R7): the `run_source` loop forks every
+/// source PCM chunk here; `/api/live` readers follow from the tail.
+/// Bounded (30 s at 16 kHz); overflow drops the oldest. `seq` counts every
+/// sample ever pushed, so readers detect overwrite and skip ahead instead
+/// of replaying stale audio.
+pub const LIVE_TAP_CAP: usize = 16_000 * 30;
+
+pub struct LiveTap {
+    inner: Mutex<LiveTapInner>,
+}
+
+struct LiveTapInner {
+    buf: VecDeque<i16>,
+    seq: u64,
+}
+
+impl LiveTap {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(LiveTapInner {
+                buf: VecDeque::new(),
+                seq: 0,
+            }),
+        }
+    }
+
+    pub fn push(&self, pcm: &[i16]) {
+        let mut g = self.inner.lock().expect("live tap mutex");
+        for &s in pcm {
+            if g.buf.len() == LIVE_TAP_CAP {
+                g.buf.pop_front();
+            }
+            g.buf.push_back(s);
+        }
+        g.seq += pcm.len() as u64;
+    }
+
+    /// Samples pushed since `since`, plus the current sequence. When `since`
+    /// predates the retained window the reader jumps to its oldest sample
+    /// (live, not archive — T3 skip-ahead lives here, not in web).
+    pub fn read_since(&self, since: u64) -> (u64, Vec<i16>) {
+        let g = self.inner.lock().expect("live tap mutex");
+        let oldest = g.seq - g.buf.len() as u64;
+        let skip = since.saturating_sub(oldest) as usize;
+        (g.seq, g.buf.iter().skip(skip).copied().collect())
+    }
+
+    pub fn current_seq(&self) -> u64 {
+        self.inner.lock().expect("live tap mutex").seq
+    }
+}
+
+impl Default for LiveTap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Live pipeline: config + store + transcriber + queue + spill.
 pub struct Pipeline {
     cfg: Config,
@@ -297,6 +387,7 @@ pub struct Pipeline {
     carry: CarryState,
     callbook: Callbook,
     voice: VoiceState,
+    tap: Arc<LiveTap>,
 }
 
 impl Pipeline {
@@ -359,11 +450,17 @@ impl Pipeline {
                 #[cfg(feature = "voice")]
                 embedder,
             ),
+            tap: Arc::new(LiveTap::new()),
         })
     }
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Live monitor tap (Slice 3): web `/api/live` readers share this.
+    pub fn live_tap(&self) -> Arc<LiveTap> {
+        Arc::clone(&self.tap)
     }
 
     pub fn config(&self) -> &Config {
@@ -510,13 +607,18 @@ impl Pipeline {
                 if let Some(k) = &speaker_key {
                     self.voice.group_keys.push((k.clone(), item.ts_start_ms));
                 }
-                let mut e = enrich(
+                // Active profile cues per segment: always fresh across the
+                // web/pipeline handles with no cache to invalidate. A failed
+                // read degrades to Normal (empty cues), never louder.
+                let disaster_cues = self.store.active_cues().unwrap_or_default();
+                let mut e = enrich_profiled(
                     &transcript,
                     &out.lang,
                     self.carry.carried(item.ts_start_ms),
                     &|cs| self.callbook.lookup(cs).ok().flatten().map(|c| c.name),
                     self.cfg.station.my_callsign.as_deref(),
                     &self.cfg.notify.emergency_cues,
+                    &disaster_cues,
                 );
                 e.speaker_key = speaker_key.clone();
                 // A heard self-ID refreshes the carry window (R2) and
@@ -711,6 +813,7 @@ impl Pipeline {
         let mut total = 0;
         let stream = source.stream();
         for frame in stream {
+            self.tap.push(&frame.samples);
             for s in seg.push(&frame.samples) {
                 self.enqueue_segment(&s)?;
                 // Drain per segment: a live mic never ends its stream, so a
@@ -1419,5 +1522,72 @@ freq_label = "TEST"
         assert_eq!(row.sender_callsign, None);
         assert_eq!(row.sender_source, "none");
         assert_eq!(row.alert, 0);
+    }
+
+    #[test]
+    fn disaster_cue_sets_bit4_alone() {
+        // G2: a disaster-only cue under a disaster profile flags bit 4
+        // without touching the Normal emergency bit.
+        let disaster = vec!["net control".to_string()];
+        let e = enrich_profiled(
+            "net control, go ahead with traffic",
+            "en",
+            None,
+            &|_| None,
+            None,
+            &[],
+            &disaster,
+        );
+        assert_eq!(e.alert & ALERT_DISASTER, ALERT_DISASTER);
+        assert_eq!(e.alert & ALERT_EMERGENCY, 0);
+    }
+
+    #[test]
+    fn baseline_enrich_ignores_disaster_only_cue() {
+        // G1: the baseline path never sees disaster cues, so a
+        // disaster-only phrase stays silent.
+        let e = enrich(
+            "net control, go ahead with traffic",
+            "en",
+            None,
+            &|_| None,
+            None,
+            &[],
+        );
+        assert_eq!(e.alert, 0);
+    }
+
+    #[test]
+    fn profiled_enrich_matches_baseline_under_normal() {
+        // G5: empty disaster cues (Normal) classify bit-identically to the
+        // Slice-2 baseline across sender, emergency, and quiet cases.
+        let cases = [
+            "ici VE2DEM, a vous",
+            "mayday mayday, engine fire",
+            "ok merci, a plus tard",
+        ];
+        for tx in cases {
+            let a = enrich(tx, "fr", None, &|_| None, None, &cues());
+            let b = enrich_profiled(tx, "fr", None, &|_| None, None, &cues(), &[]);
+            assert_eq!(a, b, "divergence on {tx:?}");
+        }
+    }
+
+    #[test]
+    fn live_tap_caps_and_skips_ahead() {
+        let tap = LiveTap::new();
+        tap.push(&vec![7i16; LIVE_TAP_CAP + 100]);
+        // A reader from the start jumps to the retained window (skip-ahead).
+        let (seq, first) = tap.read_since(0);
+        assert_eq!(seq as usize, LIVE_TAP_CAP + 100);
+        assert_eq!(first.len(), LIVE_TAP_CAP);
+        // A caught-up reader gets only what is new.
+        let (seq2, second) = tap.read_since(seq);
+        assert!(second.is_empty());
+        assert_eq!(seq2, seq);
+        tap.push(&[1, 2, 3]);
+        let (seq3, third) = tap.read_since(seq2);
+        assert_eq!(third, vec![1, 2, 3]);
+        assert_eq!(seq3, seq2 + 3);
     }
 }

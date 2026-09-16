@@ -149,6 +149,8 @@ pub fn create_app(state: AppState) -> Router {
         .route("/api/messages/:id/correct", post(api_correct))
         .route("/api/export/training", get(api_export_training))
         .route("/api/events", get(api_events))
+        .route("/api/live", get(api_live))
+        .route("/api/profile", get(api_get_profile).post(api_set_profile))
         .route("/audio/:id", get(api_audio))
         .route("/audio/:id/play.wav", get(api_audio_wav))
         .fallback_service(tower_http::services::ServeDir::new(static_dir))
@@ -315,6 +317,107 @@ async fn map_store_err(state: &AppState, id: &str, e: anyhow::Error) -> (StatusC
     } else {
         (StatusCode::NOT_FOUND, "no such message".into())
     }
+}
+
+/// Live monitor (Slice 3, R7): the channel as chained Opus-in-Ogg over
+/// chunked HTTP. Each connection mints its own encoder (own OpusHead/serial)
+/// starting at the current tap tail, so late joiners decode from byte zero;
+/// lagging readers skip ahead in the tap (live, not archive). Dropping the
+/// connection just ends the stream — no server-side bookkeeping.
+async fn api_live(State(state): State<AppState>) -> Result<Response, (StatusCode, String)> {
+    use axum::body::Bytes;
+    use std::time::Duration;
+    let tap = state.pipeline.lock().await.live_tap();
+    let (head, enc) = hamfeed_ingest::LiveEncoder::new()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let stream = futures_util::stream::unfold(
+        (Some(head), tap.current_seq(), enc),
+        move |(mut head, mut since, mut enc)| {
+            let tap = tap.clone();
+            async move {
+                loop {
+                    if let Some(h) = head.take() {
+                        let st = (None, since, enc);
+                        return Some((Ok::<_, std::io::Error>(Bytes::from(h)), st));
+                    }
+                    let (now, pcm) = tap.read_since(since);
+                    since = now;
+                    if !pcm.is_empty() {
+                        match enc.push(&pcm) {
+                            Ok(bytes) if !bytes.is_empty() => {
+                                let st = (None, since, enc);
+                                return Some((Ok(Bytes::from(bytes)), st));
+                            }
+                            Ok(_) => {}
+                            // Encoder died mid-stream: end it; the UI shows
+                            // stopped rather than hanging on silence.
+                            Err(_) => return None,
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        },
+    );
+    Ok((
+        [
+            (header::CONTENT_TYPE, "audio/ogg"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response())
+}
+
+/// Disaster profiles (Slice 3, R1/R4): which detector set is live.
+/// The banner polls this; a switch broadcasts so open feeds update too.
+async fn api_get_profile(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pipe = state.pipeline.lock().await;
+    let active = pipe
+        .store()
+        .active_profile()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let profiles = pipe
+        .store()
+        .list_profiles()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "active": active,
+        "profiles": profiles
+            .iter()
+            .map(|p| serde_json::json!({"name": p.name, "cues": p.cues}))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileBody {
+    name: String,
+}
+
+/// Switch the active profile (new traffic only; history untouched, R5).
+/// Unknown names are 404 via [`hamfeed_store::UnknownProfile`]; anything
+/// else is 500 (verdict pattern). Switches broadcast like triage.
+async fn api_set_profile(
+    State(state): State<AppState>,
+    Json(body): Json<ProfileBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let active = {
+        let pipe = state.pipeline.lock().await;
+        if let Err(e) = pipe.store().set_active_profile(&body.name) {
+            if e.downcast_ref::<hamfeed_store::UnknownProfile>().is_some() {
+                return Err((StatusCode::NOT_FOUND, "unknown profile".into()));
+            }
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+        pipe.store()
+            .active_profile()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let _ = state.tx.send(serde_json::json!({"profile": active}));
+    Ok(Json(serde_json::json!({"active": active})))
 }
 
 /// Operator sender confirm/correct (003 S8): attach the verdict and
@@ -1353,6 +1456,81 @@ freq_label = "TEST"
         (0..zip.len())
             .map(|i| zip.by_index(i).unwrap().name().to_string())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn live_stream_serves_decodable_ogg() {
+        // Slice 3 T3: tap audio in, Opus-in-Ogg out, starting at the tail.
+        let (base, h) = test_server().await;
+        h.state
+            .pipeline
+            .lock()
+            .await
+            .live_tap()
+            .push(&vec![1000i16; 3200]);
+        let client = reqwest::Client::new();
+        let mut res = client
+            .get(format!("{base}/api/live"))
+            .send()
+            .await
+            .expect("live connects");
+        assert_eq!(res.headers().get("content-type").unwrap(), "audio/ogg");
+        let first = res.chunk().await.expect("first chunk").expect("bytes");
+        assert_eq!(&first[..4], b"OggS");
+        assert!(first.windows(8).any(|w| w == b"OpusHead"));
+        // Disconnect mid-stream: the server just drops the generator.
+    }
+
+    #[tokio::test]
+    async fn profile_switch_roundtrip() {
+        // Slice 3 T4: list, switch, unknown-name 404, switch back.
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        let got: serde_json::Value = client
+            .get(format!("{base}/api/profile"))
+            .send()
+            .await
+            .expect("profile gets")
+            .json()
+            .await
+            .expect("profile json");
+        assert_eq!(got["active"], "Normal");
+        assert_eq!(got["profiles"].as_array().unwrap().len(), 3);
+        let switched: serde_json::Value = client
+            .post(format!("{base}/api/profile"))
+            .json(&serde_json::json!({"name": "ARES Net"}))
+            .send()
+            .await
+            .expect("profile posts")
+            .json()
+            .await
+            .expect("switch json");
+        assert_eq!(switched["active"], "ARES Net");
+        let missing = client
+            .post(format!("{base}/api/profile"))
+            .json(&serde_json::json!({"name": "Nope"}))
+            .send()
+            .await
+            .expect("unknown posts");
+        assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+        // Name with a quote: stored/executed as data, still just 404.
+        let quoted = client
+            .post(format!("{base}/api/profile"))
+            .json(&serde_json::json!({"name": "A' OR '1'='1"}))
+            .send()
+            .await
+            .expect("quoted posts");
+        assert_eq!(quoted.status(), reqwest::StatusCode::NOT_FOUND);
+        let back: serde_json::Value = client
+            .post(format!("{base}/api/profile"))
+            .json(&serde_json::json!({"name": "Normal"}))
+            .send()
+            .await
+            .expect("back posts")
+            .json()
+            .await
+            .expect("back json");
+        assert_eq!(back["active"], "Normal");
     }
 
     fn read_zip(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> String {

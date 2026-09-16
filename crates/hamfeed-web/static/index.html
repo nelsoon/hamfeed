@@ -19,6 +19,12 @@
     <button class="paused" id="pause" aria-pressed="false">pause live</button>
     <button class="pill-live" id="jumpLive"></button>
   </div>
+  <div class="modebar">
+    <label>mode <select id="profile" aria-label="Operating profile"></select></label>
+    <button class="apply" id="listen" aria-pressed="false">listen live</button>
+    <audio id="liveAudio" preload="none"></audio>
+  </div>
+  <div id="modeBanner" class="modebanner" style="display:none"></div>
   <div id="feed"></div>
   <div class="more-wrap"><button id="more" style="display:none">load more</button></div>
 </div>
