@@ -173,6 +173,124 @@ impl Transcriber {
     }
 }
 
+/// NATO phonetic alphabet + digit words, both common spellings where
+/// whisper varies (`alpha`/`alfa`, `juliet`/`juliett`, `x-ray`/`xray`).
+fn phonetic_letter(word: &str) -> Option<char> {
+    Some(match word {
+        "alfa" | "alpha" => 'A',
+        "bravo" => 'B',
+        "charlie" => 'C',
+        "delta" => 'D',
+        "echo" => 'E',
+        "foxtrot" => 'F',
+        "golf" => 'G',
+        "hotel" => 'H',
+        "india" => 'I',
+        "juliet" | "juliett" => 'J',
+        "kilo" => 'K',
+        "lima" => 'L',
+        "mike" => 'M',
+        "november" => 'N',
+        "oscar" => 'O',
+        "papa" => 'P',
+        "quebec" => 'Q',
+        "romeo" => 'R',
+        "sierra" => 'S',
+        "tango" => 'T',
+        "uniform" => 'U',
+        "victor" => 'V',
+        "whiskey" => 'W',
+        "xray" | "x-ray" => 'X',
+        "yankee" => 'Y',
+        "zulu" => 'Z',
+        "zero" | "oh" => '0',
+        "one" => '1',
+        "two" => '2',
+        "three" | "tree" => '3',
+        "four" | "fower" => '4',
+        "five" | "fife" => '5',
+        "six" => '6',
+        "seven" => '7',
+        "eight" | "ait" => '8',
+        "nine" | "niner" => '9',
+        _ => return None,
+    })
+}
+
+/// One token's letter, if it is a phonetic word, a digit word, or a bare
+/// digit (`2` in "victor echo 2" joins the run as `2`). Anything else —
+/// normal words, ham shortcuts (`73`, `QTH`), callsign fragments already
+/// written as letters — yields `None` and ends the run.
+fn token_letter(word: &str) -> Option<char> {
+    let lower = word.to_lowercase();
+    let t = lower.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+    if let Some(c) = phonetic_letter(t) {
+        return Some(c);
+    }
+    let t = t.trim_matches(|c: char| !c.is_alphanumeric());
+    if t.len() == 1 {
+        if let Some(c) = t.chars().next() {
+            if c.is_ascii_digit() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Collapse spoken phonetics into letter groups: "alpha lima lima oscar"
+/// becomes "ALLO", "victor echo 2" becomes "VE2". Only runs of two or more
+/// tokens collapse — a lone "echo" or "mike" in normal speech stays
+/// untouched, as do ham shortcuts. Separators inside a run may be spaces
+/// or hyphens ("x-ray yankee" and "alpha-lima" both work).
+pub fn normalize_phonetics(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let mut letters: Vec<char> = Vec::new();
+        let mut k = i;
+        while k < words.len() {
+            // Whole word first, so "x-ray" matches as a unit; hyphenated
+            // pairs ("alpha-lima") fall back to per-part matching.
+            if let Some(c) = token_letter(words[k]) {
+                letters.push(c);
+                k += 1;
+                continue;
+            }
+            let before = letters.len();
+            let mut matched_all = true;
+            let mut any = false;
+            for chunk in words[k].split('-') {
+                if chunk.is_empty() {
+                    continue;
+                }
+                any = true;
+                match token_letter(chunk) {
+                    Some(c) => letters.push(c),
+                    None => {
+                        matched_all = false;
+                        break;
+                    }
+                }
+            }
+            if !matched_all || !any {
+                letters.truncate(before);
+                break;
+            }
+            k += 1;
+        }
+        if letters.len() >= 2 {
+            out.push(letters.into_iter().collect());
+            i = k;
+        } else {
+            out.push(words[i].to_string());
+            i += 1;
+        }
+    }
+    out.join(" ")
+}
+
 /// Fixture model lookup for tests: `$HAMFEED_TEST_MODEL`, else the workspace
 /// `models/ggml-tiny.bin` (fetched by `scripts/download-model.sh`, cached in
 /// CI). Panics LOUDLY when absent — a silent skip would hide a dead STT.
@@ -222,6 +340,36 @@ mod tests {
         let out = t.transcribe(&fixture("fr.ogg")).expect("fr transcribes");
         assert_eq!(out.lang, "fr", "lang must be fr, got {}", out.lang);
         assert!(!out.transcript.is_empty(), "transcript must be non-empty");
+    }
+
+    #[test]
+    fn phonetics_collapse() {
+        assert_eq!(normalize_phonetics("alpha lima lima oscar"), "ALLO");
+        assert_eq!(
+            normalize_phonetics("Victor Echo 2 X-ray Yankee Zulu"),
+            "VE2XYZ"
+        );
+        assert_eq!(
+            normalize_phonetics("contact alpha lima on simplex"),
+            "contact AL on simplex"
+        );
+        assert_eq!(normalize_phonetics("x-ray yankee"), "XY");
+        assert_eq!(normalize_phonetics("alpha-lima"), "AL");
+        assert_eq!(normalize_phonetics("lima oscar, over"), "LO over");
+    }
+
+    #[test]
+    fn phonetics_leave_normal_speech() {
+        // Singletons are ordinary words until they form a run.
+        assert_eq!(normalize_phonetics("say echo again"), "say echo again");
+        assert_eq!(normalize_phonetics("thanks mike"), "thanks mike");
+        // Ham shortcuts pass through untouched.
+        assert_eq!(normalize_phonetics("73 and 88"), "73 and 88");
+        assert_eq!(normalize_phonetics("QTH is here"), "QTH is here");
+        assert_eq!(
+            normalize_phonetics("hello radio world"),
+            "hello radio world"
+        );
     }
 
     #[test]
