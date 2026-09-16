@@ -70,7 +70,10 @@ impl ApiMessage {
             conf_flag: m.conf_flag.clone(),
             status: m.status.clone(),
             fail_reason: m.fail_reason.clone(),
-            audio_url: m.audio_path.as_ref().map(|_| format!("/audio/{}", m.id)),
+            audio_url: m
+                .audio_path
+                .as_ref()
+                .map(|_| format!("/audio/{}/play.wav", m.id)),
             duration_ms: m.duration_ms,
             short_flag: m.short_flag,
             review_flag: m.review_flag.clone(),
@@ -112,6 +115,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/api/messages/:id/:action", post(api_triage))
         .route("/api/events", get(api_events))
         .route("/audio/:id", get(api_audio))
+        .route("/audio/:id/play.wav", get(api_audio_wav))
         .fallback_service(tower_http::services::ServeDir::new(static_dir))
         .with_state(state)
 }
@@ -274,6 +278,101 @@ async fn api_events(
     )
 }
 
+/// Playback path: the stored Opus clip decoded to WAV in RAM. WAV plays
+/// everywhere (including browsers without Ogg Opus support); the Opus file
+/// stays the archive format on disk.
+async fn api_audio_wav(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let bytes = {
+        let pipe = state.pipeline.lock().await;
+        match pipe.store().get(&id) {
+            Ok(Some(m)) => m.audio_path,
+            _ => None,
+        }
+    };
+    let path = match bytes {
+        Some(p) if std::path::Path::new(&p).exists() => p,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let ogg = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let pcm = match hamfeed_ingest::decode_ogg_to_pcm(&ogg) {
+        Ok(p) => p,
+        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    };
+    serve_bytes(encode_wav(&pcm), "audio/wav", headers)
+}
+
+/// Encode 16 kHz mono S16 as a WAV file in RAM.
+fn encode_wav(pcm: &[i16]) -> Vec<u8> {
+    let data_len = pcm.len() * 2;
+    let mut out = Vec::with_capacity(44 + data_len);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&16_000u32.to_le_bytes());
+    out.extend_from_slice(&32_000u32.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data_len as u32).to_le_bytes());
+    for s in pcm {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// Serve bytes with single-range support (media players seek).
+fn serve_bytes(full: Vec<u8>, content_type: &str, headers: HeaderMap) -> axum::response::Response {
+    let total = full.len();
+    let mut res_headers = HeaderMap::new();
+    res_headers.insert("content-type", content_type.parse().unwrap());
+    res_headers.insert("accept-ranges", "bytes".parse().unwrap());
+    if let Some(range) = headers.get("range").and_then(|v| v.to_str().ok()) {
+        if let Some((start, end)) = parse_range(range, total) {
+            res_headers.insert(
+                "content-range",
+                format!("bytes {start}-{end}/{total}").parse().unwrap(),
+            );
+            return (
+                StatusCode::PARTIAL_CONTENT,
+                res_headers,
+                full[start..=end].to_vec(),
+            )
+                .into_response();
+        }
+        return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+    }
+    (StatusCode::OK, res_headers, full).into_response()
+}
+
+fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
+    let spec = header.strip_prefix("bytes=")?.trim();
+    let (start_s, end_s) = spec.split_once('-')?;
+    let start: usize = if start_s.is_empty() {
+        total.saturating_sub(end_s.parse::<usize>().ok()? + 1)
+    } else {
+        start_s.parse().ok()?
+    };
+    let end: usize = if end_s.is_empty() {
+        total - 1
+    } else {
+        end_s.parse::<usize>().ok()?.min(total - 1)
+    };
+    if total == 0 || start >= total || start > end {
+        return None;
+    }
+    Some((start, end))
+}
+
 async fn api_audio(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let path = {
         let pipe = state.pipeline.lock().await;
@@ -410,6 +509,44 @@ freq_label = "TEST"
             text.contains("\"status\":\"ok\""),
             "event has badge: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn audio_wav_plays() {
+        // Playback path: stored Opus serves as WAV with range support.
+        let (base, _h) = test_server().await;
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../hamfeed-stt/tests/fixtures/en.ogg");
+        std::fs::copy(&src, "/tmp/m-fr-ok.ogg").unwrap();
+        let client = reqwest::Client::new();
+        let res = client
+            .get(format!("{base}/audio/m-fr-ok/play.wav"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers().get("content-type").unwrap(), "audio/wav");
+        let wav = res.bytes().await.unwrap();
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert!(wav.len() > 1000, "must carry seconds of audio");
+        // Single-range request seeks.
+        let res = client
+            .get(format!("{base}/audio/m-fr-ok/play.wav"))
+            .header("Range", "bytes=0-43")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 206);
+        assert_eq!(res.bytes().await.unwrap().len(), 44);
+        let _ = std::fs::remove_file("/tmp/m-fr-ok.ogg");
+        // Missing clip stays 404 on both paths.
+        let r = client
+            .get(format!("{base}/audio/nope/play.wav"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
     }
 
     #[tokio::test]
