@@ -167,16 +167,25 @@ CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
     VALUES (new.rowid, new.transcript, new.corrected_text);
 END;
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, transcript)
-    VALUES ('delete', old.rowid, old.transcript);
+  INSERT INTO messages_fts(messages_fts, rowid, transcript, corrected_text)
+    VALUES ('delete', old.rowid, old.transcript, old.corrected_text);
 END;
 CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF transcript, corrected_text ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, transcript)
-    VALUES ('delete', old.rowid, old.transcript);
+  INSERT INTO messages_fts(messages_fts, rowid, transcript, corrected_text)
+    VALUES ('delete', old.rowid, old.transcript, old.corrected_text);
   INSERT INTO messages_fts(rowid, transcript, corrected_text)
     VALUES (new.rowid, new.transcript, new.corrected_text);
 END;
 ";
+
+/// Escape user input for a LIKE pattern: an unescaped `%` matches
+/// everything, `_` matches any char, and a bare `\` escapes the next
+/// char by accident. Used with `ESCAPE '\'`.
+fn like_escape(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
 
 impl Store {
     fn init(conn: &Connection) -> Result<()> {
@@ -239,6 +248,23 @@ impl Store {
                 "corrected_text",
                 "ALTER TABLE messages ADD COLUMN corrected_text TEXT",
             ),
+            // Very early Slice-1 files predate grouping and triage.
+            (
+                "group_id",
+                "ALTER TABLE messages ADD COLUMN group_id TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "seq",
+                "ALTER TABLE messages ADD COLUMN seq INT NOT NULL DEFAULT 0",
+            ),
+            (
+                "review_flag",
+                "ALTER TABLE messages ADD COLUMN review_flag TEXT NOT NULL DEFAULT 'none'",
+            ),
+            (
+                "flag_reason",
+                "ALTER TABLE messages ADD COLUMN flag_reason TEXT",
+            ),
         ] {
             if !cols.iter().any(|c| c == col) {
                 conn.execute_batch(ddl)
@@ -272,6 +298,28 @@ impl Store {
                 )
                 .context("cannot drop stale search index")?;
                 rebuild_fts = true;
+            }
+        }
+        // The two-column index shipped once with single-column delete legs:
+        // a partial-column 'delete' leaves ghost tokens for the omitted
+        // column, so refresh those triggers in place. Indexed content is
+        // unaffected (no rebuild), only future deletes/updates.
+        for trig in ["messages_ad", "messages_au"] {
+            let sql: Option<String> = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                    [trig],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if sql.is_some_and(|s| !s.contains("corrected_text")) {
+                conn.execute_batch(
+                    "DROP TRIGGER IF EXISTS messages_ai;
+                     DROP TRIGGER IF EXISTS messages_ad;
+                     DROP TRIGGER IF EXISTS messages_au;",
+                )
+                .context("cannot refresh search triggers")?;
+                break;
             }
         }
         Ok(rebuild_fts)
@@ -346,6 +394,12 @@ impl Store {
     /// never wiped by a re-transcription. A `confirmed` sender likewise
     /// survives a sender-less re-transcription (the operator's verdict wins
     /// over a fresh STT pass that heard no self-ID).
+    ///
+    /// Deliberately NOT refreshed: `group_id`/`seq`. Segment identity is
+    /// assigned once by the ingest segmenter (the only allocator) and is
+    /// immutable afterwards — a re-transcription must never resequence a
+    /// clip into another group, so the upsert leaves both columns alone
+    /// and a retry that finds `status = 'dropped'` reports Ok silently.
     pub fn upsert(&self, m: &NewMessage) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex");
         conn.execute(
@@ -673,10 +727,18 @@ impl Store {
         if sender_norm.is_some() {
             sql.push_str(" AND sender_callsign = ?");
         }
+        // Allowlist + bound param: user input never reaches the SQL text
+        // (quote-stripping alone admits `OR`-style smuggling past naïve
+        // filters). Unknown statuses match nothing (fail closed).
         if let Some(st) = &q.status {
-            sql.push_str(" AND status = '");
-            sql.push_str(&st.replace('\'', ""));
-            sql.push('\'');
+            match st.as_str() {
+                "ok" | "failed" | "kept" | "dropped" => {
+                    sql.push_str(" AND status = ?");
+                }
+                _ => {
+                    sql.push_str(" AND 1 = 0");
+                }
+            }
         }
         if q.from_ms.is_some() {
             sql.push_str(" AND ts_start >= ?");
@@ -701,6 +763,12 @@ impl Store {
         }
         if let Some(s) = &sender_norm {
             params.push(Box::new(s.clone()));
+        }
+        // Mirrors the allowlist above: only known statuses bind a param.
+        if let Some(st) = &q.status {
+            if matches!(st.as_str(), "ok" | "failed" | "kept" | "dropped") {
+                params.push(Box::new(st.clone()));
+            }
         }
         if let Some(f) = q.from_ms {
             params.push(Box::new(f as i64));
@@ -755,9 +823,10 @@ impl Store {
             Ok(ids) => Ok(ids),
             Err(_) => {
                 let mut stmt = conn.prepare(
-                    "SELECT rowid FROM messages WHERE transcript LIKE ?1 OR corrected_text LIKE ?1",
+                    "SELECT rowid FROM messages WHERE transcript LIKE ?1 ESCAPE '\\'
+                     OR corrected_text LIKE ?1 ESCAPE '\\'",
                 )?;
-                let like = format!("%{text}%");
+                let like = format!("%{}%", like_escape(text));
                 let ids = stmt
                     .query_map([like], |r| r.get::<_, i64>(0))?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1146,6 +1215,47 @@ mod tests {
     }
 
     #[test]
+    fn migrate_pregroup_db_gains_group_and_triage() {
+        // A very early file (no grouping, no triage, no Slice-2/004
+        // columns): open adds everything with sane defaults and the row
+        // reads back whole.
+        let dir = std::env::temp_dir().join(format!("hamfeed-mig0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages(
+                   id TEXT PRIMARY KEY, ts_start INT NOT NULL, ts_end INT NOT NULL,
+                   freq_label TEXT NOT NULL, lang TEXT NOT NULL, lang_conf REAL NOT NULL,
+                   transcript TEXT NOT NULL, stt_conf REAL NOT NULL,
+                   conf_flag TEXT NOT NULL, status TEXT NOT NULL,
+                   fail_reason TEXT NULL, audio_path TEXT NULL,
+                   audio_purged BOOL NOT NULL DEFAULT 0,
+                   duration_ms INT NULL, size_bytes INT NULL,
+                   short_flag BOOL NOT NULL DEFAULT 0)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages(id,ts_start,ts_end,freq_label,lang,lang_conf,
+                 transcript,stt_conf,conf_flag,status)
+                 VALUES('old0',1000,1500,'TEST','fr',0.9,'bonjour',0.8,'ok','ok')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let m = store.get("old0").unwrap().expect("old row readable");
+        assert_eq!(m.group_id, "");
+        assert_eq!(m.seq, 0);
+        assert_eq!(m.review_flag, "none");
+        assert_eq!(m.sender_source, "none");
+        assert_eq!(m.corrected_text, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn migrate_slice1_db_reads_senderless() {
         // A pre-Slice-2 database file (old column set, no alias tables):
         // open must migrate it and old rows read sender-less.
@@ -1478,6 +1588,42 @@ mod tests {
     }
 
     #[test]
+    fn like_escape_neutralizes_wildcards() {
+        assert_eq!(like_escape("plain"), "plain");
+        assert_eq!(like_escape("100%"), "100\\%");
+        assert_eq!(like_escape("a_b"), "a\\_b");
+        assert_eq!(like_escape("back\\slash"), "back\\\\slash");
+        assert_eq!(like_escape("%_%"), "\\%\\_\\%");
+    }
+
+    #[test]
+    fn status_filter_allowlist() {
+        let store = Store::open_memory().unwrap();
+        seed_messages(&store);
+        let count = |status: Option<&str>| {
+            store
+                .search(&SearchQuery {
+                    status: status.map(|s| s.into()),
+                    limit: 20,
+                    ..Default::default()
+                })
+                .unwrap()
+                .messages
+                .len()
+        };
+        // Seeded rows are all status ok/failed; the filter narrows.
+        assert!(count(Some("ok")) >= 1);
+        assert!(count(Some("failed")) >= 1);
+        assert_eq!(count(Some("kept")), 0);
+        // Injection dead-ends (fail closed): quote-stripping alone would
+        // have let `OR '1'='1` smuggle past the filter.
+        assert_eq!(count(Some("ok' OR '1'='1")), 0);
+        assert_eq!(count(Some("' OR 1=1 --")), 0);
+        // No filter: everything.
+        assert!(count(None) > count(Some("ok")));
+    }
+
+    #[test]
     fn corrections_export_lists_pairs() {
         let store = Store::open_memory().unwrap();
         seed_messages(&store);
@@ -1503,5 +1649,170 @@ mod tests {
         assert_eq!(rows[0].corrected, "bonjour les vrais amis");
         assert_eq!(rows[0].original, "bonjour les amis");
         assert_eq!(rows[0].audio_path, "/tmp/m-fr-ok.ogg");
+    }
+
+    fn fts_msg(id: &str, transcript: &str, corrected: Option<&str>) -> NewMessage {
+        NewMessage {
+            id: id.into(),
+            ts_start_ms: 1000,
+            ts_end_ms: 1500,
+            freq_label: "TEST".into(),
+            lang: "en".into(),
+            lang_conf: 0.9,
+            transcript: transcript.into(),
+            stt_conf: 0.8,
+            conf_flag: "ok".into(),
+            status: "ok".into(),
+            fail_reason: None,
+            audio_path: None,
+            duration_ms: Some(500),
+            size_bytes: Some(100),
+            short_flag: false,
+            group_id: "g".into(),
+            seq: 0,
+            sender_callsign: None,
+            sender_name: None,
+            sender_source: "none".into(),
+            alert: 0,
+            speaker_key: None,
+            corrected_text: corrected.map(|s| s.into()),
+        }
+    }
+
+    fn fts_hits(store: &Store, token: &str) -> i64 {
+        let conn = store.conn.lock().expect("store mutex");
+        conn.query_row(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
+            [token],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fts_delete_clears_both_columns() {
+        // A partial-column 'delete' leaves ghost tokens for the omitted
+        // column, so the delete legs must name both FTS columns.
+        let store = Store::open_memory().unwrap();
+        store
+            .insert(&fts_msg("del1", "zagreb alpha", Some("sorel beta")))
+            .unwrap();
+        assert_eq!(fts_hits(&store, "zagreb"), 1);
+        assert_eq!(fts_hits(&store, "sorel"), 1);
+        {
+            let conn = store.conn.lock().expect("store mutex");
+            conn.execute("DELETE FROM messages WHERE id='del1'", [])
+                .unwrap();
+        }
+        assert_eq!(fts_hits(&store, "zagreb"), 0);
+        assert_eq!(fts_hits(&store, "sorel"), 0);
+    }
+
+    #[test]
+    fn fts_update_clears_old_tokens_of_both_columns() {
+        let store = Store::open_memory().unwrap();
+        store
+            .insert(&fts_msg("upd1", "zagreb alpha", Some("sorel beta")))
+            .unwrap();
+        // Re-transcription replaces the transcript (the operator's
+        // correction survives via COALESCE): the old transcript token
+        // must vanish while the correction token stays.
+        let mut retry = fts_msg("upd1", "lisbon gamma", None);
+        store.upsert(&retry).unwrap();
+        assert_eq!(fts_hits(&store, "zagreb"), 0);
+        assert_eq!(fts_hits(&store, "lisbon"), 1);
+        assert_eq!(fts_hits(&store, "sorel"), 1);
+        // A new correction retires the old correction token.
+        retry.corrected_text = Some("quebec delta".into());
+        store
+            .set_correction("upd1", retry.corrected_text.as_deref())
+            .unwrap();
+        assert_eq!(fts_hits(&store, "sorel"), 0);
+        assert_eq!(fts_hits(&store, "quebec"), 1);
+        assert_eq!(fts_hits(&store, "lisbon"), 1);
+    }
+
+    #[test]
+    fn migrate_refreshes_single_column_delete_triggers() {
+        // A file built by the buggy two-column code (2-col FTS index,
+        // single-column delete legs): open must refresh the triggers so
+        // deletes leave no ghost tokens. Indexed content is unaffected.
+        let dir = std::env::temp_dir().join(format!("hamfeed-migdel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("buggy.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages(
+                   id TEXT PRIMARY KEY,
+                   ts_start INT NOT NULL, ts_end INT NOT NULL,
+                   freq_label TEXT NOT NULL, lang TEXT NOT NULL, lang_conf REAL NOT NULL,
+                   transcript TEXT NOT NULL, stt_conf REAL NOT NULL,
+                   conf_flag TEXT NOT NULL, status TEXT NOT NULL,
+                   fail_reason TEXT NULL, audio_path TEXT NULL,
+                   audio_purged BOOL NOT NULL DEFAULT 0,
+                   duration_ms INT NULL, size_bytes INT NULL,
+                   short_flag BOOL NOT NULL DEFAULT 0,
+                   group_id TEXT NOT NULL, seq INT NOT NULL,
+                   review_flag TEXT NOT NULL DEFAULT 'none',
+                   flag_reason TEXT NULL,
+                   sender_callsign TEXT NULL, sender_name TEXT NULL,
+                   sender_source TEXT NOT NULL DEFAULT 'none',
+                   alert INT NOT NULL DEFAULT 0,
+                   speaker_key TEXT NULL,
+                   corrected_text TEXT NULL);
+                 CREATE VIRTUAL TABLE messages_fts
+                   USING fts5(transcript, corrected_text,
+                              content='messages', content_rowid='rowid');
+                 CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+                   INSERT INTO messages_fts(rowid, transcript, corrected_text)
+                     VALUES (new.rowid, new.transcript, new.corrected_text);
+                 END;
+                 CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                   INSERT INTO messages_fts(messages_fts, rowid, transcript)
+                     VALUES ('delete', old.rowid, old.transcript);
+                 END;
+                 CREATE TRIGGER messages_au
+                   AFTER UPDATE OF transcript, corrected_text ON messages BEGIN
+                   INSERT INTO messages_fts(messages_fts, rowid, transcript)
+                     VALUES ('delete', old.rowid, old.transcript);
+                   INSERT INTO messages_fts(rowid, transcript, corrected_text)
+                     VALUES (new.rowid, new.transcript, new.corrected_text);
+                 END;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages(id,ts_start,ts_end,freq_label,lang,lang_conf,
+                 transcript,stt_conf,conf_flag,status,group_id,seq,corrected_text)
+                 VALUES('old1',1000,1500,'TEST','en',0.9,'zagreb alpha',
+                        0.8,'ok','ok','g',0,'sorel beta')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        // Old row still indexed on both texts (no content rebuild).
+        assert_eq!(fts_hits(&store, "zagreb"), 1);
+        assert_eq!(fts_hits(&store, "sorel"), 1);
+        {
+            let conn = store.conn.lock().expect("store mutex");
+            for trig in ["messages_ad", "messages_au"] {
+                let sql: String = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                        [trig],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert!(sql.contains("corrected_text"), "{trig} refreshed");
+            }
+            conn.execute("DELETE FROM messages WHERE id='old1'", [])
+                .unwrap();
+        }
+        assert_eq!(fts_hits(&store, "zagreb"), 0);
+        assert_eq!(fts_hits(&store, "sorel"), 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

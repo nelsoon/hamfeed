@@ -85,7 +85,17 @@ impl Callbook {
         let tx = conn.transaction()?;
         let mut n = 0usize;
         let mut first = true;
-        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+        // A single undecodable line must not truncate the import: skip it
+        // loudly and carry on (dumps are hundreds of megabytes; one bad
+        // line is data dirt, not a fatal error).
+        for line in std::io::BufReader::new(f).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("callbook import: skipping undecodable line ({e})");
+                    continue;
+                }
+            };
             if first {
                 first = false;
                 if line.to_lowercase().starts_with("callsign;") {
@@ -141,7 +151,14 @@ impl Callbook {
         use std::io::BufRead;
         let hd = std::fs::File::open(format!("{dir}/HD.dat"))?;
         let mut active: HashSet<u32> = HashSet::new();
-        for line in std::io::BufReader::new(hd).lines().map_while(Result::ok) {
+        for line in std::io::BufReader::new(hd).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("callbook import: skipping undecodable HD line ({e})");
+                    continue;
+                }
+            };
             let cols: Vec<&str> = line.split('|').collect();
             if cols.len() < 7 || cols[0] != "HD" {
                 continue;
@@ -157,7 +174,14 @@ impl Callbook {
         let mut conn = Self::ensure_db(&self.path)?;
         let tx = conn.transaction()?;
         let mut n = 0usize;
-        for line in std::io::BufReader::new(en).lines().map_while(Result::ok) {
+        for line in std::io::BufReader::new(en).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("callbook import: skipping undecodable EN line ({e})");
+                    continue;
+                }
+            };
             let cols: Vec<&str> = line.split('|').collect();
             if cols.len() < 8 || cols[0] != "EN" || cols[5] != "L" {
                 continue;
@@ -224,6 +248,25 @@ mod tests {
         assert_eq!(hit.country, "CA");
         let club = cb.lookup("VE2RGC").unwrap().expect("club hit");
         assert_eq!(club.name, "Club Radio Montreal");
+    }
+
+    #[test]
+    fn bad_line_does_not_truncate_import() {
+        // Invalid UTF-8 mid-file: the bad line is skipped, later rows
+        // still land (map_while(Result::ok) used to stop the whole import).
+        let dir = test_dir("badline");
+        let mut bytes = b"VE2AAA;Alain;Aubert\n".to_vec();
+        bytes.extend_from_slice(b"\xff\xfe not utf-8\n");
+        bytes.extend_from_slice(b"VE2BBB;Berthe;Blais\n");
+        std::fs::write(dir.join("amateur.txt"), &bytes).unwrap();
+        let cb = open(&dir.join("cb.db").to_string_lossy());
+        assert_eq!(
+            cb.import_ised(&dir.join("amateur.txt").to_string_lossy())
+                .unwrap(),
+            2
+        );
+        assert!(cb.lookup("VE2AAA").unwrap().is_some());
+        assert!(cb.lookup("VE2BBB").unwrap().is_some());
     }
 
     #[test]

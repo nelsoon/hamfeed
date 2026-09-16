@@ -17,6 +17,6 @@ if [ -f "$DEST/$FILE" ]; then
   echo "stale checksum, re-fetching: $DEST/$FILE"
 fi
 echo "fetching $URL"
-curl -sSL -o "$DEST/$FILE" "$URL"
+curl -sSL --fail -o "$DEST/$FILE" "$URL"
 echo "$SHA  $DEST/$FILE" | sha256sum -c -
 echo "saved: $DEST/$FILE"

@@ -132,6 +132,11 @@ struct CorrectBody {
     text: Option<String>,
 }
 
+/// Corrections are labels, not essays: a 120 s transmission holds on the
+/// order of two thousand characters; beyond this the request is rejected
+/// (413) instead of stored.
+pub const MAX_CORRECTION_LEN: usize = 4000;
+
 pub fn create_app(state: AppState) -> Router {
     let static_dir = state.static_dir.clone();
     Router::new()
@@ -259,8 +264,12 @@ async fn api_triage(
     };
     {
         let mut pipe = state.pipeline.lock().await;
-        pipe.set_triage(&id, triage)
-            .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+        if let Err(e) = pipe.set_triage(&id, triage) {
+            // Drop the guard before mapping: map_store_err re-locks the
+            // same mutex and would deadlock on it.
+            drop(pipe);
+            return Err(map_store_err(&state, &id, e).await);
+        }
     }
     if needs_drain {
         // Retry re-transcribes off the async runtime; fresh rows broadcast
@@ -290,6 +299,24 @@ async fn api_triage(
     Ok(Json(api))
 }
 
+/// Map a store write failure to 404 (row gone) or 500 (row exists, so
+/// the write itself failed). Only runs on the error path.
+async fn map_store_err(state: &AppState, id: &str, e: anyhow::Error) -> (StatusCode, String) {
+    let exists = state
+        .pipeline
+        .lock()
+        .await
+        .store()
+        .get(id)
+        .map(|o| o.is_some())
+        .unwrap_or(false);
+    if exists {
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    } else {
+        (StatusCode::NOT_FOUND, "no such message".into())
+    }
+}
+
 /// Operator sender confirm/correct (003 S8): attach the verdict and
 /// teach the voice library. Unknown ids are 404, non-callsigns 400.
 /// Broadcasts like triage so live cards update without reload.
@@ -303,8 +330,10 @@ async fn api_confirm_sender(
     }
     {
         let pipe = state.pipeline.lock().await;
-        pipe.confirm_sender(&id, &body.callsign)
-            .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+        if let Err(e) = pipe.confirm_sender(&id, &body.callsign) {
+            drop(pipe);
+            return Err(map_store_err(&state, &id, e).await);
+        }
     }
     let pipe = state.pipeline.lock().await;
     let msg = pipe
@@ -326,11 +355,25 @@ async fn api_correct(
     Path(id): Path<String>,
     body: Option<Json<CorrectBody>>,
 ) -> Result<Json<ApiMessage>, (StatusCode, String)> {
+    if body
+        .as_ref()
+        .and_then(|b| b.text.as_deref())
+        .is_some_and(|t| t.chars().count() > MAX_CORRECTION_LEN)
+    {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("correction over {MAX_CORRECTION_LEN} chars"),
+        ));
+    }
     {
         let pipe = state.pipeline.lock().await;
-        pipe.store()
+        if let Err(e) = pipe
+            .store()
             .set_correction(&id, body.as_ref().and_then(|b| b.text.as_deref()))
-            .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+        {
+            drop(pipe);
+            return Err(map_store_err(&state, &id, e).await);
+        }
     }
     let pipe = state.pipeline.lock().await;
     let msg = pipe
@@ -528,19 +571,26 @@ fn serve_bytes(full: Vec<u8>, content_type: &str, headers: HeaderMap) -> axum::r
 }
 
 fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
+    // `total - 1` underflows on empty bodies: reject first, not last.
+    if total == 0 {
+        return None;
+    }
     let spec = header.strip_prefix("bytes=")?.trim();
     let (start_s, end_s) = spec.split_once('-')?;
-    let start: usize = if start_s.is_empty() {
-        total.saturating_sub(end_s.parse::<usize>().ok()? + 1)
+    // Suffix form (`bytes=-N`, RFC 7233 §2.1) runs to the end of the body;
+    // `bytes=-0` asks for zero bytes and the range check below rejects it.
+    let suffix = start_s.is_empty();
+    let start: usize = if suffix {
+        total.saturating_sub(end_s.parse::<usize>().ok()?)
     } else {
         start_s.parse().ok()?
     };
-    let end: usize = if end_s.is_empty() {
+    let end: usize = if suffix || end_s.is_empty() {
         total - 1
     } else {
         end_s.parse::<usize>().ok()?.min(total - 1)
     };
-    if total == 0 || start >= total || start > end {
+    if start >= total || start > end {
         return None;
     }
     Some((start, end))
@@ -860,6 +910,9 @@ freq_label = "TEST"
             js.contains("sender_callsign"),
             "sender badge needs identity"
         );
+        // esc() must neutralize both quote kinds: card HTML mixes
+        // double-quoted attributes with values the model wrote.
+        assert!(js.contains("&#39;"), "esc covers single quotes");
         assert!(js.contains("banner foryou"), "for-you banner must ship");
         assert!(
             js.contains("banner emergency"),
@@ -1045,6 +1098,29 @@ freq_label = "TEST"
             "audio-less pair excluded: {manifest}"
         );
         assert!(!zip_names(&body).iter().any(|n| n.starts_with("m-fr-low")));
+    }
+
+    #[tokio::test]
+    async fn correct_oversized_is_413() {
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        let big = "x".repeat(MAX_CORRECTION_LEN + 1);
+        let r = client
+            .post(format!("{base}/api/messages/m-fr-ok/correct"))
+            .json(&serde_json::json!({"text": big}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 413);
+        // At the boundary: accepted.
+        let ok = "y".repeat(MAX_CORRECTION_LEN);
+        let r = client
+            .post(format!("{base}/api/messages/m-fr-ok/correct"))
+            .json(&serde_json::json!({"text": ok}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
     }
 
     #[tokio::test]
@@ -1251,6 +1327,25 @@ freq_label = "TEST"
             .find(|m| m["id"] == "m-alert")
             .expect("feed carries m-alert");
         assert_eq!(card["alert"], 3);
+    }
+
+    #[test]
+    fn parse_range_units() {
+        assert_eq!(parse_range("bytes=0-9", 100), Some((0, 9)));
+        assert_eq!(parse_range("bytes=90-", 100), Some((90, 99)));
+        // Suffix form: the LAST N bytes (RFC 7233 §2.1), not total-(N+1).
+        assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)));
+        assert_eq!(parse_range("bytes=-200", 100), Some((0, 99)));
+        assert_eq!(parse_range("bytes=0-999", 100), Some((0, 99)));
+        // Rejections: empty body (no underflow), past-the-end,
+        // inverted, zero-length, unparsable.
+        assert_eq!(parse_range("bytes=0-", 0), None);
+        assert_eq!(parse_range("bytes=-5", 0), None);
+        assert_eq!(parse_range("bytes=200-300", 100), None);
+        assert_eq!(parse_range("bytes=50-40", 100), None);
+        assert_eq!(parse_range("bytes=-0", 100), None);
+        assert_eq!(parse_range("bytes=abc", 100), None);
+        assert_eq!(parse_range("bytes=", 100), None);
     }
 
     fn zip_names(body: &[u8]) -> Vec<String> {
