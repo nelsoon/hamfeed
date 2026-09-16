@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use hamfeed_pipeline::Pipeline;
 
 fn usage() -> ! {
-    eprintln!("usage: hamfeed-pipeline [--config PATH] [--once] [--fake SECS] [--simplex]");
+    eprintln!("usage: hamfeed-pipeline [--config PATH] [--once] [--fake SECS] [--simplex] [--list-devices]");
     std::process::exit(2);
 }
 
@@ -18,6 +18,20 @@ fn main() {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" => config = PathBuf::from(args.next().unwrap_or_else(|| usage())),
+            "--list-devices" => {
+                #[cfg(feature = "capture")]
+                {
+                    for name in hamfeed_source::list_input_devices() {
+                        println!("{name}");
+                    }
+                    return;
+                }
+                #[cfg(not(feature = "capture"))]
+                {
+                    eprintln!("hamfeed-pipeline: rebuild with --features capture");
+                    std::process::exit(2);
+                }
+            }
             "--once" => once = true,
             "--fake" => {
                 fake_secs = Some(

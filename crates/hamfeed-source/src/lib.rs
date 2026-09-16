@@ -115,6 +115,14 @@ mod mic {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use std::sync::mpsc;
 
+    /// Names of all host input devices (for `--list-devices` and errors).
+    pub fn list_input_devices() -> Vec<String> {
+        let host = cpal::default_host();
+        host.input_devices()
+            .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
+            .unwrap_or_default()
+    }
+
     /// cpal mic input at 16 kHz mono S16.
     pub struct MicSource {
         rx: mpsc::Receiver<PcmFrame>,
@@ -144,9 +152,13 @@ mod mic {
                     })?
             };
             let device_name = device.name().unwrap_or_else(|_| wanted.into());
-            let supported = device
-                .supported_input_configs()
-                .context("cannot query supported input configs")?;
+            let supported = device.supported_input_configs().with_context(|| {
+                format!(
+                    "cannot query supported input configs on {device_name:?} \
+                         (available: {})",
+                    list_names(&host)
+                )
+            })?;
             let mut supported_note = Vec::new();
             let mut chosen: Option<cpal::SupportedStreamConfig> = None;
             for cfg in supported {
@@ -219,7 +231,7 @@ mod mic {
 }
 
 #[cfg(feature = "capture")]
-pub use mic::MicSource;
+pub use mic::{list_input_devices, MicSource};
 
 #[cfg(test)]
 mod tests {
