@@ -275,11 +275,15 @@ impl Pipeline {
         source: &mut dyn AudioSource,
         hang_ms: u64,
         max_s: u64,
+        beep_split: bool,
+        beep_min_ms: u64,
     ) -> Result<usize> {
         let mut seg = Segmenter::new(
             SegmenterConfig {
                 hang_ms,
                 max_segment_ms: max_s * 1000,
+                beep_split,
+                beep_min_ms,
                 ..Default::default()
             },
             now_ms(),
@@ -519,7 +523,7 @@ freq_label = "TEST"
                 .map(|c| hamfeed_source::PcmFrame { samples: c })
                 .collect(),
         );
-        let n = pipe.run_source(&mut src, 400, 120).unwrap();
+        let n = pipe.run_source(&mut src, 400, 120, true, 150).unwrap();
         assert!(n >= 3, "three bursts, got {n} segments");
         assert!(
             pipe.drain_count() >= 3,
@@ -543,7 +547,7 @@ freq_label = "TEST"
                 .map(|c| hamfeed_source::PcmFrame { samples: c })
                 .collect(),
         );
-        let n = pipe.run_source(&mut src, 400, 120).unwrap();
+        let n = pipe.run_source(&mut src, 400, 120, true, 150).unwrap();
         assert!(n >= 1, "at least one segment must land, got {n}");
         let page = pipe
             .store

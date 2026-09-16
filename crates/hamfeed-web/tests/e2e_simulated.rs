@@ -75,7 +75,9 @@ async fn e2e_simulated_feed() {
     let mut src = FakeSource::once(frames);
 
     let mut pipe = test_pipeline(&dir);
-    let n = pipe.run_source(&mut src, 800, 120).expect("loop runs");
+    let n = pipe
+        .run_source(&mut src, 800, 120, true, 150)
+        .expect("loop runs");
     assert!(n >= 1, "speech must produce segments");
 
     // Corrupt transmission: enqueue a valid segment, then bit-rot its clip

@@ -26,12 +26,26 @@ pub struct Audio {
     pub sample_rate: u32,
 }
 
+fn default_beep_split() -> bool {
+    true
+}
+
+fn default_beep_min_ms() -> u64 {
+    150
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Vad {
     pub engine: String,
     pub hang_ms: u64,
     #[serde(default)]
     pub profiles: VadProfiles,
+    /// Cut segments on repeater courtesy beeps (B4). Old configs omit it.
+    #[serde(default = "default_beep_split")]
+    pub beep_split: bool,
+    /// Sustained-tone persistence before a beep cuts (B4, ms).
+    #[serde(default = "default_beep_min_ms")]
+    pub beep_min_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -110,6 +124,12 @@ impl Config {
             );
         }
         hang_in_range("[vad] hang_ms", self.vad.hang_ms)?;
+        if !(50..=1000).contains(&self.vad.beep_min_ms) {
+            anyhow::bail!(
+                "[vad] beep_min_ms = {} out of range (want 50..=1000)",
+                self.vad.beep_min_ms
+            );
+        }
         if let Some(p) = &self.vad.profiles.repeater {
             hang_in_range("[vad.profiles.repeater] hang_ms", p.hang_ms)?;
         }

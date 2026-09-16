@@ -71,7 +71,13 @@ fn main() {
         );
         let cfg = load_cfg(&config);
         let n = pipe
-            .run_source(&mut src, cfg.hang_ms(profile), cfg.segment.max_s)
+            .run_source(
+                &mut src,
+                cfg.hang_ms(profile),
+                cfg.segment.max_s,
+                cfg.vad.beep_split,
+                cfg.vad.beep_min_ms,
+            )
             .unwrap_or_else(|e| {
                 eprintln!("hamfeed-pipeline: simulation failed: {e:?}");
                 std::process::exit(1);
@@ -101,7 +107,13 @@ fn main() {
             mic.device_name()
         );
         let n = pipe
-            .run_source(&mut mic, cfg.hang_ms(profile), cfg.segment.max_s)
+            .run_source(
+                &mut mic,
+                cfg.hang_ms(profile),
+                cfg.segment.max_s,
+                cfg.vad.beep_split,
+                cfg.vad.beep_min_ms,
+            )
             .unwrap_or_else(|e| {
                 eprintln!("hamfeed-pipeline: capture failed: {e:?}");
                 std::process::exit(1);
