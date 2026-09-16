@@ -147,7 +147,10 @@ impl Pipeline {
                 freq_label: self.cfg.station.freq_label.clone(),
                 lang: out.lang,
                 lang_conf: out.lang_conf,
-                transcript: out.transcript,
+                // Spoken phonetics collapse to letter groups ("alpha lima
+                // lima oscar" -> "ALLO") so callsigns read and search as
+                // written; ham shortcuts ("73", "QTH") pass through.
+                transcript: hamfeed_stt::normalize_phonetics(&out.transcript),
                 stt_conf: out.stt_conf,
                 conf_flag: if out.stt_conf >= CONF_OK { "ok" } else { "low" }.into(),
                 status: "ok".into(),
