@@ -1,0 +1,12 @@
+[package]
+name = "hamfeed-speaker"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["tls-rustls"], optional = true }
+
+[features]
+# ONNX voice embeddings. Default builds never compile `ort`.
+voice = ["dep:ort"]

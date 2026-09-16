@@ -12,9 +12,11 @@ axum = "0.7"
 tower-http = { version = "0.5", features = ["fs"] }
 futures-core = "0.3"
 futures-util = "0.3"
+zip = "2"
 hamfeed-ingest = { path = "../hamfeed-ingest", features = ["opus"] }
 hamfeed-store = { path = "../hamfeed-store" }
 hamfeed-pipeline = { path = "../hamfeed-pipeline" }
+hamfeed-callsign = { path = "../hamfeed-callsign" }
 
 [dev-dependencies]
 hamfeed-config = { path = "../hamfeed-config" }

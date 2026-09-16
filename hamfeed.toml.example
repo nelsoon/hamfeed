@@ -31,3 +31,30 @@ delete_audio_on_drop = false
 
 [station]
 freq_label = "REPEATER-XXX.XXX"
+# Your own callsign: messages addressed to it raise a for-you notification.
+# Spelled forms ("Victor Echo 2 ...") are derived automatically.
+# my_callsign = "VE2XXX"
+
+# Sender carry window (Slice 2): follow-ups within this many minutes of the
+# last heard self-ID inherit its sender, marked inferred (1..=240).
+[identity]
+link_window_min = 30
+
+# Local callbook (Slice 2): uncomment to override the derived path
+# (<storage.dir>/callbook.db). Missing file degrades to nameless badges.
+[callbook]
+# db_path = "./data/audio/callbook.db"
+
+# Emergency cue list (Slice 2): matched case-insensitively (FR+EN defaults).
+[notify]
+emergency_cues = ["mayday", "may-day", "urgence", "emergency", "sos", "détresse", "detresse"]
+
+# Voiceprints (Slice 2): empty model_path disables voice (loud log, never
+# fatal). min_embed_s gates short blips; threshold is the cosine gate
+# (0.0..=1.0); suggest_min_conf gates past-window suggestions.
+[voiceprint]
+model_path = ""
+min_embed_s = 1.5
+threshold = 0.55
+suggest_min_conf = 0.5
+retention_days = 7

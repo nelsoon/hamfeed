@@ -18,6 +18,18 @@ pub struct Config {
     pub stt: Stt,
     pub storage: Storage,
     pub station: Station,
+    /// Sender carry window (Slice 2). Old configs omit it.
+    #[serde(default)]
+    pub identity: Identity,
+    /// Local callbook database (Slice 2). Old configs omit it.
+    #[serde(default)]
+    pub callbook: CallbookCfg,
+    /// Notification cue lists (Slice 2). Old configs omit it.
+    #[serde(default)]
+    pub notify: Notify,
+    /// Voiceprint settings (Slice 2). Old configs omit it.
+    #[serde(default)]
+    pub voiceprint: Voiceprint,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +98,120 @@ pub struct Station {
     pub freq_label: String,
     #[serde(default)]
     pub my_callsign: Option<String>,
+}
+
+fn default_link_window_min() -> u64 {
+    30
+}
+
+/// Sender carry window: follow-ups within this long of the last heard
+/// self-ID inherit its sender, marked inferred (R2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Identity {
+    #[serde(default = "default_link_window_min")]
+    pub link_window_min: u64,
+}
+
+impl Default for Identity {
+    fn default() -> Self {
+        Self {
+            link_window_min: default_link_window_min(),
+        }
+    }
+}
+
+/// Local CA/US callbook database path (R3). Empty `db_path` derives
+/// `<storage.dir>/callbook.db`; a missing file degrades to nameless
+/// badges, never an error.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CallbookCfg {
+    #[serde(default)]
+    pub db_path: String,
+}
+
+impl CallbookCfg {
+    pub fn resolved_db_path(&self, storage_dir: &str) -> String {
+        if self.db_path.trim().is_empty() {
+            format!("{}/callbook.db", storage_dir.trim_end_matches('/'))
+        } else {
+            self.db_path.clone()
+        }
+    }
+}
+
+fn default_emergency_cues() -> Vec<String> {
+    [
+        "mayday",
+        "may-day",
+        "urgence",
+        "emergency",
+        "sos",
+        "détresse",
+        "detresse",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Notification cue lists (R5–R6). `my_callsign` lives under `[station]`;
+/// emergency cues match case-insensitively against transcripts.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Notify {
+    #[serde(default = "default_emergency_cues")]
+    pub emergency_cues: Vec<String>,
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Self {
+            emergency_cues: default_emergency_cues(),
+        }
+    }
+}
+
+fn default_min_embed_s() -> f32 {
+    1.5
+}
+
+fn default_voice_threshold() -> f32 {
+    0.55
+}
+
+fn default_suggest_min_conf() -> f32 {
+    0.5
+}
+
+fn default_voice_retention_days() -> u64 {
+    7
+}
+
+/// Voiceprint settings (R4). Empty `model_path` (or an unreadable file)
+/// disables voice with a loud log line — never a startup refusal.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Voiceprint {
+    #[serde(default)]
+    pub model_path: String,
+    #[serde(default = "default_min_embed_s")]
+    pub min_embed_s: f32,
+    #[serde(default = "default_voice_threshold")]
+    pub threshold: f32,
+    #[serde(default = "default_suggest_min_conf")]
+    pub suggest_min_conf: f32,
+    #[serde(default = "default_voice_retention_days")]
+    pub retention_days: u64,
+}
+
+impl Default for Voiceprint {
+    fn default() -> Self {
+        Self {
+            model_path: String::new(),
+            min_embed_s: default_min_embed_s(),
+            threshold: default_voice_threshold(),
+            suggest_min_conf: default_suggest_min_conf(),
+            retention_days: default_voice_retention_days(),
+        }
+    }
 }
 
 /// Supported STT languages for Slice 1 (ADR-4: local whisper, FR/EN only).
@@ -162,6 +288,36 @@ impl Config {
             );
         }
         non_empty("[station] freq_label", &self.station.freq_label)?;
+        if !(1..=240).contains(&self.identity.link_window_min) {
+            anyhow::bail!(
+                "[identity] link_window_min = {} out of range (want 1..=240)",
+                self.identity.link_window_min
+            );
+        }
+        if !(0.0..=1.0).contains(&self.voiceprint.threshold) {
+            anyhow::bail!(
+                "[voiceprint] threshold = {} out of range (want 0.0..=1.0)",
+                self.voiceprint.threshold
+            );
+        }
+        if !(0.0..=1.0).contains(&self.voiceprint.suggest_min_conf) {
+            anyhow::bail!(
+                "[voiceprint] suggest_min_conf = {} out of range (want 0.0..=1.0)",
+                self.voiceprint.suggest_min_conf
+            );
+        }
+        if !(0.1..=30.0).contains(&self.voiceprint.min_embed_s) {
+            anyhow::bail!(
+                "[voiceprint] min_embed_s = {} out of range (want 0.1..=30.0)",
+                self.voiceprint.min_embed_s
+            );
+        }
+        if !(1..=3650).contains(&self.voiceprint.retention_days) {
+            anyhow::bail!(
+                "[voiceprint] retention_days = {} out of range (want 1..=3650)",
+                self.voiceprint.retention_days
+            );
+        }
         Ok(())
     }
 
@@ -213,6 +369,19 @@ pub fn missing_model_hint(model_path: &str) -> String {
          or drop a compatible ggml model in manually:\n  \
            mkdir -p models && cp <your-ggml-model> {model_path}\n\
          (tiny/base/small all work; CI caches the tiny model)."
+    )
+}
+
+/// Provisioning instructions shown when the voice model is missing (003
+/// R9). Voice is optional: this text is logged loudly, never a refusal.
+pub fn missing_voice_model_hint(model_path: &str) -> String {
+    format!(
+        "voiceprint model not found at {model_path} — voiceprints off.\n\
+         Fetch it with the download helper:\n  \
+           sh scripts/download-voice-model.sh models\n\
+         or drop the file in manually:\n  \
+           mkdir -p models && cp <wespeaker.onnx> {model_path}\n\
+         (pinned wespeaker revision; SHA-256 verified by the helper)."
     )
 }
 
@@ -273,6 +442,70 @@ mod tests {
                 "{label}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn voice_sections_default() {
+        let cfg = parse(EXAMPLE).expect("example must parse");
+        assert_eq!(cfg.identity.link_window_min, 30);
+        assert!(cfg.notify.emergency_cues.contains(&"mayday".to_string()));
+        assert!(cfg.notify.emergency_cues.contains(&"urgence".to_string()));
+        assert_eq!(cfg.voiceprint.threshold, 0.55);
+        assert_eq!(cfg.voiceprint.min_embed_s, 1.5);
+        assert_eq!(cfg.voiceprint.retention_days, 7);
+        // Empty db_path derives from the storage dir.
+        assert_eq!(
+            cfg.callbook.resolved_db_path(&cfg.storage.dir),
+            format!("{}/callbook.db", cfg.storage.dir)
+        );
+    }
+
+    #[test]
+    fn old_config_without_slice2_sections_parses() {
+        let text = r#"
+[audio]
+device = "default"
+sample_rate = 16000
+[vad]
+engine = "energy"
+hang_ms = 400
+[segment]
+max_s = 120
+[stt]
+model_path = "models/ggml-tiny.bin"
+lang_whitelist = ["fr", "en"]
+[storage]
+dir = "./data/audio"
+db_path = "./data/hamfeed.db"
+retention_days = 90
+[station]
+freq_label = "TEST"
+"#;
+        let cfg = parse(text).expect("pre-slice-2 config must still parse");
+        assert_eq!(cfg.identity.link_window_min, 30);
+        assert!(cfg.voiceprint.model_path.is_empty());
+    }
+
+    #[test]
+    fn rejects_bad_threshold() {
+        let text = EXAMPLE.replace("threshold = 0.55", "threshold = 1.5");
+        let err = parse(&text).unwrap_err();
+        assert!(format!("{err:?}").contains("threshold"));
+    }
+
+    #[test]
+    fn rejects_zero_window() {
+        let text = EXAMPLE.replace("link_window_min = 30", "link_window_min = 0");
+        let err = parse(&text).unwrap_err();
+        assert!(format!("{err:?}").contains("link_window_min"));
+    }
+
+    #[test]
+    fn missing_voice_model_hint_text() {
+        let hint = missing_voice_model_hint("models/wespeaker.onnx");
+        assert!(hint.contains("scripts/download-voice-model.sh"));
+        assert!(hint.contains("models/wespeaker.onnx"));
+        assert!(hint.contains("voiceprints off"));
     }
 
     #[test]

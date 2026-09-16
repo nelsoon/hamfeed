@@ -49,11 +49,35 @@
     body += '<div class="card-head"><span class="ts">' + fmtTs(m.ts_start_ms) +
       "</span><span class=\"freq\">" + esc(m.freq_label) +
       '</span><span class="dur">' + fmtDur(m.duration_ms) + "</span></div>";
+    // Alert banners (Slice 2): emergency wins when both bits are set.
+    // Icons match the approved T10 mockup.
+    if (m.alert & 2) {
+      body += '<div class="banner emergency">' +
+        '<svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">' +
+        '<path d="M7 1L13.5 12.5H0.5Z" fill="none" stroke="currentColor"' +
+        ' stroke-width="1.8" stroke-linejoin="round"/>' +
+        '<line x1="7" y1="5.5" x2="7" y2="9" stroke="currentColor" stroke-width="1.8"/>' +
+        '<circle cx="7" cy="10.8" r="1" fill="currentColor"/></svg>' +
+        "<span>EMERGENCY</span></div>";
+    } else if (m.alert & 1) {
+      body += '<div class="banner foryou">' +
+        '<svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">' +
+        '<circle cx="7" cy="4.5" r="2.5" fill="currentColor"/>' +
+        '<path d="M1.5 13c0-3 2.5-4.5 5.5-4.5S12.5 10 12.5 13" fill="none"' +
+        ' stroke="currentColor" stroke-width="1.8"/></svg>' +
+        "<span>FOR YOU</span></div>";
+    }
     if (m.status === "failed") {
       body += '<div class="err">' +
         esc(m.fail_reason || "transcription failed — clip kept") + "</div>";
-    } else {
+    } else if (!m.corrected_text) {
       body += '<p class="transcript">' + esc(m.transcript) + "</p>";
+    }
+    if (m.corrected_text) {
+      body += '<p class="transcript" data-fixed="' + esc(m.corrected_text) +
+        '" data-orig="' + esc(m.transcript) + '">' + esc(m.corrected_text) + "</p>" +
+        '<div class="correction-row"><span class="badge corrected">corrigé</span>' +
+        '<button class="toggle-orig">voir l\u2019original</button></div>';
     }
     if (m.audio_url) {
       body += '<div class="audio-row"><audio controls preload="none" src="' +
@@ -62,6 +86,20 @@
     }
     body += '<div class="foot"><span class="badge lang">' + esc(m.lang) +
       '</span><span class="badge ' + conf + '">' + confText + "</span>";
+    if (m.sender_callsign) {
+      var who = esc(m.sender_callsign) +
+        (m.sender_name ? " · " + esc(m.sender_name) : "");
+      body += '<span class="badge sender" title="' + esc(m.sender_source || "") +
+        '">' + who + "</span>";
+    }
+    body += '<span class="triage"><button class="edit-correction">corriger</button>';
+    if (m.sender_callsign && m.sender_source === "suggested") {
+      body += '<button class="confirm-sender">confirmer</button>';
+    }
+    if (m.sender_callsign) {
+      body += '<button class="fix-sender">indicatif</button>';
+    }
+    body += "</span>";
     if (m.status === "failed") {
       body += '<span class="triage">' +
         '<button data-act="keep">Keep</button>' +
@@ -96,7 +134,101 @@
         triage(m.id, btn.dataset.act);
       });
     });
+    var toggle = el.querySelector(".toggle-orig");
+    if (toggle) {
+      toggle.addEventListener("click", function () {
+        var p = el.querySelector("p.transcript");
+        var showingFixed = p.textContent === p.dataset.fixed;
+        p.textContent = showingFixed ? p.dataset.orig : p.dataset.fixed;
+        toggle.textContent = showingFixed ? "voir la correction" : "voir l\u2019original";
+      });
+    }
+    el.querySelectorAll(".edit-correction").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        openEditor(el, m);
+      });
+    });
+    el.querySelectorAll(".confirm-sender").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        var res = await fetch("/api/messages/" + encodeURIComponent(m.id) + "/confirm-sender", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ callsign: m.sender_callsign }),
+        });
+        if (!res.ok) return;
+        upsert(await res.json());
+      });
+    });
+    el.querySelectorAll(".fix-sender").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        openSenderEditor(el, m);
+      });
+    });
     return el;
+  }
+
+  function openSenderEditor(el, m) {
+    if (el.querySelector(".sender-edit")) return;
+    var box = document.createElement("div");
+    box.className = "correction-edit sender-edit";
+    box.innerHTML = '<input type="text" aria-label="Callsign">' +
+      '<div class="correction-actions"><button class="save">valider</button>' +
+      '<button class="cancel">annuler</button>' +
+      '<span class="correction-err" style="display:none">échec, réessayez</span></div>';
+    var input = box.querySelector("input");
+    input.value = m.sender_callsign || "";
+    var anchor = el.querySelector("p.transcript") || el.querySelector(".err");
+    anchor.after(box);
+    input.focus();
+    box.querySelector(".cancel").addEventListener("click", function () {
+      box.remove();
+    });
+    box.querySelector(".save").addEventListener("click", async function () {
+      var err = box.querySelector(".correction-err");
+      err.style.display = "none";
+      var res = await fetch("/api/messages/" + encodeURIComponent(m.id) + "/confirm-sender", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ callsign: input.value }),
+      });
+      if (!res.ok) {
+        err.style.display = "";
+        return;
+      }
+      upsert(await res.json());
+    });
+  }
+
+  function openEditor(el, m) {
+    if (el.querySelector(".correction-edit")) return;
+    var box = document.createElement("div");
+    box.className = "correction-edit";
+    box.innerHTML = '<textarea rows="3"></textarea>' +
+      '<div class="correction-actions"><button class="save">enregistrer</button>' +
+      '<button class="cancel">annuler</button>' +
+      '<span class="correction-err" style="display:none">échec, réessayez</span></div>';
+    var area = box.querySelector("textarea");
+    area.value = m.corrected_text || m.transcript || "";
+    var anchor = el.querySelector("p.transcript") || el.querySelector(".err");
+    anchor.after(box);
+    area.focus();
+    box.querySelector(".cancel").addEventListener("click", function () {
+      box.remove();
+    });
+    box.querySelector(".save").addEventListener("click", async function () {
+      var err = box.querySelector(".correction-err");
+      err.style.display = "none";
+      var res = await fetch("/api/messages/" + encodeURIComponent(m.id) + "/correct", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: area.value }),
+      });
+      if (!res.ok) {
+        err.style.display = "";
+        return;
+      }
+      upsert(await res.json());
+    });
   }
 
   function upsert(m) {
@@ -125,6 +257,8 @@
     params = params || new URLSearchParams();
     var q = document.getElementById("q").value.trim();
     if (q) params.set("q", q);
+    var sender = document.getElementById("sender").value.trim();
+    if (sender) params.set("sender", sender);
     var from = document.getElementById("from").value;
     var to = document.getElementById("to").value;
     if (from) params.set("from", String(new Date(from).getTime()));

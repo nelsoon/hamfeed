@@ -8,6 +8,11 @@ Slice 1 ("live loop") captures microphone audio, cuts transmissions with an
 energy VAD, archives each as an Opus clip, transcribes locally with whisper,
 and serves text + playback in a live web feed with searchable history.
 
+Slice 2 ("know + notify") attributes each message to its sender: callsigns
+parsed from self-IDs (plain + NATO-spelled, FR/EN), enriched with local
+CA/US callbooks, linked across follow-ups by voiceprint, with for-you and
+emergency notifications in the feed.
+
 ## Install / Run
 
 Prerequisites: stable Rust, `libopus` + ALSA headers, `cmake`, and a whisper
@@ -42,7 +47,13 @@ Open `http://127.0.0.1:8080/` for the live feed.
 - `crates/hamfeed-store` — SQLite + FTS5 archive, retention janitors
 - `crates/hamfeed-pipeline` — orchestration binary
 - `crates/hamfeed-web` — Axum + SSE feed binary + static UI
+- `crates/hamfeed-callsign` — self-ID extraction (plain + spelled, FR/EN)
+- `crates/hamfeed-callbook` — local CA/US operator lookup + import binary
+- `crates/hamfeed-speaker` — voiceprints (mel frontend + ONNX embeddings,
+  `voice` cargo feature)
 - `scripts/download-model.sh` — fetch a whisper model (tiny/base/small)
+- `scripts/download-voice-model.sh` — fetch the wespeaker voice model
+  (checksum-verified; optional — voiceprints stay off without it)
 
 ## Docs
 
