@@ -1,0 +1,15 @@
+[package]
+name = "hamfeed-speaker"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# download-binaries: fresh machines (CI, new clones) fetch prebuilt
+# libonnxruntime at build time — no system install, no ORT_LIB_PATH.
+# A prebuilt local lib via ORT_LIB_PATH still wins when set (as on prod).
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["tls-rustls", "download-binaries"], optional = true }
+
+[features]
+# ONNX voice embeddings. Default builds never compile `ort`.
+voice = ["dep:ort"]

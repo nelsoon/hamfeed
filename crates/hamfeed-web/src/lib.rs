@@ -7,10 +7,11 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
-use axum::response::{IntoResponse, Json};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use futures_core::Stream;
@@ -55,6 +56,16 @@ pub struct ApiMessage {
     pub duration_ms: Option<u64>,
     pub short_flag: bool,
     pub review_flag: String,
+    /// Operator correction, if any (004). `transcript` stays the model's
+    /// original; cards toggle between the two.
+    pub corrected_text: Option<String>,
+    /// Sender identity (Slice 2, 003): callsign + callbook name + how the
+    /// link was made (heard|carried|suggested|confirmed|none).
+    pub sender_callsign: Option<String>,
+    pub sender_name: Option<String>,
+    pub sender_source: String,
+    /// Alert bitmask: 1 = for-you, 2 = emergency.
+    pub alert: i32,
 }
 
 impl ApiMessage {
@@ -77,6 +88,11 @@ impl ApiMessage {
             duration_ms: m.duration_ms,
             short_flag: m.short_flag,
             review_flag: m.review_flag.clone(),
+            corrected_text: m.corrected_text.clone(),
+            sender_callsign: m.sender_callsign.clone(),
+            sender_name: m.sender_name.clone(),
+            sender_source: m.sender_source.clone(),
+            alert: m.alert,
         }
     }
 }
@@ -97,6 +113,12 @@ struct SearchParams {
     limit: Option<usize>,
     cursor: Option<String>,
     status: Option<String>,
+    sender: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfirmBody {
+    callsign: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +126,16 @@ struct TriageBody {
     reason: Option<String>,
     delete_audio: Option<bool>,
 }
+
+#[derive(Debug, Deserialize)]
+struct CorrectBody {
+    text: Option<String>,
+}
+
+/// Corrections are labels, not essays: a 120 s transmission holds on the
+/// order of two thousand characters; beyond this the request is rejected
+/// (413) instead of stored.
+pub const MAX_CORRECTION_LEN: usize = 4000;
 
 pub fn create_app(state: AppState) -> Router {
     let static_dir = state.static_dir.clone();
@@ -113,6 +145,9 @@ pub fn create_app(state: AppState) -> Router {
         .route("/api/messages", get(api_messages))
         .route("/api/search", get(api_search))
         .route("/api/messages/:id/:action", post(api_triage))
+        .route("/api/messages/:id/confirm-sender", post(api_confirm_sender))
+        .route("/api/messages/:id/correct", post(api_correct))
+        .route("/api/export/training", get(api_export_training))
         .route("/api/events", get(api_events))
         .route("/audio/:id", get(api_audio))
         .route("/audio/:id/play.wav", get(api_audio_wav))
@@ -196,6 +231,7 @@ async fn api_search(
             to_ms: q.to,
             hide_noise: q.hide_noise.unwrap_or(false),
             status: q.status,
+            sender: q.sender,
             limit: q.limit.unwrap_or(20),
             cursor: q.cursor,
         })
@@ -228,8 +264,12 @@ async fn api_triage(
     };
     {
         let mut pipe = state.pipeline.lock().await;
-        pipe.set_triage(&id, triage)
-            .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+        if let Err(e) = pipe.set_triage(&id, triage) {
+            // Drop the guard before mapping: map_store_err re-locks the
+            // same mutex and would deadlock on it.
+            drop(pipe);
+            return Err(map_store_err(&state, &id, e).await);
+        }
     }
     if needs_drain {
         // Retry re-transcribes off the async runtime; fresh rows broadcast
@@ -257,6 +297,182 @@ async fn api_triage(
     let api = ApiMessage::from(&msg);
     let _ = state.tx.send(serde_json::to_value(&api).unwrap());
     Ok(Json(api))
+}
+
+/// Map a store write failure to 404 (row gone) or 500 (row exists, so
+/// the write itself failed). Only runs on the error path.
+async fn map_store_err(state: &AppState, id: &str, e: anyhow::Error) -> (StatusCode, String) {
+    let exists = state
+        .pipeline
+        .lock()
+        .await
+        .store()
+        .get(id)
+        .map(|o| o.is_some())
+        .unwrap_or(false);
+    if exists {
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    } else {
+        (StatusCode::NOT_FOUND, "no such message".into())
+    }
+}
+
+/// Operator sender confirm/correct (003 S8): attach the verdict and
+/// teach the voice library. Unknown ids are 404, non-callsigns 400.
+/// Broadcasts like triage so live cards update without reload.
+async fn api_confirm_sender(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ConfirmBody>,
+) -> Result<Json<ApiMessage>, (StatusCode, String)> {
+    if !hamfeed_callsign::is_valid(&hamfeed_callsign::normalize(&body.callsign)) {
+        return Err((StatusCode::BAD_REQUEST, "not a callsign".into()));
+    }
+    {
+        let pipe = state.pipeline.lock().await;
+        if let Err(e) = pipe.confirm_sender(&id, &body.callsign) {
+            drop(pipe);
+            return Err(map_store_err(&state, &id, e).await);
+        }
+    }
+    let pipe = state.pipeline.lock().await;
+    let msg = pipe
+        .store()
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "no such message".into()))?;
+    let api = ApiMessage::from(&msg);
+    let _ = state.tx.send(serde_json::to_value(&api).unwrap());
+    Ok(Json(api))
+}
+
+/// Operator transcript correction (004): store the true text beside the
+/// model's guess. Missing/blank text clears the correction. Unknown ids
+/// are 404 (triage convention). Broadcasts like triage so live cards
+/// update without reload.
+async fn api_correct(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<CorrectBody>>,
+) -> Result<Json<ApiMessage>, (StatusCode, String)> {
+    if body
+        .as_ref()
+        .and_then(|b| b.text.as_deref())
+        .is_some_and(|t| t.chars().count() > MAX_CORRECTION_LEN)
+    {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("correction over {MAX_CORRECTION_LEN} chars"),
+        ));
+    }
+    {
+        let pipe = state.pipeline.lock().await;
+        if let Err(e) = pipe
+            .store()
+            .set_correction(&id, body.as_ref().and_then(|b| b.text.as_deref()))
+        {
+            drop(pipe);
+            return Err(map_store_err(&state, &id, e).await);
+        }
+    }
+    let pipe = state.pipeline.lock().await;
+    let msg = pipe
+        .store()
+        .get(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "no such message".into()))?;
+    let api = ApiMessage::from(&msg);
+    let _ = state.tx.send(serde_json::to_value(&api).unwrap());
+    Ok(Json(api))
+}
+
+fn csv_esc(s: &str) -> String {
+    if s.contains([',', '"', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Training export (004): zip of corrected (audio, true-text) pairs for
+/// offline fine-tuning. `Stored` (audio is already compressed). Rows
+/// whose clip file is gone are skipped — a pair needs both halves.
+async fn api_export_training(State(state): State<AppState>) -> Response {
+    let rows = {
+        let pipe = state.pipeline.lock().await;
+        match pipe.store().corrections_export() {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("export query: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    };
+    // Keep only pairs whose clip file is still on disk — the manifest
+    // must never list audio that did not ship.
+    let mut pairs: Vec<(&hamfeed_store::ExportRow, Vec<u8>)> = Vec::new();
+    for r in &rows {
+        if let Ok(bytes) = std::fs::read(&r.audio_path) {
+            pairs.push((r, bytes));
+        }
+    }
+    let mut manifest = String::from("id,true_text,lang,original_transcript\n");
+    for (r, _) in &pairs {
+        manifest.push_str(&format!(
+            "{},{},{},{}\n",
+            csv_esc(&r.id),
+            csv_esc(&r.corrected),
+            csv_esc(&r.lang),
+            csv_esc(&r.original),
+        ));
+    }
+    let mut zip_buf = std::io::Cursor::new(Vec::new());
+    let fail = |what: &str| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("export zip: {what}"),
+        )
+            .into_response()
+    };
+    {
+        let mut zw = zip::ZipWriter::new(&mut zip_buf);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        use std::io::Write as _;
+        if zw.start_file("manifest.csv", opts).is_err()
+            || zw.write_all(manifest.as_bytes()).is_err()
+        {
+            return fail("manifest");
+        }
+        for (r, bytes) in &pairs {
+            let ext = std::path::Path::new(&r.audio_path)
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("ogg");
+            if zw.start_file(format!("{}.txt", r.id), opts).is_err()
+                || zw.write_all(r.corrected.as_bytes()).is_err()
+                || zw.start_file(format!("{}.{}", r.id, ext), opts).is_err()
+                || zw.write_all(bytes).is_err()
+            {
+                return fail("pair");
+            }
+        }
+        if zw.finish().is_err() {
+            return fail("finish");
+        }
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/zip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"training-export.zip\"",
+        )
+        .body(Body::from(zip_buf.into_inner()))
+        .unwrap()
 }
 
 /// SSE stream of new/updated messages (S7 live feed).
@@ -355,19 +571,26 @@ fn serve_bytes(full: Vec<u8>, content_type: &str, headers: HeaderMap) -> axum::r
 }
 
 fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
+    // `total - 1` underflows on empty bodies: reject first, not last.
+    if total == 0 {
+        return None;
+    }
     let spec = header.strip_prefix("bytes=")?.trim();
     let (start_s, end_s) = spec.split_once('-')?;
-    let start: usize = if start_s.is_empty() {
-        total.saturating_sub(end_s.parse::<usize>().ok()? + 1)
+    // Suffix form (`bytes=-N`, RFC 7233 §2.1) runs to the end of the body;
+    // `bytes=-0` asks for zero bytes and the range check below rejects it.
+    let suffix = start_s.is_empty();
+    let start: usize = if suffix {
+        total.saturating_sub(end_s.parse::<usize>().ok()?)
     } else {
         start_s.parse().ok()?
     };
-    let end: usize = if end_s.is_empty() {
+    let end: usize = if suffix || end_s.is_empty() {
         total - 1
     } else {
         end_s.parse::<usize>().ok()?.min(total - 1)
     };
-    if total == 0 || start >= total || start > end {
+    if start >= total || start > end {
         return None;
     }
     Some((start, end))
@@ -675,6 +898,28 @@ freq_label = "TEST"
             .unwrap();
         assert!(js.contains("/api/events"), "SSE wiring must ship");
         assert!(js.contains("/api/messages"), "REST wiring must ship");
+        // Correction UI wiring (004): editor posts here, toggle reads this.
+        assert!(js.contains("/correct"), "correction endpoint must ship");
+        assert!(js.contains("corrected_text"), "toggle needs both texts");
+        assert!(
+            index.contains("/api/export/training"),
+            "export link must ship"
+        );
+        // Sender UI wiring (003): badges, banners, confirm, filter.
+        assert!(
+            js.contains("sender_callsign"),
+            "sender badge needs identity"
+        );
+        // esc() must neutralize both quote kinds: card HTML mixes
+        // double-quoted attributes with values the model wrote.
+        assert!(js.contains("&#39;"), "esc covers single quotes");
+        assert!(js.contains("banner foryou"), "for-you banner must ship");
+        assert!(
+            js.contains("banner emergency"),
+            "emergency banner must ship"
+        );
+        assert!(js.contains("/confirm-sender"), "confirm endpoint must ship");
+        assert!(index.contains("id=\"sender\""), "sender filter must ship");
     }
 
     #[tokio::test]
@@ -709,5 +954,412 @@ freq_label = "TEST"
             .await
             .unwrap();
         assert_eq!(s["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn correct_roundtrip() {
+        // Submit a correction: JSON carries both texts, original intact.
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        let mut events = client
+            .get(format!("{base}/api/events"))
+            .header("Accept", "text/event-stream")
+            .send()
+            .await
+            .expect("sse connects");
+        let fixed: ApiMessage = client
+            .post(format!("{base}/api/messages/m-fr-ok/correct"))
+            .json(&serde_json::json!({"text": "bonjour les vrais amis"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(fixed.id, "m-fr-ok");
+        assert_eq!(
+            fixed.corrected_text.as_deref(),
+            Some("bonjour les vrais amis")
+        );
+        assert_eq!(fixed.transcript, "bonjour les amis");
+        // The correction broadcasts like triage (live cards update).
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), events.chunk())
+            .await
+            .expect("sse event arrives")
+            .expect("chunk reads")
+            .expect("non-empty");
+        let text = String::from_utf8_lossy(&chunk);
+        assert!(
+            text.contains("bonjour les vrais amis"),
+            "event carries fix: {text}"
+        );
+        // Feed search hits the corrected-only word.
+        let s: serde_json::Value = client
+            .get(format!("{base}/api/search?q=vrais"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(s["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn correct_blank_clears_and_unknown_404() {
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        let fixed: ApiMessage = client
+            .post(format!("{base}/api/messages/m-fr-ok/correct"))
+            .json(&serde_json::json!({"text": "  "}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(fixed.corrected_text, None);
+        // Missing body clears too.
+        let fixed: ApiMessage = client
+            .post(format!("{base}/api/messages/m-fr-ok/correct"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(fixed.corrected_text, None);
+        // Unknown id is 404, not 500.
+        let r = client
+            .post(format!("{base}/api/messages/nope/correct"))
+            .json(&serde_json::json!({"text": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn export_zip_pairs() {
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        // Empty export first: manifest only, no pairs.
+        let empty = client
+            .get(format!("{base}/api/export/training"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let names = zip_names(&empty);
+        assert_eq!(names, vec!["manifest.csv"]);
+        // Correct two rows; only the one with a clip file on disk exports.
+        // NOTE: seed audio paths are /tmp/{id}.ogg; m-en-ok is used here
+        // because no other test touches it (m-fr-ok races audio_wav_plays).
+        std::fs::write("/tmp/m-en-ok.ogg", b"fake-opus-bytes").unwrap();
+        for (id, text) in [
+            ("m-en-ok", "hello true friends"),
+            ("m-fr-low", "appel corrigé"),
+        ] {
+            client
+                .post(format!("{base}/api/messages/{id}/correct"))
+                .json(&serde_json::json!({"text": text}))
+                .send()
+                .await
+                .unwrap();
+        }
+        let body = client
+            .get(format!("{base}/api/export/training"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file("/tmp/m-en-ok.ogg");
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&body[..])).unwrap();
+        let manifest = read_zip(&mut zip, "manifest.csv");
+        assert!(
+            manifest.contains("m-en-ok"),
+            "manifest lists pair: {manifest}"
+        );
+        assert!(
+            manifest.contains("hello true friends"),
+            "manifest true text: {manifest}"
+        );
+        assert!(
+            !manifest.contains("m-fr-ok"),
+            "uncorrected excluded: {manifest}"
+        );
+        assert_eq!(read_zip(&mut zip, "m-en-ok.txt"), "hello true friends");
+        assert!(
+            !manifest.contains("m-fr-low"),
+            "audio-less pair excluded: {manifest}"
+        );
+        assert!(!zip_names(&body).iter().any(|n| n.starts_with("m-fr-low")));
+    }
+
+    #[tokio::test]
+    async fn correct_oversized_is_413() {
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        let big = "x".repeat(MAX_CORRECTION_LEN + 1);
+        let r = client
+            .post(format!("{base}/api/messages/m-fr-ok/correct"))
+            .json(&serde_json::json!({"text": big}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 413);
+        // At the boundary: accepted.
+        let ok = "y".repeat(MAX_CORRECTION_LEN);
+        let r = client
+            .post(format!("{base}/api/messages/m-fr-ok/correct"))
+            .json(&serde_json::json!({"text": ok}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn correction_flow() {
+        // Slice proof end to end: correct → feed shows both texts → search
+        // hits the corrected-only word → export ships the pair.
+        // NOTE: m-old's clip path is exclusive to this test.
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        std::fs::write("/tmp/m-old.ogg", b"fake-opus-bytes").unwrap();
+        client
+            .post(format!("{base}/api/messages/m-old/correct"))
+            .json(&serde_json::json!({"text": "message ancien corrigé"}))
+            .send()
+            .await
+            .unwrap();
+        let feed: serde_json::Value = client
+            .get(format!("{base}/api/messages?limit=20"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let card = feed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "m-old")
+            .expect("feed carries m-old");
+        assert_eq!(card["corrected_text"], "message ancien corrigé");
+        assert_eq!(card["transcript"], "ancien message");
+        let s: serde_json::Value = client
+            .get(format!("{base}/api/search?q=corrigé"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(s["messages"].as_array().unwrap().len(), 1);
+        let body = client
+            .get(format!("{base}/api/export/training"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file("/tmp/m-old.ogg");
+        assert!(zip_names(&body).contains(&"m-old.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn sender_badge_in_feed() {
+        let (base, _h) = test_server().await;
+        {
+            let pipe = _h.state.pipeline.lock().await;
+            pipe.store()
+                .set_sender("m-fr-ok", Some("VE2DEM"), Some("Jean Tremblay"), "heard")
+                .unwrap();
+            pipe.store()
+                .set_sender("m-en-ok", Some("VE2DEM"), None, "carried")
+                .unwrap();
+        }
+        let client = reqwest::Client::new();
+        let feed: serde_json::Value = client
+            .get(format!("{base}/api/messages?limit=20"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let card = feed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "m-fr-ok")
+            .expect("feed carries m-fr-ok");
+        assert_eq!(card["sender_callsign"], "VE2DEM");
+        assert_eq!(card["sender_name"], "Jean Tremblay");
+        assert_eq!(card["sender_source"], "heard");
+        // Nameless carried badge: callsign alone.
+        let card = feed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "m-en-ok")
+            .expect("feed carries m-en-ok");
+        assert_eq!(card["sender_name"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn sender_filter() {
+        let (base, _h) = test_server().await;
+        {
+            let pipe = _h.state.pipeline.lock().await;
+            pipe.store()
+                .set_sender("m-fr-ok", Some("VE2DEM"), None, "heard")
+                .unwrap();
+            pipe.store()
+                .set_sender("m-en-ok", Some("VE3MA"), None, "heard")
+                .unwrap();
+        }
+        let client = reqwest::Client::new();
+        let s: serde_json::Value = client
+            .get(format!("{base}/api/search?sender=ve2dem"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ids: Vec<&str> = s["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["m-fr-ok"]);
+    }
+
+    #[tokio::test]
+    async fn confirm_roundtrip() {
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        let confirmed: ApiMessage = client
+            .post(format!("{base}/api/messages/m-fr-ok/confirm-sender"))
+            .json(&serde_json::json!({"callsign": "ve2dem"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(confirmed.sender_callsign.as_deref(), Some("VE2DEM"));
+        assert_eq!(confirmed.sender_source, "confirmed");
+        // Non-callsign is 400, unknown id 404.
+        let r = client
+            .post(format!("{base}/api/messages/m-fr-ok/confirm-sender"))
+            .json(&serde_json::json!({"callsign": "not a call"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        let r = client
+            .post(format!("{base}/api/messages/nope/confirm-sender"))
+            .json(&serde_json::json!({"callsign": "VE2DEM"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn alert_banner_payload() {
+        // The JSON carries the bits; banners render from them (mockup
+        // anatomy, asserted on the shipped JS below).
+        let (base, _h) = test_server().await;
+        {
+            let pipe = _h.state.pipeline.lock().await;
+            pipe.store()
+                .insert(&hamfeed_store::NewMessage {
+                    id: "m-alert".into(),
+                    ts_start_ms: 9500,
+                    ts_end_ms: 10000,
+                    freq_label: "TEST".into(),
+                    lang: "en".into(),
+                    lang_conf: 0.9,
+                    transcript: "Mayday, mayday".into(),
+                    stt_conf: 0.8,
+                    conf_flag: "ok".into(),
+                    status: "ok".into(),
+                    fail_reason: None,
+                    audio_path: None,
+                    duration_ms: Some(500),
+                    size_bytes: None,
+                    short_flag: false,
+                    group_id: "g".into(),
+                    seq: 0,
+                    sender_callsign: Some("W1AW".into()),
+                    sender_name: None,
+                    sender_source: "heard".into(),
+                    alert: 3,
+                    speaker_key: None,
+                    corrected_text: None,
+                })
+                .unwrap();
+        }
+        let client = reqwest::Client::new();
+        let feed: serde_json::Value = client
+            .get(format!("{base}/api/messages?limit=20"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let card = feed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "m-alert")
+            .expect("feed carries m-alert");
+        assert_eq!(card["alert"], 3);
+    }
+
+    #[test]
+    fn parse_range_units() {
+        assert_eq!(parse_range("bytes=0-9", 100), Some((0, 9)));
+        assert_eq!(parse_range("bytes=90-", 100), Some((90, 99)));
+        // Suffix form: the LAST N bytes (RFC 7233 §2.1), not total-(N+1).
+        assert_eq!(parse_range("bytes=-10", 100), Some((90, 99)));
+        assert_eq!(parse_range("bytes=-200", 100), Some((0, 99)));
+        assert_eq!(parse_range("bytes=0-999", 100), Some((0, 99)));
+        // Rejections: empty body (no underflow), past-the-end,
+        // inverted, zero-length, unparsable.
+        assert_eq!(parse_range("bytes=0-", 0), None);
+        assert_eq!(parse_range("bytes=-5", 0), None);
+        assert_eq!(parse_range("bytes=200-300", 100), None);
+        assert_eq!(parse_range("bytes=50-40", 100), None);
+        assert_eq!(parse_range("bytes=-0", 100), None);
+        assert_eq!(parse_range("bytes=abc", 100), None);
+        assert_eq!(parse_range("bytes=", 100), None);
+    }
+
+    fn zip_names(body: &[u8]) -> Vec<String> {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(body)).unwrap();
+        (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect()
+    }
+
+    fn read_zip(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> String {
+        use std::io::Read as _;
+        let mut f = zip.by_name(name).unwrap();
+        let mut s = String::new();
+        f.read_to_string(&mut s).unwrap();
+        s
     }
 }

@@ -1,11 +1,12 @@
-# Public architecture (hamfeed, Slice 1)
+# Public architecture (hamfeed, Slices 1–2)
 
 ## What it does
 
 An operator leaves a receiver feeding the computer microphone on a fixed
 frequency. hamfeed captures each transmission, transcribes it locally in its
-original language (French or English, never translated), and serves text +
-audio clip in a live web feed with searchable history.
+original language (French or English, never translated), attributes it to
+its sender, and serves text + audio clip in a live web feed with searchable
+history.
 
 ## Components
 
@@ -13,7 +14,9 @@ audio clip in a live web feed with searchable history.
 mic-in → hamfeed-source → hamfeed-ingest → Opus clip (.ogg)
   → hamfeed-stt (local whisper) → hamfeed-store (SQLite + FTS5)
   → hamfeed-web (Axum + SSE + static UI)
-hamfeed-pipeline orchestrates ingest → stt → store.
+hamfeed-pipeline orchestrates ingest → stt → enrich → store, where enrich
+  = hamfeed-callsign parse + hamfeed-callbook lookup + voice carry/link
+  (hamfeed-speaker, optional) + notify cue match.
 ```
 
 - **source**: `AudioSource` trait yielding 16 kHz mono S16 frames. v1 ships
@@ -32,10 +35,22 @@ hamfeed-pipeline orchestrates ingest → stt → store.
   language/confidence badges, triage buttons on failed cards
   (Keep / Drop / Retry / Flag-for-training), full-text search with
   from/to filters, hide-noise toggle, and cursor pagination.
+- **callsign**: self-ID extraction from transcripts — plain (`VE2DEM`)
+  and NATO-spelled runs, French and English, accent-tolerant.
+- **callbook**: local CA/US operator databases (manual drop-in or
+  `callbook-import` over ISED/ULS dumps); a missing file degrades to
+  nameless badges, never an error or a network call.
+- **speaker**: voiceprints for sender linking (80-bin CMVN mel frontend
+  + wespeaker ONNX embeddings behind the `voice` cargo feature).
+  Short-term carry auto-links in-window; the long-term library only
+  ever *suggests*, and confirm/correct teaches it. The voice model is
+  optional (`scripts/download-voice-model.sh`, checksum-verified).
+- **notify**: messages addressing the configured callsign raise for-you
+  banners; configured emergency cues raise emergency banners.
 
-## Limits (Slice 1)
+## Limits (Slices 1–2)
 
-- VAD-only cutting; no courtesy-beep detection.
+- VAD + courtesy-beep cutting (frequency-agnostic Goertzel detector).
 - Opus-in-Ogg archive only.
 - Transcription quality follows the whisper model size (tiny for CI,
   small by default); low-confidence rows are badged, not hidden.

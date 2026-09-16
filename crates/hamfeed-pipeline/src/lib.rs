@@ -8,14 +8,279 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use hamfeed_callbook::Callbook;
 use hamfeed_config::Config;
 use hamfeed_ingest::{IngestQueue, QueueItem, Segment, Segmenter, SegmenterConfig, SpillDir};
 use hamfeed_source::AudioSource;
+use hamfeed_speaker::cluster::Clusterer;
+#[cfg(feature = "voice")]
+use hamfeed_speaker::embedder::Embedder;
 use hamfeed_store::{Message, NewMessage, SearchQuery, Store, TriageAction, SHORT_MS};
 use hamfeed_stt::{SttErr, Transcriber};
 
 /// `stt_conf` at or above this marks a row `ok`, below marks `low`.
 pub const CONF_OK: f64 = 0.6;
+
+/// Result of sender enrichment for one message (Slice 2, 003).
+/// `sender_name` lands in T5 (callbook), `alert` in T9 (notify),
+/// `speaker_key` in T8 (voice).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Enrichment {
+    pub sender_callsign: Option<String>,
+    pub sender_name: Option<String>,
+    pub sender_source: String,
+    pub alert: i32,
+    pub speaker_key: Option<String>,
+}
+
+impl Enrichment {
+    fn none() -> Self {
+        Self {
+            sender_callsign: None,
+            sender_name: None,
+            sender_source: "none".into(),
+            alert: 0,
+            speaker_key: None,
+        }
+    }
+}
+
+/// Voice-link state (R4, T8): per-group clusterer window plus the keyed
+/// segments of the current group for alias linking. Without the `voice`
+/// feature no embedder exists and no keys are ever minted — the alias and
+/// suggestion paths then idle on empty state.
+pub struct VoiceState {
+    clusterer: Clusterer,
+    group_keys: Vec<(String, u64)>,
+    last_group_id: String,
+    #[cfg(feature = "voice")]
+    embedder: Option<Embedder>,
+}
+
+impl VoiceState {
+    fn new(threshold: f32, #[cfg(feature = "voice")] embedder: Option<Embedder>) -> Self {
+        Self {
+            clusterer: Clusterer::new(threshold),
+            group_keys: Vec::new(),
+            last_group_id: String::new(),
+            #[cfg(feature = "voice")]
+            embedder,
+        }
+    }
+
+    /// Roll the clusterer window on `group_id` change (one window = one
+    /// transmission group; N allocation stays store-global, never reused).
+    fn roll_window(&mut self, group_id: &str) {
+        if self.last_group_id != group_id {
+            self.clusterer.reset_window();
+            self.group_keys.clear();
+            self.last_group_id = group_id.to_string();
+        }
+    }
+
+    /// Per-segment speaker gate: long enough AND not failed → embed →
+    /// assign → `Unknown-N|label|day` key; else `None` (short blips,
+    /// failed rows, and voice-off builds stay keyless).
+    #[allow(clippy::too_many_arguments)]
+    fn key_for(
+        &mut self,
+        store: &Store,
+        pcm: &[i16],
+        duration_ms: u64,
+        status: &str,
+        freq_label: &str,
+        day: &str,
+        min_embed_s: f32,
+        seg_id: &str,
+    ) -> Option<String> {
+        // Float seconds (no float→int truncation at the boundary).
+        if (duration_ms as f32) < min_embed_s * 1000.0 {
+            return None;
+        }
+        if status == "failed" {
+            return None;
+        }
+        #[cfg(feature = "voice")]
+        {
+            let emb = self.embedder.as_ref()?;
+            match emb.embed(pcm) {
+                Ok(vec) => {
+                    let mut alloc_failed = false;
+                    let mut alloc = || match store.alloc_speaker_n(freq_label, day) {
+                        Ok(n) => n,
+                        Err(err) => {
+                            eprintln!("pipeline: alloc_speaker_n failed: {err}");
+                            alloc_failed = true;
+                            0
+                        }
+                    };
+                    let (n, _is_new) = self.clusterer.assign(&vec, &mut alloc);
+                    if !alloc_failed && n != 0 {
+                        return Some(format!(
+                            "{}|{}|{}",
+                            Clusterer::label(n),
+                            freq_label.replace('|', "-"),
+                            day
+                        ));
+                    }
+                    None
+                }
+                Err(err) => {
+                    eprintln!("pipeline: embed failed for {seg_id}: {err}");
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = (store, pcm, freq_label, day, seg_id);
+            None
+        }
+    }
+}
+
+/// Epoch-day number for a millisecond timestamp (voice-key scope).
+pub fn day_of(ts_ms: u64) -> String {
+    (ts_ms / 86_400_000).to_string()
+}
+
+/// Link every keyed segment in the current group to a heard callsign.
+///
+/// Confidence decays linearly from 1.0 at dt=0 to 0.5 at the window edge.
+/// Writes alias rows only — never `sender_*` fields.
+pub fn link_alias(
+    store: &Store,
+    group_keys: &[(String, u64)],
+    heard_ts_ms: u64,
+    callsign: &str,
+    window_ms: u64,
+) {
+    if window_ms == 0 {
+        return;
+    }
+    let now_ms = now_ms();
+    for (key, ts) in group_keys {
+        let dt = heard_ts_ms.abs_diff(*ts) as f64;
+        if dt <= window_ms as f64 {
+            let conf = 0.5 + 0.5 * (1.0 - dt / window_ms as f64);
+            let _ = store.set_alias(key, callsign, conf as f32, now_ms);
+        }
+    }
+}
+
+/// In-memory heard-sender carry (R2): the last self-ID heard plus its
+/// timestamp. A restart clears it by design (carry is best-effort).
+#[derive(Debug, Default)]
+pub struct CarryState {
+    last_callsign: Option<String>,
+    last_ts_ms: u64,
+    window_ms: u64,
+}
+
+impl CarryState {
+    pub fn new(window_ms: u64) -> Self {
+        Self {
+            last_callsign: None,
+            last_ts_ms: 0,
+            window_ms,
+        }
+    }
+
+    /// Record a heard self-ID (or clear nothing when `callsign` is `None`).
+    pub fn observe(&mut self, callsign: Option<String>, ts_ms: u64) {
+        if let Some(cs) = callsign {
+            self.last_callsign = Some(cs);
+            self.last_ts_ms = ts_ms;
+        }
+    }
+
+    /// The carried sender when the last heard self-ID is still in-window.
+    pub fn carried(&self, ts_ms: u64) -> Option<&str> {
+        let cs = self.last_callsign.as_deref()?;
+        if ts_ms.saturating_sub(self.last_ts_ms) <= self.window_ms {
+            Some(cs)
+        } else {
+            None
+        }
+    }
+}
+
+/// Alert bit: the message addresses my configured callsign (R5).
+pub const ALERT_ME: i32 = 1;
+/// Alert bit: the message matches an emergency cue (R6).
+pub const ALERT_EMERGENCY: i32 = 2;
+
+/// True when the transcript addresses my callsign — plain or spelled
+/// (both resolve through the same extractor, so `VE2ABC` and `victor
+/// echo two ...` match alike).
+pub fn matches_me(transcript: &str, lang: &str, my_callsign: &str) -> bool {
+    let mine = hamfeed_callsign::normalize(my_callsign);
+    if mine.is_empty() {
+        return false;
+    }
+    hamfeed_callsign::extract(transcript, lang)
+        .iter()
+        .any(|h| h.normalized == mine)
+}
+
+/// True when the transcript contains any emergency cue (accent-folded,
+/// case-insensitive substring — cues are ordinary words, not tokens).
+pub fn matches_emergency(transcript: &str, cues: &[String]) -> bool {
+    let folded = hamfeed_callsign::fold(transcript);
+    cues.iter().any(|c| {
+        let cue = hamfeed_callsign::fold(c);
+        !cue.trim().is_empty() && folded.contains(&cue)
+    })
+}
+
+/// Enrich one transcript: heard self-ID wins; otherwise an in-window
+/// carried sender attaches (marked `carried`); otherwise sender-less.
+/// `carry` is the in-window callsign, if any — resolved by the caller via
+/// [`CarryState::carried`] so this stays pure and unit-testable.
+/// `lookup` maps a normalized callsign to an operator name (callbook);
+/// a degraded callbook simply returns `None` and badges show the
+/// callsign alone. `my_callsign`/`emergency_cues` raise the alert bits
+/// on any message with a transcript (R5–R6).
+pub fn enrich(
+    transcript: &str,
+    lang: &str,
+    carry: Option<&str>,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    my_callsign: Option<&str>,
+    emergency_cues: &[String],
+) -> Enrichment {
+    let mut alert = 0;
+    if let Some(mine) = my_callsign {
+        if matches_me(transcript, lang, mine) {
+            alert |= ALERT_ME;
+        }
+    }
+    if matches_emergency(transcript, emergency_cues) {
+        alert |= ALERT_EMERGENCY;
+    }
+    if let Some(hit) = hamfeed_callsign::extract(transcript, lang).first() {
+        let cs = hit.normalized.clone();
+        return Enrichment {
+            sender_callsign: Some(cs.clone()),
+            sender_name: lookup(&cs),
+            sender_source: "heard".into(),
+            alert,
+            speaker_key: None,
+        };
+    }
+    if let Some(cs) = carry {
+        return Enrichment {
+            sender_callsign: Some(cs.to_string()),
+            sender_name: lookup(cs),
+            sender_source: "carried".into(),
+            alert,
+            speaker_key: None,
+        };
+    }
+    let mut e = Enrichment::none();
+    e.alert = alert;
+    e
+}
 
 /// Language recorded when detection was skipped (failed/system rows).
 pub const LANG_UNKNOWN: &str = "und";
@@ -29,6 +294,9 @@ pub struct Pipeline {
     spill: SpillDir,
     storage_dir: PathBuf,
     drains: u64,
+    carry: CarryState,
+    callbook: Callbook,
+    voice: VoiceState,
 }
 
 impl Pipeline {
@@ -54,14 +322,43 @@ impl Pipeline {
         std::fs::create_dir_all(&storage_dir)
             .with_context(|| format!("cannot create {}", storage_dir.display()))?;
         let spill = SpillDir::open(&storage_dir.join("spill"))?;
+        let window_ms = cfg.identity.link_window_min * 60_000;
+        let callbook = hamfeed_callbook::open(&cfg.callbook.resolved_db_path(&cfg.storage.dir));
+        #[cfg(feature = "voice")]
+        let embedder = match cfg.voiceprint.model_path.trim() {
+            "" => {
+                eprintln!(
+                    "voice: no model configured ([voiceprint] model_path empty) — voiceprints off"
+                );
+                None
+            }
+            path => match Embedder::open(path) {
+                Ok(e) => Some(e),
+                Err(err) => {
+                    eprintln!("voice: cannot load {path} ({err:?})");
+                    eprintln!(
+                        "{}",
+                        hamfeed_config::missing_voice_model_hint(&cfg.voiceprint.model_path)
+                    );
+                    None
+                }
+            },
+        };
         Ok(Self {
-            cfg,
+            cfg: cfg.clone(),
             store,
             transcriber,
             queue: IngestQueue::new(100),
             drains: 0,
             spill,
             storage_dir,
+            carry: CarryState::new(window_ms),
+            callbook,
+            voice: VoiceState::new(
+                cfg.voiceprint.threshold,
+                #[cfg(feature = "voice")]
+                embedder,
+            ),
         })
     }
 
@@ -82,8 +379,15 @@ impl Pipeline {
     }
 
     /// Boot recovery: replay spilled rows into the queue, oldest first, and
-    /// leave a system gap marker when anything was recovered (S9).
+    /// leave a system gap marker when anything was recovered (S9). Also
+    /// purges expired voice aliases (R4 library bound).
     pub fn startup_recovery(&mut self) -> Result<usize> {
+        let purged = self
+            .store
+            .purge_aliases(self.cfg.voiceprint.retention_days, now_ms())?;
+        if purged > 0 {
+            eprintln!("voice: purged {purged} expired voice alias(es)");
+        }
         let items = self.spill.replay_items()?;
         let n = items.len();
         for item in items {
@@ -140,30 +444,132 @@ impl Pipeline {
         self.drains
     }
 
-    fn process_item(&self, item: &QueueItem) -> Result<()> {
+    /// Past-window voice suggestion (S7): a stored alias for this key at
+    /// or above the suggestion confidence becomes a `suggested` sender,
+    /// awaiting confirm/correct. Never auto-links — the operator decides.
+    fn suggest_from_voice(&self, speaker_key: &str) -> Option<Enrichment> {
+        let (callsign, conf) = self.store.get_alias(speaker_key).ok()??;
+        if conf < self.cfg.voiceprint.suggest_min_conf {
+            return None;
+        }
+        Some(Enrichment {
+            sender_callsign: Some(callsign.clone()),
+            sender_name: self
+                .callbook
+                .lookup(&callsign)
+                .ok()
+                .flatten()
+                .map(|c| c.name),
+            sender_source: "suggested".into(),
+            alert: 0,
+            speaker_key: Some(speaker_key.to_string()),
+        })
+    }
+
+    /// Operator confirm/correct (S8): attach the verdict to the message
+    /// and teach the voice library (`set_alias` at 1.0) when the message
+    /// has a speaker key. Corrections are the same call with a different
+    /// callsign — the library reassigns.
+    pub fn confirm_sender(&self, id: &str, callsign: &str) -> Result<()> {
+        let cs = hamfeed_callsign::normalize(callsign);
+        if !hamfeed_callsign::is_valid(&cs) {
+            anyhow::bail!("confirm_sender: {callsign} is not a callsign");
+        }
+        let name = self.callbook.lookup(&cs).ok().flatten().map(|c| c.name);
+        self.store
+            .set_sender(id, Some(&cs), name.as_deref(), "confirmed")?;
+        let msg: Message = self
+            .store
+            .get(id)?
+            .with_context(|| format!("confirm_sender: no such message {id}"))?;
+        if let Some(key) = msg.speaker_key {
+            self.store.overwrite_alias(&key, &cs, 1.0, now_ms())?;
+        }
+        Ok(())
+    }
+
+    fn process_item(&mut self, item: &QueueItem) -> Result<()> {
         let msg = match self.transcriber.transcribe(Path::new(&item.audio_path)) {
-            Ok(out) => NewMessage {
-                id: item.id.clone(),
-                ts_start_ms: item.ts_start_ms,
-                ts_end_ms: item.ts_start_ms + item.duration_ms,
-                freq_label: self.cfg.station.freq_label.clone(),
-                lang: out.lang,
-                lang_conf: out.lang_conf,
+            Ok(out) => {
                 // Spoken phonetics collapse to letter groups ("alpha lima
                 // lima oscar" -> "ALLO") so callsigns read and search as
                 // written; ham shortcuts ("73", "QTH") pass through.
-                transcript: hamfeed_stt::normalize_phonetics(&out.transcript),
-                stt_conf: out.stt_conf,
-                conf_flag: if out.stt_conf >= CONF_OK { "ok" } else { "low" }.into(),
-                status: "ok".into(),
-                fail_reason: None,
-                audio_path: Some(item.audio_path.clone()),
-                duration_ms: Some(item.duration_ms),
-                size_bytes: file_size(&item.audio_path),
-                short_flag: item.duration_ms < SHORT_MS,
-                group_id: item.group_id.clone(),
-                seq: item.seq,
-            },
+                let transcript = hamfeed_stt::normalize_phonetics(&out.transcript);
+                // Voice key first: the alias link below needs it.
+                self.voice.roll_window(&item.group_id);
+                let speaker_key = self.voice.key_for(
+                    &self.store,
+                    &decode_for_voice(&item.audio_path),
+                    item.duration_ms,
+                    "ok",
+                    &self.cfg.station.freq_label,
+                    &day_of(item.ts_start_ms),
+                    self.cfg.voiceprint.min_embed_s,
+                    &item.id,
+                );
+                if let Some(k) = &speaker_key {
+                    self.voice.group_keys.push((k.clone(), item.ts_start_ms));
+                }
+                let mut e = enrich(
+                    &transcript,
+                    &out.lang,
+                    self.carry.carried(item.ts_start_ms),
+                    &|cs| self.callbook.lookup(cs).ok().flatten().map(|c| c.name),
+                    self.cfg.station.my_callsign.as_deref(),
+                    &self.cfg.notify.emergency_cues,
+                );
+                e.speaker_key = speaker_key.clone();
+                // A heard self-ID refreshes the carry window (R2) and
+                // teaches the voice library (link_alias writes alias rows
+                // only — never sender_*).
+                if e.sender_source == "heard" {
+                    if let Some(cs) = &e.sender_callsign {
+                        self.carry.observe(Some(cs.clone()), item.ts_start_ms);
+                        link_alias(
+                            &self.store,
+                            &self.voice.group_keys,
+                            item.ts_start_ms,
+                            cs,
+                            self.cfg.identity.link_window_min * 60_000,
+                        );
+                    }
+                }
+                // Carry expired and nothing heard: ask the voice library.
+                if e.sender_source == "none" {
+                    if let Some(k) = &speaker_key {
+                        if let Some(sugg) = self.suggest_from_voice(k) {
+                            e = sugg;
+                        }
+                    }
+                }
+                NewMessage {
+                    id: item.id.clone(),
+                    ts_start_ms: item.ts_start_ms,
+                    ts_end_ms: item.ts_start_ms + item.duration_ms,
+                    freq_label: self.cfg.station.freq_label.clone(),
+                    lang: out.lang,
+                    lang_conf: out.lang_conf,
+                    transcript,
+                    stt_conf: out.stt_conf,
+                    conf_flag: if out.stt_conf >= CONF_OK { "ok" } else { "low" }.into(),
+                    status: "ok".into(),
+                    fail_reason: None,
+                    audio_path: Some(item.audio_path.clone()),
+                    duration_ms: Some(item.duration_ms),
+                    size_bytes: file_size(&item.audio_path),
+                    short_flag: item.duration_ms < SHORT_MS,
+                    group_id: item.group_id.clone(),
+                    seq: item.seq,
+                    sender_callsign: e.sender_callsign,
+                    sender_name: e.sender_name,
+                    sender_source: e.sender_source,
+                    alert: e.alert,
+                    speaker_key: e.speaker_key,
+                    // The pipeline never invents corrections (004).
+                    corrected_text: None,
+                }
+            }
+            // Failed rows skip enrichment: sender-less, alert 0 (S11).
             Err(e) => NewMessage {
                 id: item.id.clone(),
                 ts_start_ms: item.ts_start_ms,
@@ -182,6 +588,12 @@ impl Pipeline {
                 short_flag: item.duration_ms < SHORT_MS,
                 group_id: item.group_id.clone(),
                 seq: item.seq,
+                sender_callsign: None,
+                sender_name: None,
+                sender_source: "none".into(),
+                alert: 0,
+                speaker_key: None,
+                corrected_text: None,
             },
         };
         // Upsert: a retried clip already has its row (S5 retry path).
@@ -255,6 +667,12 @@ impl Pipeline {
             short_flag: false,
             group_id: uuid::Uuid::new_v4().to_string(),
             seq: 0,
+            sender_callsign: None,
+            sender_name: None,
+            sender_source: "none".into(),
+            alert: 0,
+            speaker_key: None,
+            corrected_text: None,
         })?;
         Ok(())
     }
@@ -319,6 +737,16 @@ pub fn drop_with_config(cfg: &Config, delete_audio: Option<bool>) -> TriageActio
 
 fn file_size(path: &str) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// Decode a stored clip for voice embedding. Failure yields empty PCM,
+/// which the speaker gate refuses (keyless, never an error).
+fn decode_for_voice(path: &str) -> Vec<i16> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    hamfeed_ingest::decode_ogg_to_pcm(&bytes).unwrap_or_default()
 }
 
 pub fn now_ms() -> u64 {
@@ -563,5 +991,433 @@ freq_label = "TEST"
             let p = m.audio_path.as_ref().expect("clip kept");
             assert!(Path::new(p).exists(), "missing {p}");
         }
+    }
+
+    #[test]
+    fn heard_attaches() {
+        let e = enrich(
+            "ici VE2DEM vous m'entendez",
+            "fr",
+            None,
+            &|_| None,
+            None,
+            &[],
+        );
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2DEM"));
+        assert_eq!(e.sender_source, "heard");
+        // Degraded callbook: callsign alone. Alerts land in T9, keys in T8.
+        assert_eq!(e.sender_name, None);
+        assert_eq!(e.alert, 0);
+        assert_eq!(e.speaker_key, None);
+    }
+
+    #[test]
+    fn name_attaches_when_known() {
+        let lookup = |cs: &str| (cs == "VE2DEM").then(|| "Jean Tremblay".to_string());
+        let e = enrich("ici VE2DEM", "fr", None, &lookup, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2DEM"));
+        assert_eq!(e.sender_name.as_deref(), Some("Jean Tremblay"));
+        // Carried senders get names too.
+        let e = enrich("ok merci", "fr", Some("VE2DEM"), &lookup, None, &[]);
+        assert_eq!(e.sender_source, "carried");
+        assert_eq!(e.sender_name.as_deref(), Some("Jean Tremblay"));
+        // Unknown callsign: badge shows the callsign alone.
+        let e = enrich("ici VE9ZZZ", "fr", None, &lookup, None, &[]);
+        assert_eq!(e.sender_name, None);
+    }
+
+    fn cues() -> Vec<String> {
+        vec!["mayday".into(), "urgence".into(), "detresse".into()]
+    }
+
+    #[test]
+    fn me_plain_notifies() {
+        let e = enrich(
+            "VE2ABC à vous, ici VE2DEM",
+            "fr",
+            None,
+            &|_| None,
+            Some("VE2ABC"),
+            &cues(),
+        );
+        assert_eq!(e.alert & ALERT_ME, ALERT_ME);
+        assert_eq!(e.alert & ALERT_EMERGENCY, 0);
+        // Unconfigured: silence.
+        let e = enrich("VE2ABC à vous", "fr", None, &|_| None, None, &cues());
+        assert_eq!(e.alert, 0);
+    }
+
+    #[test]
+    fn me_spelled_notifies() {
+        let e = enrich(
+            "victor echo two alpha bravo charlie, m'entendez-vous",
+            "fr",
+            None,
+            &|_| None,
+            Some("ve2abc"),
+            &cues(),
+        );
+        assert_eq!(e.alert & ALERT_ME, ALERT_ME);
+    }
+
+    #[test]
+    fn emergency_fr_notifies() {
+        let e = enrich(
+            "appel d'urgence, je répète, urgence",
+            "fr",
+            None,
+            &|_| None,
+            None,
+            &cues(),
+        );
+        assert_eq!(e.alert & ALERT_EMERGENCY, ALERT_EMERGENCY);
+        // Accent-folded: "détresse" matches the plain cue.
+        let e = enrich(
+            "ici VE2DEM en détresse",
+            "fr",
+            None,
+            &|_| None,
+            None,
+            &cues(),
+        );
+        assert_eq!(e.alert & ALERT_EMERGENCY, ALERT_EMERGENCY);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2DEM"));
+    }
+
+    #[test]
+    fn no_cue_no_alert() {
+        let e = enrich(
+            "bonjour à tous, bonne soirée",
+            "fr",
+            None,
+            &|_| None,
+            Some("VE9ZZ"),
+            &cues(),
+        );
+        assert_eq!(e.alert, 0);
+        assert_eq!(e.sender_source, "none");
+    }
+
+    #[test]
+    fn carry_marks_carried() {
+        let mut carry = CarryState::new(30 * 60_000);
+        carry.observe(Some("VE2DEM".into()), 1_000);
+        // Follow-up 5 min later, no self-ID: carried.
+        let e = enrich(
+            "ok compris merci",
+            "fr",
+            carry.carried(301_000),
+            &|_| None,
+            None,
+            &[],
+        );
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2DEM"));
+        assert_eq!(e.sender_source, "carried");
+        // A heard hit beats carry even when carry is fresh.
+        let e = enrich(
+            "ici VE3MA",
+            "fr",
+            carry.carried(302_000),
+            &|_| None,
+            None,
+            &[],
+        );
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE3MA"));
+        assert_eq!(e.sender_source, "heard");
+    }
+
+    #[test]
+    fn expired_window_stays_senderless() {
+        let mut carry = CarryState::new(30 * 60_000);
+        carry.observe(Some("VE2DEM".into()), 1_000);
+        // 31 min later: window expired, no silent link (S4).
+        assert_eq!(carry.carried(1_861_000), None);
+        let e = enrich(
+            "ok compris merci",
+            "fr",
+            carry.carried(1_861_000),
+            &|_| None,
+            None,
+            &[],
+        );
+        assert_eq!(e.sender_callsign, None);
+        assert_eq!(e.sender_source, "none");
+        // Nothing heard yet at all: also sender-less.
+        let fresh = CarryState::new(30 * 60_000);
+        assert_eq!(fresh.carried(999_999), None);
+    }
+
+    #[cfg(feature = "voice")]
+    fn test_voice_state() -> VoiceState {
+        let emb = std::env::var("HAMFEED_TEST_VOICE_MODEL")
+            .ok()
+            .and_then(|p| Embedder::open(&p).ok());
+        VoiceState::new(0.55, emb)
+    }
+
+    #[cfg(not(feature = "voice"))]
+    fn test_voice_state() -> VoiceState {
+        VoiceState::new(0.55)
+    }
+
+    fn new_msg(id: &str) -> NewMessage {
+        NewMessage {
+            id: id.into(),
+            ts_start_ms: 1000,
+            ts_end_ms: 1500,
+            freq_label: "TEST".into(),
+            lang: "fr".into(),
+            lang_conf: 0.9,
+            transcript: "bonjour".into(),
+            stt_conf: 0.8,
+            conf_flag: "ok".into(),
+            status: "ok".into(),
+            fail_reason: None,
+            audio_path: None,
+            duration_ms: Some(500),
+            size_bytes: None,
+            short_flag: false,
+            group_id: "g".into(),
+            seq: 0,
+            sender_callsign: None,
+            sender_name: None,
+            sender_source: "none".into(),
+            alert: 0,
+            speaker_key: None,
+            corrected_text: None,
+        }
+    }
+
+    #[test]
+    fn short_blip_stays_keyless() {
+        // Under the minimum embed duration: no key with or without a model.
+        let store = Store::open_memory().unwrap();
+        let mut v = test_voice_state();
+        assert_eq!(
+            v.key_for(
+                &store,
+                &vec![0i16; 32000],
+                500,
+                "ok",
+                "TEST",
+                "1",
+                1.5,
+                "s1"
+            ),
+            None
+        );
+        // Failed rows never key either.
+        assert_eq!(
+            v.key_for(
+                &store,
+                &vec![0i16; 96000],
+                6000,
+                "failed",
+                "TEST",
+                "1",
+                1.5,
+                "s2"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn link_alias_writes_decayed_conf() {
+        let store = Store::open_memory().unwrap();
+        link_alias(
+            &store,
+            &[
+                ("k-near".into(), 2000),
+                ("k-far".into(), 1000),
+                ("k-out".into(), 0),
+            ],
+            2000,
+            "VE2DEM",
+            1000,
+        );
+        // dt=0 → 1.0; dt=1000 at the window edge → 0.5; dt=2000 → skipped.
+        assert_eq!(
+            store.get_alias("k-near").unwrap(),
+            Some(("VE2DEM".to_string(), 1.0))
+        );
+        assert_eq!(
+            store.get_alias("k-far").unwrap(),
+            Some(("VE2DEM".to_string(), 0.5))
+        );
+        assert_eq!(store.get_alias("k-out").unwrap(), None);
+    }
+
+    #[test]
+    fn expired_carry_suggests_from_alias() {
+        let dir = test_dir("suggest");
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        // Confident alias → suggestion (never a silent auto-link: the
+        // source says suggested, awaiting confirm).
+        pipe.store.set_alias("K1", "VE2DEM", 0.9, 1000).unwrap();
+        let e = pipe.suggest_from_voice("K1").expect("suggestion");
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2DEM"));
+        assert_eq!(e.sender_source, "suggested");
+        assert_eq!(e.speaker_key.as_deref(), Some("K1"));
+        // Below the suggestion confidence: silence.
+        pipe.store.set_alias("K2", "VE3MA", 0.3, 1000).unwrap();
+        assert!(pipe.suggest_from_voice("K2").is_none());
+        // Unknown key: silence.
+        assert!(pipe.suggest_from_voice("K9").is_none());
+    }
+
+    #[test]
+    fn confirm_refreshes_alias() {
+        let dir = test_dir("confirm");
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let mut m = new_msg("v1");
+        m.speaker_key = Some("K1".into());
+        pipe.store.insert(&m).unwrap();
+        pipe.confirm_sender("v1", "ve2dem").unwrap();
+        let row = pipe.store.get("v1").unwrap().unwrap();
+        assert_eq!(row.sender_callsign.as_deref(), Some("VE2DEM"));
+        assert_eq!(row.sender_source, "confirmed");
+        assert_eq!(
+            pipe.store.get_alias("K1").unwrap(),
+            Some(("VE2DEM".to_string(), 1.0))
+        );
+        // Correct (same call, different callsign): library reassigns.
+        pipe.confirm_sender("v1", "VE3MA").unwrap();
+        assert_eq!(
+            pipe.store.get_alias("K1").unwrap(),
+            Some(("VE3MA".to_string(), 1.0))
+        );
+        // Not a callsign, unknown id: loud errors.
+        assert!(pipe.confirm_sender("v1", "XYZ").is_err());
+        assert!(pipe.confirm_sender("nope", "VE2DEM").is_err());
+    }
+
+    /// Slice-2 stream proof (T11): a synthetic transcript stream through
+    /// the real enrich → carry → suggest → confirm → store path lands
+    /// linked senders (STT decode and HTTP are proven by their own suites;
+    /// this drives everything between).
+    #[test]
+    fn slice2_stream_links_senders() {
+        let dir = test_dir("slice2");
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let lookup = &|_: &str| None;
+        let cues = vec!["mayday".to_string()];
+        let window = pipe.cfg.identity.link_window_min * 60_000;
+        let mut carry = CarryState::new(window);
+
+        // m1: heard self-ID.
+        let t0 = 1_000_000u64;
+        let e1 = enrich("ici VE2DEM, à vous", "fr", None, lookup, None, &cues);
+        assert_eq!(e1.sender_source, "heard");
+        carry.observe(e1.sender_callsign.clone(), t0);
+        let mut m1 = new_msg("m1");
+        m1.ts_start_ms = t0;
+        m1.sender_callsign = e1.sender_callsign;
+        m1.sender_source = e1.sender_source;
+        pipe.store.upsert(&m1).unwrap();
+
+        // m2 five minutes later, no self-ID: carried.
+        let t2 = t0 + 5 * 60_000;
+        let e2 = enrich(
+            "ok, compris, merci",
+            "fr",
+            carry.carried(t2),
+            lookup,
+            None,
+            &cues,
+        );
+        assert_eq!(e2.sender_source, "carried");
+        let mut m2 = new_msg("m2");
+        m2.ts_start_ms = t2;
+        m2.sender_callsign = e2.sender_callsign;
+        m2.sender_source = e2.sender_source;
+        pipe.store.upsert(&m2).unwrap();
+
+        // m3 past the window: sender-less.
+        let t3 = t0 + 40 * 60_000;
+        let e3 = enrich("toujours là?", "fr", carry.carried(t3), lookup, None, &cues);
+        assert_eq!(e3.sender_source, "none");
+        let mut m3 = new_msg("m3");
+        m3.ts_start_ms = t3;
+        pipe.store.upsert(&m3).unwrap();
+
+        // m4: a taught voice returns past the window → suggested, then
+        // the operator confirms it.
+        pipe.store.set_alias("KX", "VE2DEM", 0.9, t3).unwrap();
+        let e4 = pipe.suggest_from_voice("KX").expect("suggestion");
+        let mut m4 = new_msg("m4");
+        m4.ts_start_ms = t3 + 1000;
+        m4.sender_callsign = e4.sender_callsign;
+        m4.sender_name = e4.sender_name;
+        m4.sender_source = e4.sender_source;
+        m4.speaker_key = e4.speaker_key;
+        pipe.store.upsert(&m4).unwrap();
+        pipe.confirm_sender("m4", "VE2DEM").unwrap();
+
+        // m5: emergency cue raises the bit on a sender-less message.
+        let e5 = enrich(
+            "mayday, en panne sur la 117",
+            "fr",
+            None,
+            lookup,
+            None,
+            &cues,
+        );
+        assert_eq!(e5.alert & ALERT_EMERGENCY, ALERT_EMERGENCY);
+        let mut m5 = new_msg("m5");
+        m5.ts_start_ms = t3 + 2000;
+        m5.alert = e5.alert;
+        pipe.store.upsert(&m5).unwrap();
+
+        // Final ledger.
+        assert_eq!(
+            pipe.store.get("m1").unwrap().unwrap().sender_source,
+            "heard"
+        );
+        assert_eq!(
+            pipe.store.get("m2").unwrap().unwrap().sender_source,
+            "carried"
+        );
+        assert_eq!(pipe.store.get("m3").unwrap().unwrap().sender_callsign, None);
+        assert_eq!(
+            pipe.store.get("m4").unwrap().unwrap().sender_source,
+            "confirmed"
+        );
+        assert_eq!(
+            pipe.store.get("m5").unwrap().unwrap().alert,
+            ALERT_EMERGENCY
+        );
+        let page = pipe
+            .store
+            .search(&SearchQuery {
+                sender: Some("VE2DEM".into()),
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut ids: Vec<&str> = page.messages.iter().map(|m| m.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["m1", "m2", "m4"]);
+    }
+
+    #[test]
+    fn day_of_counts_epoch_days() {
+        assert_eq!(day_of(0), "0");
+        assert_eq!(day_of(86_400_000), "1");
+        assert_eq!(day_of(86_400_001), "1");
+    }
+
+    #[test]
+    fn failed_row_skips_enrich() {
+        // Corrupt clip → failed row stays sender-less with alert 0 (S11).
+        let dir = test_dir("noenrich");
+        let mut pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let item = failed_item(&dir, "bad2");
+        pipe.process_item(&item).unwrap();
+        let row = pipe.store.get("bad2").unwrap().expect("row stored");
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.sender_callsign, None);
+        assert_eq!(row.sender_source, "none");
+        assert_eq!(row.alert, 0);
     }
 }

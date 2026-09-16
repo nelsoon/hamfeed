@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 capture = ["hamfeed-source/capture"]
+voice = ["hamfeed-speaker/voice"]
 
 [dependencies]
 anyhow.workspace = true
@@ -14,3 +15,6 @@ hamfeed-source = { path = "../hamfeed-source" }
 hamfeed-ingest = { path = "../hamfeed-ingest", features = ["opus"] }
 hamfeed-stt = { path = "../hamfeed-stt" }
 hamfeed-store = { path = "../hamfeed-store" }
+hamfeed-callsign = { path = "../hamfeed-callsign" }
+hamfeed-callbook = { path = "../hamfeed-callbook" }
+hamfeed-speaker = { path = "../hamfeed-speaker" }
