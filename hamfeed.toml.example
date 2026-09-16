@@ -7,6 +7,10 @@ sample_rate = 16000
 [vad]
 engine = "energy"
 hang_ms = 800
+# Cut segments on repeater courtesy beeps (Slice 2); beep_min_ms is the
+# sustained-tone persistence before a beep cuts (50..=1000).
+beep_split = true
+beep_min_ms = 150
 [vad.profiles.repeater]
 hang_ms = 800
 [vad.profiles.simplex]

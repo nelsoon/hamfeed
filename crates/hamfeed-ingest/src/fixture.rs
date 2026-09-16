@@ -16,6 +16,19 @@ pub fn silence_ms(ms: u64) -> Vec<i16> {
     vec![0; ms as usize * SAMPLE_RATE as usize / 1000]
 }
 
+/// Two simultaneous steady tones (dual-tone repeater beeps).
+pub fn dual_tone_ms(f1_hz: f32, f2_hz: f32, ms: u64, amplitude: i16) -> Vec<i16> {
+    let n = ms as usize * SAMPLE_RATE as usize / 1000;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let v = (2.0 * std::f32::consts::PI * f1_hz * t).sin()
+            + (2.0 * std::f32::consts::PI * f2_hz * t).sin();
+        out.push((v * amplitude as f32 / 2.0) as i16);
+    }
+    out
+}
+
 /// Steady tone (loud, clearly above VAD threshold).
 pub fn tone_ms(freq_hz: f32, ms: u64, amplitude: i16) -> Vec<i16> {
     let n = ms as usize * SAMPLE_RATE as usize / 1000;
