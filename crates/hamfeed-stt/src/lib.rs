@@ -239,7 +239,8 @@ fn token_letter(word: &str) -> Option<char> {
 }
 
 /// Collapse spoken phonetics into letter groups: "alpha lima lima oscar"
-/// becomes "ALLO", "victor echo 2" becomes "VE2". Only runs of two or more
+/// becomes "ALLO"; callsign-style runs with digits collapse the same way.
+/// Only runs of two or more tokens collapse — a lone "echo" or "mike" in
 /// tokens collapse — a lone "echo" or "mike" in normal speech stays
 /// untouched, as do ham shortcuts. Separators inside a run may be spaces
 /// or hyphens ("x-ray yankee" and "alpha-lima" both work).
@@ -346,9 +347,10 @@ mod tests {
     fn phonetics_collapse() {
         assert_eq!(normalize_phonetics("alpha lima lima oscar"), "ALLO");
         assert_eq!(
-            normalize_phonetics("Victor Echo 2 X-ray Yankee Zulu"),
-            "VE2XYZ"
+            normalize_phonetics("Whiskey One Alpha Whiskey calling"),
+            "W1AW calling"
         );
+        assert_eq!(normalize_phonetics("tango hotel five"), "TH5");
         assert_eq!(
             normalize_phonetics("contact alpha lima on simplex"),
             "contact AL on simplex"
