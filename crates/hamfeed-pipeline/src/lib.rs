@@ -40,13 +40,15 @@ impl Pipeline {
     }
 
     pub fn open_with(cfg: Config) -> Result<Self> {
-        let transcriber =
-            Transcriber::open(Path::new(&cfg.stt.model_path), &cfg.stt.lang_whitelist).map_err(
-                |e| match e {
-                    SttErr::ModelMissing(hint) => anyhow::anyhow!("{hint}"),
-                    other => anyhow::anyhow!("stt backend: {other}"),
-                },
-            )?;
+        let transcriber = Transcriber::open(
+            Path::new(&cfg.stt.model_path),
+            &cfg.stt.lang_whitelist,
+            cfg.stt.initial_prompt.as_deref(),
+        )
+        .map_err(|e| match e {
+            SttErr::ModelMissing(hint) => anyhow::anyhow!("{hint}"),
+            other => anyhow::anyhow!("stt backend: {other}"),
+        })?;
         let store = Store::open(Path::new(&cfg.storage.db_path))?;
         let storage_dir = PathBuf::from(&cfg.storage.dir);
         std::fs::create_dir_all(&storage_dir)

@@ -70,6 +70,10 @@ pub struct Segment {
 pub struct Stt {
     pub model_path: String,
     pub lang_whitelist: Vec<String>,
+    /// Whisper initial prompt override. Omitted → built-in bilingual
+    /// repeater context (`hamfeed_stt::DEFAULT_INITIAL_PROMPT`).
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -230,7 +234,18 @@ mod tests {
         assert_eq!(cfg.hang_ms("simplex"), 1200);
         assert_eq!(cfg.segment.max_s, 120);
         assert_eq!(cfg.stt.lang_whitelist, vec!["fr", "en"]);
+        assert_eq!(cfg.stt.initial_prompt, None);
         assert_eq!(cfg.storage.retention_days, 90);
+    }
+
+    #[test]
+    fn initial_prompt_override() {
+        let text = EXAMPLE.replace(
+            "lang_whitelist = [\"fr\", \"en\"]",
+            "lang_whitelist = [\"fr\", \"en\"]\ninitial_prompt = \"VE2ABC net\"",
+        );
+        let cfg = parse(&text).expect("override must parse");
+        assert_eq!(cfg.stt.initial_prompt.as_deref(), Some("VE2ABC net"));
     }
 
     #[test]

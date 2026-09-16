@@ -22,6 +22,9 @@ max_s = 120
 [stt]
 model_path = "models/whisper-small.bin"
 lang_whitelist = ["fr", "en"]
+# Optional whisper initial-prompt override. Omitted → built-in bilingual
+# (FR/EN) repeater context: callsigns, NATO words, Q codes.
+# initial_prompt = "VE2ABC net, nightly round table, over."
 
 [storage]
 dir = "./data/audio"
