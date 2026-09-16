@@ -140,8 +140,12 @@ impl Transcriber {
         let mut prob_sum = 0f64;
         let mut prob_n = 0u64;
         for i in 0..n_seg {
+            // Lossy read: whisper occasionally emits bytes that are not
+            // valid UTF-8 (more often with larger models). One bad segment
+            // must not fail the whole clip — scrub to U+FFFD instead. This
+            // fixed a real `text: InvalidUtf8` failure on a 120 s FR clip.
             let text = state
-                .full_get_segment_text(i)
+                .full_get_segment_text_lossy(i)
                 .map_err(|e| SttErr::Backend(format!("text: {e:?}")))?;
             transcript.push_str(text.trim());
             transcript.push(' ');
