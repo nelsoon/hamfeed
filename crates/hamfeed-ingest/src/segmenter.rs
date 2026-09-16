@@ -34,12 +34,8 @@ impl Default for SegmenterConfig {
     }
 }
 
-/// Courtesy-beep band (B3): frequency-agnostic, so no per-repeater tuning.
-/// Repeater beeps live here; voice fundamentals and hum do not.
-const BEEP_BAND_LO_HZ: f32 = 600.0;
-const BEEP_BAND_HI_HZ: f32 = 2500.0;
-/// Zero-crossing stats run on 50 ms sub-windows; a beep must fill enough of
-/// them to cover `beep_min_ms`.
+/// Short trailing windows for the idle-drop and `voice_seen` gates run on 50
+/// ms; the split evaluation window covers `beep_min_ms`.
 const BEEP_SUB_MS: u64 = 50;
 
 /// One closed voice segment with its PCM attached (in-RAM only in T5).
@@ -60,98 +56,118 @@ struct Open {
     seq: u32,
     start_sample: u64,
     last_voice_sample: u64,
-    /// Set once non-tone voice arrives. A beep with no prior voice never
-    /// splits (B5), and a tone-only segment is dropped, never transcribed.
+    /// Set after two consecutive confident-speech windows (loud +
+    /// spectrally spread, 100 ms total). A beep with no prior voice never
+    /// splits (B5), and a tone-only segment is dropped even when a transient
+    /// edge window looks speech-like — one stray window can't mark.
     voice_seen: bool,
+    voice_streak: u32,
     pcm: Vec<i16>,
 }
 
-/// Count sign changes (zero crossings) in `pcm`.
-fn crossings(pcm: &[i16]) -> u32 {
-    let mut n = 0u32;
-    for w in pcm.windows(2) {
-        if (w[0] < 0) != (w[1] < 0) {
-            n += 1;
-        }
-    }
-    n
-}
-
-/// Goertzel magnitude at `freq_hz` over `win` (single DFT bin, O(n)).
-fn goertzel_mag(win: &[i16], freq_hz: f32) -> f32 {
+/// Goertzel magnitude at `freq_hz` over windowed `win` (single DFT bin).
+fn goertzel_mag(win: &[f32], freq_hz: f32) -> f32 {
     let omega = 2.0 * std::f32::consts::PI * freq_hz / SAMPLE_RATE as f32;
     let coeff = 2.0 * omega.cos();
     let (mut s1, mut s2) = (0f32, 0f32);
     for &s in win {
-        let s0 = s as f32 + coeff * s1 - s2;
+        let s0 = s + coeff * s1 - s2;
         s2 = s1;
         s1 = s0;
     }
     (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt()
 }
 
-/// Fundamental + purity of `win` (B3). Returns the F0 when the window is a
-/// real pure tone: loud, F0 in the beep band, a strong fundamental, and no
-/// significant second harmonic. Vowels fail the harmonic test — their
-/// crossing-inflated "F0" always carries 2F0 energy — and fricatives fail
-/// the level test. `None` means "not a beep".
-fn tone_f0(win: &[i16], threshold: f32) -> Option<f32> {
+/// Hann-windowed copy of `win`: tames rectangular sidelobes so an off-grid
+/// beep (880 Hz on a 25 Hz bank) still concentrates in its peak bins
+/// instead of smearing across the whole bank.
+fn hann(win: &[i16]) -> Vec<f32> {
     let n = win.len();
-    if n < SAMPLE_RATE as usize / 100 {
-        return None;
+    win.iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos();
+            s as f32 * w
+        })
+        .collect()
+}
+
+/// Beep band. Multi-tone beeps (e.g. 700+1100 Hz courtesy tones) concentrate
+/// here; voice fundamentals sit below it. The 25 Hz grid keeps off-grid
+/// beeps (880 Hz, …) inside one bin's main lobe on 50 ms+ windows.
+const BANK_LO_HZ: f32 = 600.0;
+const BANK_STEP_HZ: f32 = 25.0;
+const BANK_BINS: usize = 77; // 600..=2500
+/// Guard bins around the band: a strong out-of-band source (440 Hz test
+/// tone, mains hum) vetoes the window instead of leaking in.
+const GUARD_HZ: [f32; 8] = [100.0, 200.0, 300.0, 400.0, 500.0, 2600.0, 2700.0, 2800.0];
+
+/// In-band spectral peaks of the Hann-windowed `win`: top two (freq,
+/// magnitude) plus the total in-band magnitude. One Goertzel bank per
+/// evaluation — trivial next to STT.
+fn bank_top2(win: &[f32]) -> ((f32, f32), (f32, f32), f32) {
+    let mut top = [(0f32, 0f32); 2];
+    let mut total = 0f32;
+    for i in 0..BANK_BINS {
+        let f = BANK_LO_HZ + i as f32 * BANK_STEP_HZ;
+        let m = goertzel_mag(win, f);
+        total += m;
+        if m > top[0].1 {
+            top[1] = top[0];
+            top[0] = (f, m);
+        } else if m > top[1].1 {
+            top[1] = (f, m);
+        }
     }
-    // Level gate reuses the VAD mean-abs threshold so the detector and the
-    // voice gate agree on what counts as loud.
-    if Segmenter::mean_abs(win) < threshold {
-        return None;
+    (top[0], top[1], total)
+}
+
+/// Bank ratio test on one sub-window: the top two bins dominate, the top
+/// peak carries no second harmonic (vowels always do), and no guard bin
+/// shows an out-of-band source bleeding in.
+fn sub_is_tonal(hw: &[f32], threshold: f32, raw: &[i16]) -> bool {
+    if Segmenter::mean_abs(raw) < threshold {
+        return false;
     }
-    let mut sum_sq = 0f64;
-    for &s in win {
-        sum_sq += (s as f64) * (s as f64);
+    let ((f1, m1), (_, m2), total) = bank_top2(hw);
+    // Dual tones only reach ~0.6 (their lobes lift the middle bins);
+    // vowels were measured up to ~0.4. The harmonic veto below is what
+    // really separates them.
+    if total <= 0.0 || m1 < 0.2 * total || m1 + m2 < 0.5 * total {
+        return false;
     }
-    let rms = (sum_sq / n as f64).sqrt() as f32;
-    let secs = n as f32 / SAMPLE_RATE as f32;
-    let f0 = crossings(win) as f32 / (2.0 * secs);
-    if !(BEEP_BAND_LO_HZ..=BEEP_BAND_HI_HZ).contains(&f0) {
-        return None;
+    if 2.0 * f1 <= 3000.0 && goertzel_mag(hw, 2.0 * f1) > 0.4 * m1 {
+        return false;
     }
-    let m0 = goertzel_mag(win, f0);
-    // A pure sine concentrates its energy at F0: magnitude ≈ A·N/2 against
-    // RMS A/√2, i.e. level ≈ 0.707. Broadband noise scores near zero.
-    if m0 / (n as f32 * rms) < 0.45 {
-        return None;
+    for g in GUARD_HZ {
+        if goertzel_mag(hw, g) > 0.5 * m1 {
+            return false;
+        }
     }
-    // No second harmonic: vowels and other voiced sounds always carry 2F0.
-    if goertzel_mag(win, 2.0 * f0) > 0.35 * m0 {
-        return None;
-    }
-    Some(f0)
+    true
 }
 
 /// True when `win` (a whole number of 50 ms sub-windows) is one sustained
-/// pure tone: every sub-window tone-like and mutually consistent. Speech
-/// wobbles across sub-windows; a beep does not (B3).
-fn is_beep_tone(win: &[i16], threshold: f32) -> bool {
+/// beep: every sub-window is one or two steady tones (B3). Single beeps,
+/// dual beeps (700+1100 Hz repeater courtesy tones), and test sines pass
+/// every window; vowels spread harmonics over many bins, fricatives spread
+/// everywhere, and silence fails the level gate — so speech, gaps, and
+/// partial fills all fail at least one window.
+fn is_tone(win: &[i16], threshold: f32) -> bool {
     let sub = BEEP_SUB_MS as usize * SAMPLE_RATE as usize / 1000;
     if win.is_empty() || !win.len().is_multiple_of(sub) {
         return false;
     }
-    let mut f0s = Vec::with_capacity(win.len() / sub);
-    for s in win.chunks(sub) {
-        match tone_f0(s, threshold) {
-            Some(f) => f0s.push(f),
-            None => return false,
-        }
-    }
-    // One steady pitch: held vowels already failed the per-window harmonic
-    // test; glides fail here. Only a beep passes both (B3).
-    let (lo, hi) = f0s
-        .iter()
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &f| {
-            (lo.min(f), hi.max(f))
-        });
-    hi <= lo * 1.1
+    win.chunks(sub)
+        .all(|s| sub_is_tonal(&hann(s), threshold, s))
 }
+
+/// Gate window for the idle-drop and `voice_seen` tone checks: 50 ms of
+/// audio is enough for the bank test, short enough to react fast.
+const GATE_SAMPLES: usize = 50 * SAMPLE_RATE as usize / 1000;
+/// Trailing audio retained for the gates (covers the longest evaluation
+/// window, `beep_min_ms` max 1000 ms).
+const RECENT_MAX: usize = 1000 * SAMPLE_RATE as usize / 1000;
 
 /// Energy-VAD segmenter over a sample clock starting at `epoch_ms`.
 #[derive(Debug)]
@@ -160,6 +176,7 @@ pub struct Segmenter {
     epoch_ms: u64,
     cursor: u64,
     open: Option<Open>,
+    recent: Vec<i16>,
 }
 
 impl Segmenter {
@@ -169,6 +186,7 @@ impl Segmenter {
             epoch_ms,
             cursor: 0,
             open: None,
+            recent: Vec::new(),
         }
     }
 
@@ -199,32 +217,50 @@ impl Segmenter {
         subs as usize * BEEP_SUB_MS as usize * SAMPLE_RATE as usize / 1000
     }
 
+    /// Trailing gate window (last 50 ms of everything pushed), when buffered.
+    fn gate_win(&self) -> Option<&[i16]> {
+        if self.recent.len() < GATE_SAMPLES {
+            return None;
+        }
+        Some(&self.recent[self.recent.len() - GATE_SAMPLES..])
+    }
+
     /// Beep-split step after a voice chunk was stored (B1/B2). A sustained
     /// in-band tone following voice trims the tone, closes the segment at
     /// the tone start, and leaves nothing open — post-beep speech starts a
-    /// NEW group. Tone chunks never mark `voice_seen`, so a beep alone can
-    /// neither split nor (via the hang-close drop) emit.
+    /// NEW group. Tone windows never mark `voice_seen`, so a beep alone can
+    /// neither split nor (via the hang-close drop) emit; windows too short
+    /// to judge leave it unset, so sub-50 ms blips stay dropped too.
     fn beep_step(&mut self, chunk_end: u64, out: &mut Vec<Segment>) {
         let win = self.beep_window_samples();
         let tonal = self.open.as_ref().is_some_and(|o| {
-            o.pcm.len() >= win
-                && is_beep_tone(&o.pcm[o.pcm.len() - win..], self.cfg.energy_threshold)
+            o.pcm.len() >= win && is_tone(&o.pcm[o.pcm.len() - win..], self.cfg.energy_threshold)
         });
-        let Some(o) = self.open.as_mut() else {
-            return;
-        };
         if tonal {
-            if o.voice_seen {
+            if self.open.as_ref().is_some_and(|o| o.voice_seen) {
                 let mut o = self.open.take().expect("just checked");
                 o.pcm.truncate(o.pcm.len() - win);
                 out.push(self.close(&o, chunk_end - win as u64));
             }
             return;
         }
-        let sub = BEEP_SUB_MS as usize * SAMPLE_RATE as usize / 1000;
-        let n = o.pcm.len().min(sub);
-        if tone_f0(&o.pcm[o.pcm.len() - n..], self.cfg.energy_threshold).is_none() {
-            o.voice_seen = true;
+        // Confident speech only: loud AND spectrally spread, twice running.
+        // Loud-but-tonal windows (beeps) break the streak, so a beep-only
+        // segment stays unmarked even when a transient edge window looks
+        // speech-like — one stray window can't mark.
+        let speech = self.gate_win().is_some_and(|w| {
+            Segmenter::mean_abs(w) >= self.cfg.energy_threshold
+                && !sub_is_tonal(&hann(w), self.cfg.energy_threshold, w)
+        });
+        if let Some(o) = self.open.as_mut() {
+            if speech {
+                o.voice_streak += 1;
+                if o.voice_streak >= 2 {
+                    o.voice_seen = true;
+                }
+            } else {
+                o.voice_streak = 0;
+            }
         }
     }
 
@@ -251,6 +287,20 @@ impl Segmenter {
         let voice = Self::mean_abs(chunk) >= self.cfg.energy_threshold;
         let chunk_start = self.cursor;
         let chunk_end = self.cursor + chunk.len() as u64;
+        // Trailing history for the tone gates (capped well above any window).
+        self.recent.extend_from_slice(chunk);
+        if self.recent.len() > RECENT_MAX {
+            self.recent.drain(..self.recent.len() - RECENT_MAX);
+        }
+
+        // While idle, a sustained tone is a beep tail or a kerchunk: drop it
+        // instead of opening a tone-only segment, so post-beep speech starts
+        // clean (B5). The gate needs 50 ms buffered; stream starts open
+        // blind. Computed before the match below to keep borrows disjoint.
+        let idle_tonal = self.cfg.beep_split
+            && self
+                .gate_win()
+                .is_some_and(|w| is_tone(w, self.cfg.energy_threshold));
 
         if voice {
             match self.open.as_mut() {
@@ -259,18 +309,14 @@ impl Segmenter {
                     o.pcm.extend_from_slice(chunk);
                 }
                 None => {
-                    // While idle, pure-tone chunks are beep tails or
-                    // kerchunks: drop them instead of opening a tone-only
-                    // segment, so post-beep speech starts clean (B5).
-                    let tonal =
-                        self.cfg.beep_split && tone_f0(chunk, self.cfg.energy_threshold).is_some();
-                    if !tonal {
+                    if !idle_tonal {
                         self.open = Some(Open {
                             group_id: uuid::Uuid::new_v4().to_string(),
                             seq: 0,
                             start_sample: chunk_start,
                             last_voice_sample: chunk_end,
                             voice_seen: false,
+                            voice_streak: 0,
                             pcm: chunk.to_vec(),
                         });
                     }
@@ -309,6 +355,7 @@ impl Segmenter {
                     last_voice_sample: chunk_end,
                     // Same transmission continues: voice was already seen.
                     voice_seen: true,
+                    voice_streak: 0,
                     pcm: Vec::new(),
                 });
             }
@@ -484,6 +531,73 @@ mod tests {
         pcm.extend(fixture::silence_ms(1500));
         let segs = run(&cfg, &pcm);
         assert_eq!(segs.len(), 1, "bursts must not cut, got {}", segs.len());
+    }
+
+    /// A dual-tone courtesy beep (700+1100 Hz, like the real repeater) cuts
+    /// just like a single beep (B1/B3).
+    #[test]
+    fn dual_beep_splits_turn() {
+        let cfg = SegmenterConfig {
+            hang_ms: 800,
+            ..Default::default()
+        };
+        let speech_ms = 6 * (150 + 80); // speech_like(6)
+        let mut pcm = fixture::speech_like(6);
+        pcm.extend(fixture::dual_tone_ms(700.0, 1100.0, 300, 9_000));
+        pcm.extend(fixture::speech_like(6));
+        pcm.extend(fixture::silence_ms(1500));
+        let segs = run(&cfg, &pcm);
+        assert_eq!(segs.len(), 2, "dual beep must cut, got {}", segs.len());
+        assert_ne!(segs[0].group_id, segs[1].group_id, "new turn, new group");
+        assert!(
+            (segs[0].ts_end_ms as i64 - speech_ms as i64).abs() <= 30,
+            "ts_end={} want ~{speech_ms}",
+            segs[0].ts_end_ms
+        );
+    }
+
+    /// Real repeater audio (10 s trim of a live FR repeater clip: two speech
+    /// turns plus courtesy-beep blips). With beep-split the blips are
+    /// dropped and only the two turns remain; without it all four land.
+    /// Regression test for the operator's 10:27:51 report (B1/B5).
+    /// Needs the `opus` feature for fixture decode (on in CI --all-features).
+    #[cfg(feature = "opus")]
+    #[test]
+    fn real_repeater_beeps_dropped() {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/repeater-beeps.ogg"
+        ))
+        .expect("beep fixture checked in");
+        let pcm = crate::decode_ogg_to_pcm(&bytes).expect("fixture decodes");
+        let run = |beep_split: bool| {
+            let cfg = SegmenterConfig {
+                hang_ms: 800,
+                beep_split,
+                ..Default::default()
+            };
+            let mut seg = Segmenter::new(cfg, 0);
+            let mut out = Vec::new();
+            for c in fixture::chunks(&pcm, 1600) {
+                out.extend(seg.push(&c));
+            }
+            out.extend(seg.flush());
+            out
+        };
+        let off = run(false);
+        assert_eq!(off.len(), 4, "beep blips land without split: {off:?}");
+        let on = run(true);
+        assert_eq!(on.len(), 2, "beep blips must drop: {on:?}");
+        assert!(
+            (on[0].ts_end_ms as i64 - 1600).abs() <= 200,
+            "first turn end: {}",
+            on[0].ts_end_ms
+        );
+        assert!(
+            (on[1].ts_start_ms as i64 - 4700).abs() <= 200,
+            "second turn start: {}",
+            on[1].ts_start_ms
+        );
     }
 
     /// `beep_split = false` restores Slice 1 behavior: the beep glues (B4).
