@@ -367,37 +367,59 @@
     setProfile(profileSel.value);
   });
 
-  // Listen live (Slice 3, R7): one press streams /api/live into the audio
-  // element (the click is the autoplay gesture); a second press pauses and
-  // drops src, which releases the server stream. SSE profile events keep
-  // working while listening.
+  // Listen to radio (Slice 3, R7): one press streams /api/live into the
+  // audio element (the click is the autoplay gesture); a second press pauses
+  // and drops src, which releases the server stream. Transient stalls and
+  // pipeline restarts reconnect on their own (a few tries, then honest
+  // stop); only an explicit second press means "stay stopped".
   var listenBtn = document.getElementById("listen");
   var liveAudio = document.getElementById("liveAudio");
   var listening = false;
+  var listenRetries = 0;
   listenBtn.addEventListener("click", function () {
-    listening = !listening;
-    listenBtn.setAttribute("aria-pressed", String(listening));
-    listenBtn.textContent = listening ? "Stop radio" : "Listen to radio";
-    if (listening) {
-      liveAudio.src = "/api/live";
-      var pr = liveAudio.play();
-      if (pr && pr.catch) {
-        pr.catch(function () { stopListening(); });
-      }
-    } else {
-      stopListening();
-    }
+    if (listening) stopListening();
+    else startListening();
   });
+  function startListening() {
+    listening = true;
+    listenRetries = 0;
+    listenBtn.setAttribute("aria-pressed", "true");
+    listenBtn.textContent = "Stop radio";
+    playLive();
+  }
+  function playLive() {
+    liveAudio.src = "/api/live";
+    var pr = liveAudio.play();
+    if (pr && pr.catch) {
+      pr.catch(function () { scheduleRetry(); });
+    }
+  }
+  function scheduleRetry() {
+    if (!listening) return;
+    if (listenRetries >= 5) { stopListening(); return; }
+    listenRetries++;
+    setTimeout(function () {
+      if (!listening) return;
+      playLive();
+    }, 1500);
+  }
   function stopListening() {
     listening = false;
+    listenRetries = 0;
     listenBtn.setAttribute("aria-pressed", "false");
     listenBtn.textContent = "Listen to radio";
     liveAudio.pause();
     liveAudio.removeAttribute("src");
     liveAudio.load();
   }
+  liveAudio.addEventListener("playing", function () {
+    listenRetries = 0;
+  });
   liveAudio.addEventListener("error", function () {
-    if (listening) stopListening();
+    if (listening) scheduleRetry();
+  });
+  liveAudio.addEventListener("ended", function () {
+    if (listening) scheduleRetry();
   });
 
   var es = new EventSource("/api/events");
