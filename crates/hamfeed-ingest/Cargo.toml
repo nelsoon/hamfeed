@@ -5,7 +5,6 @@ edition.workspace = true
 
 [features]
 opus = ["dep:audiopus", "dep:ogg"]
-capture = ["dep:rubato"]
 
 [dependencies]
 anyhow.workspace = true
@@ -14,4 +13,4 @@ serde.workspace = true
 serde_json.workspace = true
 audiopus = { version = "0.2", optional = true }
 ogg = { version = "0.9", optional = true }
-rubato = { version = "5", optional = true }
+nnnoiseless = "0.5.2"

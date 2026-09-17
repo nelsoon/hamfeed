@@ -13,6 +13,8 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub audio: Audio,
+    #[serde(default)]
+    pub ingest: Ingest,
     pub vad: Vad,
     pub segment: Segment,
     pub stt: Stt,
@@ -76,6 +78,14 @@ pub struct VadProfile {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Segment {
     pub max_s: u64,
+}
+
+/// RNNoise suppression ahead of the segmenter (006). Old configs omit
+/// it (stays off); prod enables it explicitly after the ear test.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Ingest {
+    #[serde(default)]
+    pub denoise: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -405,6 +415,20 @@ mod tests {
         assert_eq!(cfg.stt.lang_whitelist, vec!["fr", "en"]);
         assert_eq!(cfg.stt.initial_prompt, None);
         assert_eq!(cfg.storage.retention_days, 90);
+    }
+
+    #[test]
+    fn ingest_denoise_flag() {
+        // 006: absent section stays off (old configs unchanged); explicit
+        // true parses through.
+        assert!(!parse(EXAMPLE).expect("example must parse").ingest.denoise);
+        let text = EXAMPLE.replace("[vad]", "[ingest]\ndenoise = true\n\n[vad]");
+        assert!(
+            parse(&text)
+                .expect("ingest section must parse")
+                .ingest
+                .denoise
+        );
     }
 
     #[test]

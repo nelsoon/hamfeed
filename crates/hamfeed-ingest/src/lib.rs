@@ -5,6 +5,7 @@
 //! sample count, which keeps tests deterministic. No files, no DB here —
 //! encode/queue/spill land in T6.
 
+pub mod denoise;
 #[cfg(feature = "opus")]
 pub mod encode;
 pub mod fixture;
@@ -12,6 +13,7 @@ pub mod queue;
 pub mod segmenter;
 pub mod spill;
 
+pub use denoise::Denoiser;
 #[cfg(feature = "opus")]
 pub use encode::{
     clip_path, decode_ogg_to_pcm, encode_pcm_to_ogg, write_clip_atomic, ClipMeta, LiveEncoder,

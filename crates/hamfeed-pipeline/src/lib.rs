@@ -859,12 +859,21 @@ impl Pipeline {
             });
             // Capture: frames, tap, and queue only — never STT. A capture
             // error still flushes first (worker drains the remainder below)
-            // and then surfaces, same as the old inline order.
+            // and then surfaces, same as the old inline order. Denoise
+            // (006) sits ahead of everything when enabled, so tap,
+            // segmenter, and archive all hear the same clean audio.
+            let denoise = self.cfg.ingest.denoise;
+            let mut dn = denoise.then(hamfeed_ingest::Denoiser::new);
             let capture = (|| -> Result<()> {
                 let stream = source.stream();
                 for frame in stream {
-                    self.tap.push(&frame.samples);
-                    for sg in seg.push(&frame.samples) {
+                    // Borrow dance: the denoiser is capture-local state.
+                    let samples: Vec<i16> = match dn.as_mut() {
+                        Some(d) => d.process(&frame.samples),
+                        None => frame.samples.clone(),
+                    };
+                    self.tap.push(&samples);
+                    for sg in seg.push(&samples) {
                         self.enqueue_segment(&sg)?;
                     }
                 }
