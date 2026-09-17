@@ -298,7 +298,7 @@
   pauseBtn.addEventListener("click", function () {
     paused = !paused;
     pauseBtn.setAttribute("aria-pressed", String(paused));
-    pauseBtn.textContent = paused ? "resume live" : "pause live";
+    pauseBtn.textContent = paused ? "Resume feed" : "Pause feed";
     if (!paused && pendingNew > 0) {
       pendingNew = 0;
       jumpPill.style.display = "none";
@@ -377,22 +377,27 @@
   listenBtn.addEventListener("click", function () {
     listening = !listening;
     listenBtn.setAttribute("aria-pressed", String(listening));
-    listenBtn.textContent = listening ? "stop live" : "listen live";
+    listenBtn.textContent = listening ? "Stop radio" : "Listen to radio";
     if (listening) {
       liveAudio.src = "/api/live";
       var pr = liveAudio.play();
       if (pr && pr.catch) {
-        pr.catch(function () {
-          listening = false;
-          listenBtn.setAttribute("aria-pressed", "false");
-          listenBtn.textContent = "listen live";
-        });
+        pr.catch(function () { stopListening(); });
       }
     } else {
-      liveAudio.pause();
-      liveAudio.removeAttribute("src");
-      liveAudio.load();
+      stopListening();
     }
+  });
+  function stopListening() {
+    listening = false;
+    listenBtn.setAttribute("aria-pressed", "false");
+    listenBtn.textContent = "Listen to radio";
+    liveAudio.pause();
+    liveAudio.removeAttribute("src");
+    liveAudio.load();
+  }
+  liveAudio.addEventListener("error", function () {
+    if (listening) stopListening();
   });
 
   var es = new EventSource("/api/events");
@@ -404,7 +409,7 @@
     if (m && m.profile && !m.id) { refreshProfile(); return; }
     if (paused || window.scrollY > 400) {
       pendingNew++;
-      jumpPill.textContent = pendingNew + " new — jump to live";
+      jumpPill.textContent = pendingNew + " new — show latest";
       jumpPill.style.display = "";
       if (!paused) upsert(m);
     } else {
@@ -412,6 +417,7 @@
     }
   });
 
+  pauseBtn.textContent = "Pause feed";
   loadMore();
   refreshProfile();
 })();

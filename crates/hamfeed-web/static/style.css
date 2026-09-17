@@ -11,7 +11,7 @@
   --failed: #f85149;
   --foryou: #58a6ff;
   --emergency: #ff7b72;
-  --disaster: #d2a8ff;
+  --disaster: #e8a13c;
   --radius: 10px;
 }
 * { box-sizing: border-box; }
@@ -163,7 +163,7 @@ audio { flex: 1; min-width: 0; height: 34px; }
 }
 .banner.disaster {
   color: var(--disaster);
-  background: rgba(210, 168, 255, 0.10);
+  background: rgba(232, 161, 60, 0.10);
   border-left-color: var(--disaster);
 }
 .modebar {
@@ -194,7 +194,7 @@ audio { flex: 1; min-width: 0; height: 34px; }
   font-size: 14px;
   letter-spacing: 0.04em;
   color: var(--disaster);
-  background: rgba(210, 168, 255, 0.10);
+  background: rgba(232, 161, 60, 0.10);
   border: 1px solid var(--disaster);
   border-radius: 6px;
   padding: 8px 10px;

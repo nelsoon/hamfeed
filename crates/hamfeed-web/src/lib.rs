@@ -320,41 +320,61 @@ async fn map_store_err(state: &AppState, id: &str, e: anyhow::Error) -> (StatusC
 }
 
 /// Live monitor (Slice 3, R7): the channel as chained Opus-in-Ogg over
-/// chunked HTTP. Each connection mints its own encoder (own OpusHead/serial)
-/// starting at the current tap tail, so late joiners decode from byte zero;
-/// lagging readers skip ahead in the tap (live, not archive). Dropping the
-/// connection just ends the stream — no server-side bookkeeping.
+/// chunked HTTP. The pipeline process owns the tap, so each connection
+/// subscribes to its relay socket (`<storage.dir>/live.sock`, raw LE i16)
+/// and encodes from the current tail — late joiners decode from byte zero
+/// via their own OpusHead/serial. No relay (pipeline down or restarting)
+/// is 503, never silence: the UI shows stopped instead of hanging.
+/// Dropping the connection just ends the stream.
 async fn api_live(State(state): State<AppState>) -> Result<Response, (StatusCode, String)> {
     use axum::body::Bytes;
-    use std::time::Duration;
-    let tap = state.pipeline.lock().await.live_tap();
+    use tokio::io::AsyncReadExt as _;
+    // Socket path mirrors the pipeline relay; the guard drops before any
+    // blocking I/O below.
+    let sock = {
+        let pipe = state.pipeline.lock().await;
+        std::path::PathBuf::from(&pipe.config().storage.dir).join("live.sock")
+    };
+    let relay = match tokio::net::UnixStream::connect(&sock).await {
+        Ok(s) => s,
+        Err(_) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "live capture unavailable (pipeline down or restarting)".into(),
+            ));
+        }
+    };
     let (head, enc) = hamfeed_ingest::LiveEncoder::new()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let stream = futures_util::stream::unfold(
-        (Some(head), tap.current_seq(), enc),
-        move |(mut head, mut since, mut enc)| {
-            let tap = tap.clone();
-            async move {
-                loop {
-                    if let Some(h) = head.take() {
-                        let st = (None, since, enc);
-                        return Some((Ok::<_, std::io::Error>(Bytes::from(h)), st));
+        (Some(head), relay, enc),
+        move |(mut head, mut relay, mut enc)| async move {
+            loop {
+                if let Some(h) = head.take() {
+                    let st = (None, relay, enc);
+                    return Some((Ok::<_, std::io::Error>(Bytes::from(h)), st));
+                }
+                // One 20 ms frame per read; the relay only ever sends live
+                // PCM, so a stall here means the other end went away.
+                let mut frame = [0u8; 640];
+                if relay.read_exact(&mut frame).await.is_err() {
+                    return None;
+                }
+                let pcm: Vec<i16> = frame
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| i16::from_le_bytes(*c))
+                    .collect();
+                match enc.push(&pcm) {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        let st = (None, relay, enc);
+                        return Some((Ok(Bytes::from(bytes)), st));
                     }
-                    let (now, pcm) = tap.read_since(since);
-                    since = now;
-                    if !pcm.is_empty() {
-                        match enc.push(&pcm) {
-                            Ok(bytes) if !bytes.is_empty() => {
-                                let st = (None, since, enc);
-                                return Some((Ok(Bytes::from(bytes)), st));
-                            }
-                            Ok(_) => {}
-                            // Encoder died mid-stream: end it; the UI shows
-                            // stopped rather than hanging on silence.
-                            Err(_) => return None,
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Ok(_) => {}
+                    // Encoder died mid-stream: end it; the UI shows
+                    // stopped rather than hanging on silence.
+                    Err(_) => return None,
                 }
             }
         },
@@ -1458,16 +1478,38 @@ freq_label = "TEST"
             .collect()
     }
 
+    /// Stub the pipeline relay: raw LE i16 frames on the socket path the
+    /// handler derives from the test storage dir. Mirrors serve_live_tap's
+    /// side of the contract (framing only, no tap involved).
+    fn stub_relay(sock_path: std::path::PathBuf, frames: usize) {
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            use std::os::unix::net::UnixListener;
+            let _ = std::fs::remove_file(&sock_path);
+            let listener = UnixListener::bind(&sock_path).expect("stub binds");
+            let (mut stream, _) = listener.accept().expect("web connects");
+            let frame = vec![0u8; 640];
+            for _ in 0..frames {
+                if stream.write_all(&frame).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+    }
+
+    async fn relay_sock(state: &AppState) -> std::path::PathBuf {
+        let pipe = state.pipeline.lock().await;
+        std::path::PathBuf::from(&pipe.config().storage.dir).join("live.sock")
+    }
+
     #[tokio::test]
-    async fn live_stream_serves_decodable_ogg() {
-        // Slice 3 T3: tap audio in, Opus-in-Ogg out, starting at the tail.
+    async fn live_stream_relays_socket_audio() {
+        // Slice 3 fix: with a relay feeding, the second chunk must carry
+        // audio pages (headers alone = the old same-process starvation).
         let (base, h) = test_server().await;
-        h.state
-            .pipeline
-            .lock()
-            .await
-            .live_tap()
-            .push(&vec![1000i16; 3200]);
+        stub_relay(relay_sock(&h.state).await, 200);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let client = reqwest::Client::new();
         let mut res = client
             .get(format!("{base}/api/live"))
@@ -1478,7 +1520,21 @@ freq_label = "TEST"
         let first = res.chunk().await.expect("first chunk").expect("bytes");
         assert_eq!(&first[..4], b"OggS");
         assert!(first.windows(8).any(|w| w == b"OpusHead"));
-        // Disconnect mid-stream: the server just drops the generator.
+        let second = res.chunk().await.expect("second chunk").expect("bytes");
+        assert!(!second.is_empty(), "relay audio must follow headers");
+        assert_eq!(&second[..4], b"OggS");
+    }
+
+    #[tokio::test]
+    async fn live_stream_503_without_relay() {
+        // No socket (pipeline down): honest 503, never hanging silence.
+        let (base, _h) = test_server().await;
+        let res = reqwest::Client::new()
+            .get(format!("{base}/api/live"))
+            .send()
+            .await
+            .expect("live responds");
+        assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

@@ -50,6 +50,15 @@ fn main() {
         eprintln!("hamfeed-pipeline: cannot start\n{e:?}");
         std::process::exit(1);
     });
+    // Live monitor relay (Slice 3 fix): the web UI runs in its own process
+    // and cannot see our in-memory tap, so publish tap PCM on a socket the
+    // web `/api/live` handler subscribes to. No library change: the tap
+    // handle is already shareable; this thread only reads it.
+    std::thread::spawn({
+        let tap = pipe.live_tap();
+        let sock = std::path::PathBuf::from(&pipe.config().storage.dir).join("live.sock");
+        move || serve_live_tap(tap, sock)
+    });
     let recovered = pipe.startup_recovery().unwrap_or_else(|e| {
         eprintln!("hamfeed-pipeline: spill replay failed: {e:?}");
         std::process::exit(1);
@@ -135,4 +144,43 @@ fn load_cfg(path: &std::path::Path) -> hamfeed_config::Config {
         eprintln!("hamfeed-pipeline: bad config: {e:?}");
         std::process::exit(1);
     })
+}
+
+/// Publish tap PCM as raw little-endian i16 over a Unix socket (Slice 3
+/// fix). One thread per listener; each starts at the current tail and
+/// follows live. A dead or slow listener ends only its own thread —
+/// capture never blocks on listeners.
+fn serve_live_tap(tap: std::sync::Arc<hamfeed_pipeline::LiveTap>, sock: std::path::PathBuf) {
+    use std::io::Write as _;
+    use std::os::unix::net::UnixListener;
+    let _ = std::fs::remove_file(&sock);
+    let listener = match UnixListener::bind(&sock) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("hamfeed-pipeline: live relay unavailable ({e:?})");
+            return;
+        }
+    };
+    for conn in listener.incoming() {
+        let Ok(mut stream) = conn else { continue };
+        let tap = std::sync::Arc::clone(&tap);
+        std::thread::spawn(move || {
+            let mut since = tap.current_seq();
+            loop {
+                let (now, pcm) = tap.read_since(since);
+                since = now;
+                if pcm.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                let mut raw = Vec::with_capacity(pcm.len() * 2);
+                for s in &pcm {
+                    raw.extend_from_slice(&s.to_le_bytes());
+                }
+                if stream.write_all(&raw).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 }
