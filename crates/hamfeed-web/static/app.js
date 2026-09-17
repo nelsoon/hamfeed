@@ -395,13 +395,18 @@
     }
   }
   function scheduleRetry() {
+    // Generous on purpose: a transcription stall (drain blocks the frame
+    // loop) starves the relay for the length of a segment, and a pipeline
+    // restart rebinds the socket seconds later. Backoff caps at 8 s; the
+    // counter resets on every playing event, so only a truly dead relay
+    // (minutes of nothing) gives up.
     if (!listening) return;
-    if (listenRetries >= 5) { stopListening(); return; }
+    if (listenRetries >= 60) { stopListening(); return; }
     listenRetries++;
     setTimeout(function () {
       if (!listening) return;
       playLive();
-    }, 1500);
+    }, Math.min(1500 * listenRetries, 8000));
   }
   function stopListening() {
     listening = false;

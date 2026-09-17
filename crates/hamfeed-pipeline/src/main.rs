@@ -150,6 +150,22 @@ fn load_cfg(path: &std::path::Path) -> hamfeed_config::Config {
 /// fix). One thread per listener; each starts at the current tail and
 /// follows live. A dead or slow listener ends only its own thread —
 /// capture never blocks on listeners.
+/// Max backlog a listener replays after a stall. The frame loop blocks
+/// during transcription (drain runs STT synchronously), so after a long
+/// segment a follower can sit on seconds of stale audio: beyond this it
+/// jumps to the live tail instead of replaying the past.
+const LIVE_CATCHUP_MAX: u64 = 16_000 * 5;
+
+/// Where a stalled reader resumes: its position when fresh, the live tail
+/// when it fell further than [`LIVE_CATCHUP_MAX`] behind.
+fn catch_up(current: u64, since: u64) -> u64 {
+    if current.saturating_sub(since) > LIVE_CATCHUP_MAX {
+        current
+    } else {
+        since
+    }
+}
+
 fn serve_live_tap(tap: std::sync::Arc<hamfeed_pipeline::LiveTap>, sock: std::path::PathBuf) {
     use std::io::Write as _;
     use std::os::unix::net::UnixListener;
@@ -167,6 +183,9 @@ fn serve_live_tap(tap: std::sync::Arc<hamfeed_pipeline::LiveTap>, sock: std::pat
         std::thread::spawn(move || {
             let mut since = tap.current_seq();
             loop {
+                // Jump to live when a transcription stall left this
+                // follower on stale audio; otherwise follow contiguously.
+                since = catch_up(tap.current_seq(), since);
                 let (now, pcm) = tap.read_since(since);
                 since = now;
                 if pcm.is_empty() {
@@ -182,5 +201,21 @@ fn serve_live_tap(tap: std::sync::Arc<hamfeed_pipeline::LiveTap>, sock: std::pat
                 }
             }
         });
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catch_up_jumps_only_when_stale() {
+        // Fresh follower: stays put, replays contiguously.
+        assert_eq!(catch_up(100_000, 100_000), 100_000);
+        assert_eq!(catch_up(100_000, 99_999), 99_999);
+        // Exactly at the bound: still replays.
+        assert_eq!(catch_up(80_000, 0), 0);
+        // Past it (a transcription stall's worth): jumps to live.
+        assert_eq!(catch_up(80_001, 0), 80_001);
+        assert_eq!(catch_up(480_000, 0), 480_000);
     }
 }
