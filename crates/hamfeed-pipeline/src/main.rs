@@ -46,7 +46,7 @@ fn main() {
         }
     }
 
-    let mut pipe = Pipeline::open(&config).unwrap_or_else(|e| {
+    let pipe = Pipeline::open(&config).unwrap_or_else(|e| {
         eprintln!("hamfeed-pipeline: cannot start\n{e:?}");
         std::process::exit(1);
     });

@@ -74,7 +74,7 @@ async fn e2e_simulated_feed() {
         .collect();
     let mut src = FakeSource::once(frames);
 
-    let mut pipe = test_pipeline(&dir);
+    let pipe = test_pipeline(&dir);
     let n = pipe
         .run_source(&mut src, 800, 120, true, 150)
         .expect("loop runs");

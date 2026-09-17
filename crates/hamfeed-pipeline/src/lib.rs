@@ -7,7 +7,11 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use hamfeed_callbook::Callbook;
@@ -380,13 +384,13 @@ pub struct Pipeline {
     cfg: Config,
     store: Store,
     transcriber: Transcriber,
-    queue: IngestQueue,
+    queue: Mutex<IngestQueue>,
     spill: SpillDir,
     storage_dir: PathBuf,
-    drains: u64,
-    carry: CarryState,
+    drains: AtomicU64,
+    carry: Mutex<CarryState>,
     callbook: Callbook,
-    voice: VoiceState,
+    voice: Mutex<VoiceState>,
     tap: Arc<LiveTap>,
 }
 
@@ -439,17 +443,17 @@ impl Pipeline {
             cfg: cfg.clone(),
             store,
             transcriber,
-            queue: IngestQueue::new(100),
-            drains: 0,
+            queue: Mutex::new(IngestQueue::new(100)),
+            drains: AtomicU64::new(0),
             spill,
             storage_dir,
-            carry: CarryState::new(window_ms),
+            carry: Mutex::new(CarryState::new(window_ms)),
             callbook,
-            voice: VoiceState::new(
+            voice: Mutex::new(VoiceState::new(
                 cfg.voiceprint.threshold,
                 #[cfg(feature = "voice")]
                 embedder,
-            ),
+            )),
             tap: Arc::new(LiveTap::new()),
         })
     }
@@ -472,13 +476,13 @@ impl Pipeline {
     }
 
     pub fn queue_len(&self) -> usize {
-        self.queue.len()
+        self.queue.lock().expect("queue mutex").len()
     }
 
     /// Boot recovery: replay spilled rows into the queue, oldest first, and
     /// leave a system gap marker when anything was recovered (S9). Also
     /// purges expired voice aliases (R4 library bound).
-    pub fn startup_recovery(&mut self) -> Result<usize> {
+    pub fn startup_recovery(&self) -> Result<usize> {
         let purged = self
             .store
             .purge_aliases(self.cfg.voiceprint.retention_days, now_ms())?;
@@ -488,7 +492,10 @@ impl Pipeline {
         let items = self.spill.replay_items()?;
         let n = items.len();
         for item in items {
-            self.queue.push(item, &self.spill)?;
+            self.queue
+                .lock()
+                .expect("queue mutex")
+                .push(item, &self.spill)?;
         }
         if n > 0 {
             self.record_gap(&format!(
@@ -500,7 +507,7 @@ impl Pipeline {
 
     /// Persist one closed segment's audio, then queue its metadata.
     /// The queue item exists only after the file has landed (S6).
-    pub fn enqueue_segment(&mut self, seg: &Segment) -> Result<()> {
+    pub fn enqueue_segment(&self, seg: &Segment) -> Result<()> {
         let meta = hamfeed_ingest::write_clip_atomic(
             &self.storage_dir,
             &seg.id,
@@ -508,7 +515,7 @@ impl Pipeline {
             seg.duration_ms,
             &seg.pcm,
         )?;
-        self.queue.push(
+        self.queue.lock().expect("queue mutex").push(
             QueueItem {
                 id: meta.id,
                 audio_path: meta.path.to_string_lossy().into_owned(),
@@ -525,10 +532,10 @@ impl Pipeline {
     /// Drain the queue: transcribe each clip, store the row. Returns the
     /// number of clips processed. Spilled-then-replayed items are removed
     /// from the spill dir once stored.
-    pub fn drain(&mut self) -> Result<usize> {
-        self.drains += 1;
+    pub fn drain(&self) -> Result<usize> {
+        self.drains.fetch_add(1, Ordering::Relaxed);
         let mut n = 0;
-        while let Some(item) = self.queue.pop() {
+        while let Some(item) = self.queue.lock().expect("queue mutex").pop() {
             self.process_item(&item)?;
             let _ = self.spill.remove(&item.id);
             n += 1;
@@ -538,7 +545,7 @@ impl Pipeline {
 
     /// How many times the queue was drained (live loop drains per segment).
     pub fn drain_count(&self) -> u64 {
-        self.drains
+        self.drains.load(Ordering::Relaxed)
     }
 
     /// Past-window voice suggestion (S7): a stored alias for this key at
@@ -585,36 +592,49 @@ impl Pipeline {
         Ok(())
     }
 
-    fn process_item(&mut self, item: &QueueItem) -> Result<()> {
+    fn process_item(&self, item: &QueueItem) -> Result<()> {
         let msg = match self.transcriber.transcribe(Path::new(&item.audio_path)) {
             Ok(out) => {
                 // Spoken phonetics collapse to letter groups ("alpha lima
                 // lima oscar" -> "ALLO") so callsigns read and search as
                 // written; ham shortcuts ("73", "QTH") pass through.
                 let transcript = hamfeed_stt::normalize_phonetics(&out.transcript);
-                // Voice key first: the alias link below needs it.
-                self.voice.roll_window(&item.group_id);
-                let speaker_key = self.voice.key_for(
-                    &self.store,
-                    &decode_for_voice(&item.audio_path),
-                    item.duration_ms,
-                    "ok",
-                    &self.cfg.station.freq_label,
-                    &day_of(item.ts_start_ms),
-                    self.cfg.voiceprint.min_embed_s,
-                    &item.id,
-                );
-                if let Some(k) = &speaker_key {
-                    self.voice.group_keys.push((k.clone(), item.ts_start_ms));
-                }
+                // Voice key first: the alias link below needs it. One
+                // guard for the whole voice block (same sequential order
+                // the single worker always had); group keys are cloned
+                // out for the link step below.
+                let (speaker_key, group_keys) = {
+                    let mut v = self.voice.lock().expect("voice mutex");
+                    v.roll_window(&item.group_id);
+                    let k = v.key_for(
+                        &self.store,
+                        &decode_for_voice(&item.audio_path),
+                        item.duration_ms,
+                        "ok",
+                        &self.cfg.station.freq_label,
+                        &day_of(item.ts_start_ms),
+                        self.cfg.voiceprint.min_embed_s,
+                        &item.id,
+                    );
+                    if let Some(kk) = &k {
+                        v.group_keys.push((kk.clone(), item.ts_start_ms));
+                    }
+                    (k, v.group_keys.clone())
+                };
                 // Active profile cues per segment: always fresh across the
                 // web/pipeline handles with no cache to invalidate. A failed
                 // read degrades to Normal (empty cues), never louder.
                 let disaster_cues = self.store.active_cues().unwrap_or_default();
+                let carried = self
+                    .carry
+                    .lock()
+                    .expect("carry mutex")
+                    .carried(item.ts_start_ms)
+                    .map(str::to_string);
                 let mut e = enrich_profiled(
                     &transcript,
                     &out.lang,
-                    self.carry.carried(item.ts_start_ms),
+                    carried.as_deref(),
                     &|cs| self.callbook.lookup(cs).ok().flatten().map(|c| c.name),
                     self.cfg.station.my_callsign.as_deref(),
                     &self.cfg.notify.emergency_cues,
@@ -626,10 +646,13 @@ impl Pipeline {
                 // only — never sender_*).
                 if e.sender_source == "heard" {
                     if let Some(cs) = &e.sender_callsign {
-                        self.carry.observe(Some(cs.clone()), item.ts_start_ms);
+                        self.carry
+                            .lock()
+                            .expect("carry mutex")
+                            .observe(Some(cs.clone()), item.ts_start_ms);
                         link_alias(
                             &self.store,
-                            &self.voice.group_keys,
+                            &group_keys,
                             item.ts_start_ms,
                             cs,
                             self.cfg.identity.link_window_min * 60_000,
@@ -708,14 +731,14 @@ impl Pipeline {
     /// not choose. `Retry` re-queues the clip for another pass.
     ///
     /// Web helper: [`drop_with_config`] resolves the config default.
-    pub fn set_triage(&mut self, id: &str, action: TriageAction) -> Result<()> {
+    pub fn set_triage(&self, id: &str, action: TriageAction) -> Result<()> {
         match &action {
             TriageAction::Drop { .. } => {
                 self.store.set_triage(id, &action)?;
                 // A retry may still be queued or draining: the row stays
                 // dropped (upsert skips dropped rows) and the queue entry
                 // goes away so it is never re-processed.
-                self.queue.remove(id);
+                self.queue.lock().expect("queue mutex").remove(id);
             }
             TriageAction::Retry => {
                 self.store.set_triage(id, &TriageAction::Retry)?;
@@ -729,7 +752,7 @@ impl Pipeline {
                 if !Path::new(&audio).exists() {
                     anyhow::bail!("retry: audio missing for {id}");
                 }
-                self.queue.push(
+                self.queue.lock().expect("queue mutex").push(
                     QueueItem {
                         id: msg.id,
                         audio_path: audio,
@@ -792,8 +815,14 @@ impl Pipeline {
 
     /// Feed one audio source through segment → clip → queue → store.
     /// Headless Slice-1 loop without web (T9 Done clause).
+    /// Live loop with transcription as a background job (Slice 3 fix):
+    /// the capture thread reads frames, feeds the live tap, and enqueues
+    /// segments without ever waiting on STT; one worker thread drains the
+    /// queue FIFO in order. Returns when the source ends AND the queue is
+    /// empty, with the drained count — same contract as before, so the
+    /// `--fake` harness and tests behave identically.
     pub fn run_source(
-        &mut self,
+        &self,
         source: &mut dyn AudioSource,
         hang_ms: u64,
         max_s: u64,
@@ -810,24 +839,47 @@ impl Pipeline {
             },
             now_ms(),
         );
-        let mut total = 0;
-        let stream = source.stream();
-        for frame in stream {
-            self.tap.push(&frame.samples);
-            for s in seg.push(&frame.samples) {
-                self.enqueue_segment(&s)?;
-                // Drain per segment: a live mic never ends its stream, so a
-                // drain-only-at-end would buffer forever and store nothing.
-                // STT latency only delays the feed; capture keeps buffering
-                // frames in order behind it.
-                total += self.drain()?;
-            }
-        }
-        for s in seg.flush() {
-            self.enqueue_segment(&s)?;
-        }
-        total += self.drain()?;
-        Ok(total)
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            // Worker: chew through the queue FIFO; idle-poll when empty so
+            // a live mic's pauses cost nothing; exit once capture ends AND
+            // nothing remains. Its error surfaces below after the join.
+            let worker = s.spawn(|| -> Result<usize> {
+                let mut n = 0;
+                loop {
+                    let k = self.drain()?;
+                    n += k;
+                    if k == 0 {
+                        if done.load(Ordering::Acquire) {
+                            return Ok(n);
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            });
+            // Capture: frames, tap, and queue only — never STT. A capture
+            // error still flushes first (worker drains the remainder below)
+            // and then surfaces, same as the old inline order.
+            let capture = (|| -> Result<()> {
+                let stream = source.stream();
+                for frame in stream {
+                    self.tap.push(&frame.samples);
+                    for sg in seg.push(&frame.samples) {
+                        self.enqueue_segment(&sg)?;
+                    }
+                }
+                for sg in seg.flush() {
+                    self.enqueue_segment(&sg)?;
+                }
+                Ok(())
+            })();
+            done.store(true, Ordering::Release);
+            let n = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("drain worker panicked"))??;
+            capture?;
+            Ok(n)
+        })
     }
 }
 
@@ -933,7 +985,7 @@ freq_label = "TEST"
     #[test]
     fn undecodable_clip_triage() {
         let dir = test_dir("triage");
-        let mut pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
         pipe.startup_recovery().unwrap();
 
         // Corrupt clip → failed row with error text.
@@ -1043,7 +1095,7 @@ freq_label = "TEST"
         // segments close — draining only at end-of-stream would buffer
         // forever. Three bursts must trigger at least three drains.
         let dir = test_dir("livedrain");
-        let mut pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
         let mut pcm = Vec::new();
         for _ in 0..3 {
             pcm.extend(fixture::speech_like(2));
@@ -1070,7 +1122,7 @@ freq_label = "TEST"
         // Synthetic FakeSource transmission through the whole headless loop
         // lands rows whose audio files exist (T9 Done clause).
         let dir = test_dir("fakerun");
-        let mut pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
         let mut pcm = fixture::speech_like(6);
         pcm.extend(fixture::silence_ms(1200));
         let frames = fixture::chunks(&pcm, 1600);
@@ -1514,7 +1566,7 @@ freq_label = "TEST"
     fn failed_row_skips_enrich() {
         // Corrupt clip → failed row stays sender-less with alert 0 (S11).
         let dir = test_dir("noenrich");
-        let mut pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
         let item = failed_item(&dir, "bad2");
         pipe.process_item(&item).unwrap();
         let row = pipe.store.get("bad2").unwrap().expect("row stored");
@@ -1589,5 +1641,42 @@ freq_label = "TEST"
         let (seq3, third) = tap.read_since(seq2);
         assert_eq!(third, vec![1, 2, 3]);
         assert_eq!(seq3, seq2 + 3);
+    }
+
+    #[test]
+    fn drain_runs_concurrent_with_capture_side() {
+        use std::sync::Arc;
+        // Queued-background contract (Slice 3 fix): the capture side
+        // (enqueue + tap) proceeds while a drain is in flight. Under the
+        // old &mut design this test could not compile — no shared access
+        // existed. Behaviorally: every item stored exactly once, FIFO.
+        let dir = test_dir("bgdrain");
+        let pipe = Arc::new(Pipeline::open_with(test_config(&dir, &test_model())).unwrap());
+        let seg = |i: u32| Segment {
+            id: format!("bg-{i}"),
+            group_id: "g".into(),
+            seq: i,
+            ts_start_ms: u64::from(i) * 4000,
+            ts_end_ms: u64::from(i) * 4000 + 3000,
+            duration_ms: 3000,
+            pcm: hamfeed_ingest::fixture::speech_like(8),
+        };
+        pipe.enqueue_segment(&seg(0)).unwrap();
+        pipe.enqueue_segment(&seg(1)).unwrap();
+        let worker = {
+            let pipe = Arc::clone(&pipe);
+            std::thread::spawn(move || pipe.drain().unwrap())
+        };
+        pipe.enqueue_segment(&seg(2)).unwrap();
+        pipe.enqueue_segment(&seg(3)).unwrap();
+        pipe.live_tap().push(&[0i16; 160]);
+        let first = worker.join().unwrap();
+        let rest = pipe.drain().unwrap();
+        assert_eq!(first + rest, 4);
+        for i in 0..4 {
+            let id = format!("bg-{i}");
+            assert!(pipe.store().get(&id).unwrap().is_some(), "{id} stored");
+        }
+        assert_eq!(pipe.queue_len(), 0);
     }
 }

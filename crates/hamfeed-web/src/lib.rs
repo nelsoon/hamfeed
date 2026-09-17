@@ -265,7 +265,7 @@ async fn api_triage(
         (t, retry)
     };
     {
-        let mut pipe = state.pipeline.lock().await;
+        let pipe = state.pipeline.lock().await;
         if let Err(e) = pipe.set_triage(&id, triage) {
             // Drop the guard before mapping: map_store_err re-locks the
             // same mutex and would deadlock on it.
@@ -278,7 +278,7 @@ async fn api_triage(
         // as SSE events when they land.
         let state2 = state.clone();
         tokio::task::spawn_blocking(move || {
-            let mut pipe = state2.pipeline.blocking_lock();
+            let pipe = state2.pipeline.blocking_lock();
             if pipe.drain().is_ok() {
                 if let Ok(latest) = pipe.latest(64) {
                     for m in &latest {
