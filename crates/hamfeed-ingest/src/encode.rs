@@ -20,13 +20,22 @@ use crate::SAMPLE_RATE;
 pub const FRAME_SAMPLES: usize = 320;
 /// Archive bitrate: speech remains intelligible, files stay small.
 pub const BITRATE_BPS: i32 = 16_000;
+/// Live bitrate (007 ear-test finding): the 16 kbit/s archive setting
+/// leaves a speech-locked hash on sibilants over `/api/live` (silence
+/// encodes trivially, so it only ever rides on talking). 32 kbit/s
+/// costs ~2 KB/s extra on the LAN and never touches the archive.
+pub const LIVE_BITRATE_BPS: i32 = 32_000;
 
-fn encoder() -> Result<Encoder> {
+fn encoder_with(bitrate: i32) -> Result<Encoder> {
     let mut enc = Encoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip)
         .context("cannot create Opus encoder")?;
-    enc.set_bitrate(Bitrate::BitsPerSecond(BITRATE_BPS))
+    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate))
         .context("cannot set Opus bitrate")?;
     Ok(enc)
+}
+
+fn encoder() -> Result<Encoder> {
+    encoder_with(BITRATE_BPS)
 }
 
 /// Encode 16 kHz mono S16 into a self-describing Opus-in-Ogg byte buffer.
@@ -62,6 +71,76 @@ pub fn encode_pcm_to_ogg(pcm: &[i16]) -> Result<Vec<u8>> {
         .context("cannot close Ogg stream")?;
     drop(w);
     Ok(out)
+}
+
+/// Streaming Opus-in-Ogg encoder for `/api/live` (Slice 3, R7).
+/// Unlike [`encode_pcm_to_ogg`] this never writes EOS: the connection is the
+/// stream, and each connection starts with its own OpusHead/Tags/serial, so
+/// a late joiner decodes from its first byte. Partial 20 ms frames buffer
+/// internally (at most one frame of extra latency).
+pub struct LiveEncoder {
+    enc: Encoder,
+    serial: u32,
+    granule: u64,
+    pending: Vec<i16>,
+}
+
+impl LiveEncoder {
+    /// Fresh encoder plus the header bytes the connection must send first.
+    pub fn new() -> Result<(Vec<u8>, Self)> {
+        let serial = rand_serial();
+        let mut head = Vec::new();
+        {
+            let mut w = PacketWriter::new(&mut head);
+            // Solo-paged headers (RFC 7845) double as a flush: the
+            // header burst is complete bytes on return, no EOS ever.
+            w.write_packet(opus_head(), serial, PacketWriteEndInfo::EndPage, 0)
+                .context("cannot write OpusHead")?;
+            w.write_packet(opus_tags(), serial, PacketWriteEndInfo::EndPage, 0)
+                .context("cannot write OpusTags")?;
+        }
+        Ok((
+            head,
+            Self {
+                enc: encoder_with(LIVE_BITRATE_BPS)?,
+                serial,
+                granule: 0,
+                pending: Vec::new(),
+            },
+        ))
+    }
+
+    /// Feed 16 kHz mono S16; returns Ogg audio-packet bytes (empty until a
+    /// full 20 ms frame accumulates). The granule position runs across calls.
+    pub fn push(&mut self, pcm: &[i16]) -> Result<Vec<u8>> {
+        self.pending.extend_from_slice(pcm);
+        let mut out = Vec::new();
+        {
+            let mut w = PacketWriter::new(&mut out);
+            let mut frame = [0i16; FRAME_SAMPLES];
+            let mut packet = [0u8; 4096];
+            while self.pending.len() >= FRAME_SAMPLES {
+                frame.copy_from_slice(&self.pending[..FRAME_SAMPLES]);
+                self.pending.drain(..FRAME_SAMPLES);
+                let n = self
+                    .enc
+                    .encode(&frame, &mut packet)
+                    .context("Opus encode failed")?;
+                self.granule += FRAME_SAMPLES as u64;
+                // EndPage: one flushed Ogg page per 20 ms packet, so the
+                // browser plays with ~200 ms granularity instead of waiting
+                // for a 4 KB page to fill (~2 s of near-silence).
+                w.write_packet(
+                    packet[..n].to_vec(),
+                    self.serial,
+                    PacketWriteEndInfo::EndPage,
+                    self.granule,
+                )
+                .context("cannot write Opus packet")?;
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Decode an Opus-in-Ogg buffer back to 16 kHz mono S16.
@@ -230,6 +309,45 @@ mod tests {
     fn undecodable_is_error() {
         assert!(decode_ogg_to_pcm(b"definitely not ogg").is_err());
         assert!(decode_ogg_to_pcm(b"OggS garbage").is_err());
+    }
+
+    #[test]
+    fn live_encoder_headers_and_cadence() {
+        let (head, mut enc) = LiveEncoder::new().unwrap();
+        // Ogg page magic up front, OpusHead inside the header burst.
+        assert_eq!(&head[..4], b"OggS");
+        assert!(head.windows(8).any(|w| w == b"OpusHead"));
+        // Sub-frame input buffers silently (no runt packets).
+        assert!(enc.push(&[0i16; 100]).unwrap().is_empty());
+        // Completing the 20 ms frame flushes audio bytes in Ogg pages.
+        let bytes = enc.push(&vec![0i16; FRAME_SAMPLES - 100]).unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(&bytes[..4], b"OggS");
+    }
+
+    #[test]
+    fn live_encoder_spends_more_bits_than_archive() {
+        // The live wire runs hotter than the archive on purpose
+        // (LIVE_BITRATE_BPS > BITRATE_BPS): sibilant-heavy input must
+        // come out measurably larger through LiveEncoder than through
+        // the clip encoder, with margin to spare for page layout.
+        let a = fixture::tone_ms(5233.0, 2000, 6000);
+        let b = fixture::tone_ms(6117.0, 2000, 6000);
+        let pcm: Vec<i16> = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| x.saturating_add(*y))
+            .collect();
+        let (_, mut live) = LiveEncoder::new().unwrap();
+        let mut live_bytes = 0usize;
+        for chunk in pcm.chunks(1600) {
+            live_bytes += live.push(chunk).unwrap().len();
+        }
+        let clip_bytes = encode_pcm_to_ogg(&pcm).unwrap().len();
+        assert!(
+            live_bytes as f64 > clip_bytes as f64 * 1.3,
+            "live {live_bytes} should exceed archive {clip_bytes} with margin"
+        );
     }
 
     #[test]

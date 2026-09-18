@@ -149,6 +149,8 @@ pub fn create_app(state: AppState) -> Router {
         .route("/api/messages/:id/correct", post(api_correct))
         .route("/api/export/training", get(api_export_training))
         .route("/api/events", get(api_events))
+        .route("/api/live", get(api_live))
+        .route("/api/profile", get(api_get_profile).post(api_set_profile))
         .route("/audio/:id", get(api_audio))
         .route("/audio/:id/play.wav", get(api_audio_wav))
         .fallback_service(tower_http::services::ServeDir::new(static_dir))
@@ -263,7 +265,7 @@ async fn api_triage(
         (t, retry)
     };
     {
-        let mut pipe = state.pipeline.lock().await;
+        let pipe = state.pipeline.lock().await;
         if let Err(e) = pipe.set_triage(&id, triage) {
             // Drop the guard before mapping: map_store_err re-locks the
             // same mutex and would deadlock on it.
@@ -276,7 +278,7 @@ async fn api_triage(
         // as SSE events when they land.
         let state2 = state.clone();
         tokio::task::spawn_blocking(move || {
-            let mut pipe = state2.pipeline.blocking_lock();
+            let pipe = state2.pipeline.blocking_lock();
             if pipe.drain().is_ok() {
                 if let Ok(latest) = pipe.latest(64) {
                     for m in &latest {
@@ -315,6 +317,127 @@ async fn map_store_err(state: &AppState, id: &str, e: anyhow::Error) -> (StatusC
     } else {
         (StatusCode::NOT_FOUND, "no such message".into())
     }
+}
+
+/// Live monitor (Slice 3, R7): the channel as chained Opus-in-Ogg over
+/// chunked HTTP. The pipeline process owns the tap, so each connection
+/// subscribes to its relay socket (`<storage.dir>/live.sock`, raw LE i16)
+/// and encodes from the current tail — late joiners decode from byte zero
+/// via their own OpusHead/serial. No relay (pipeline down or restarting)
+/// is 503, never silence: the UI shows stopped instead of hanging.
+/// Dropping the connection just ends the stream.
+async fn api_live(State(state): State<AppState>) -> Result<Response, (StatusCode, String)> {
+    use axum::body::Bytes;
+    use tokio::io::AsyncReadExt as _;
+    // Socket path mirrors the pipeline relay; the guard drops before any
+    // blocking I/O below.
+    let sock = {
+        let pipe = state.pipeline.lock().await;
+        std::path::PathBuf::from(&pipe.config().storage.dir).join("live.sock")
+    };
+    let relay = match tokio::net::UnixStream::connect(&sock).await {
+        Ok(s) => s,
+        Err(_) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "live capture unavailable (pipeline down or restarting)".into(),
+            ));
+        }
+    };
+    let (head, enc) = hamfeed_ingest::LiveEncoder::new()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let stream = futures_util::stream::unfold(
+        (Some(head), relay, enc),
+        move |(mut head, mut relay, mut enc)| async move {
+            loop {
+                if let Some(h) = head.take() {
+                    let st = (None, relay, enc);
+                    return Some((Ok::<_, std::io::Error>(Bytes::from(h)), st));
+                }
+                // One 20 ms frame per read; the relay only ever sends live
+                // PCM, so a stall here means the other end went away.
+                let mut frame = [0u8; 640];
+                if relay.read_exact(&mut frame).await.is_err() {
+                    return None;
+                }
+                let pcm: Vec<i16> = frame
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| i16::from_le_bytes(*c))
+                    .collect();
+                match enc.push(&pcm) {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        let st = (None, relay, enc);
+                        return Some((Ok(Bytes::from(bytes)), st));
+                    }
+                    Ok(_) => {}
+                    // Encoder died mid-stream: end it; the UI shows
+                    // stopped rather than hanging on silence.
+                    Err(_) => return None,
+                }
+            }
+        },
+    );
+    Ok((
+        [
+            (header::CONTENT_TYPE, "audio/ogg"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response())
+}
+
+/// Disaster profiles (Slice 3, R1/R4): which detector set is live.
+/// The banner polls this; a switch broadcasts so open feeds update too.
+async fn api_get_profile(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pipe = state.pipeline.lock().await;
+    let active = pipe
+        .store()
+        .active_profile()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let profiles = pipe
+        .store()
+        .list_profiles()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "active": active,
+        "profiles": profiles
+            .iter()
+            .map(|p| serde_json::json!({"name": p.name, "cues": p.cues}))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileBody {
+    name: String,
+}
+
+/// Switch the active profile (new traffic only; history untouched, R5).
+/// Unknown names are 404 via [`hamfeed_store::UnknownProfile`]; anything
+/// else is 500 (verdict pattern). Switches broadcast like triage.
+async fn api_set_profile(
+    State(state): State<AppState>,
+    Json(body): Json<ProfileBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let active = {
+        let pipe = state.pipeline.lock().await;
+        if let Err(e) = pipe.store().set_active_profile(&body.name) {
+            if e.downcast_ref::<hamfeed_store::UnknownProfile>().is_some() {
+                return Err((StatusCode::NOT_FOUND, "unknown profile".into()));
+            }
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+        pipe.store()
+            .active_profile()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let _ = state.tx.send(serde_json::json!({"profile": active}));
+    Ok(Json(serde_json::json!({"active": active})))
 }
 
 /// Operator sender confirm/correct (003 S8): attach the verdict and
@@ -1353,6 +1476,117 @@ freq_label = "TEST"
         (0..zip.len())
             .map(|i| zip.by_index(i).unwrap().name().to_string())
             .collect()
+    }
+
+    /// Stub the pipeline relay: raw LE i16 frames on the socket path the
+    /// handler derives from the test storage dir. Mirrors serve_live_tap's
+    /// side of the contract (framing only, no tap involved).
+    fn stub_relay(sock_path: std::path::PathBuf, frames: usize) {
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            use std::os::unix::net::UnixListener;
+            let _ = std::fs::remove_file(&sock_path);
+            let listener = UnixListener::bind(&sock_path).expect("stub binds");
+            let (mut stream, _) = listener.accept().expect("web connects");
+            let frame = vec![0u8; 640];
+            for _ in 0..frames {
+                if stream.write_all(&frame).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+    }
+
+    async fn relay_sock(state: &AppState) -> std::path::PathBuf {
+        let pipe = state.pipeline.lock().await;
+        std::path::PathBuf::from(&pipe.config().storage.dir).join("live.sock")
+    }
+
+    #[tokio::test]
+    async fn live_stream_relays_socket_audio() {
+        // Slice 3 fix: with a relay feeding, the second chunk must carry
+        // audio pages (headers alone = the old same-process starvation).
+        let (base, h) = test_server().await;
+        stub_relay(relay_sock(&h.state).await, 200);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let client = reqwest::Client::new();
+        let mut res = client
+            .get(format!("{base}/api/live"))
+            .send()
+            .await
+            .expect("live connects");
+        assert_eq!(res.headers().get("content-type").unwrap(), "audio/ogg");
+        let first = res.chunk().await.expect("first chunk").expect("bytes");
+        assert_eq!(&first[..4], b"OggS");
+        assert!(first.windows(8).any(|w| w == b"OpusHead"));
+        let second = res.chunk().await.expect("second chunk").expect("bytes");
+        assert!(!second.is_empty(), "relay audio must follow headers");
+        assert_eq!(&second[..4], b"OggS");
+    }
+
+    #[tokio::test]
+    async fn live_stream_503_without_relay() {
+        // No socket (pipeline down): honest 503, never hanging silence.
+        let (base, _h) = test_server().await;
+        let res = reqwest::Client::new()
+            .get(format!("{base}/api/live"))
+            .send()
+            .await
+            .expect("live responds");
+        assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn profile_switch_roundtrip() {
+        // Slice 3 T4: list, switch, unknown-name 404, switch back.
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        let got: serde_json::Value = client
+            .get(format!("{base}/api/profile"))
+            .send()
+            .await
+            .expect("profile gets")
+            .json()
+            .await
+            .expect("profile json");
+        assert_eq!(got["active"], "Normal");
+        assert_eq!(got["profiles"].as_array().unwrap().len(), 3);
+        let switched: serde_json::Value = client
+            .post(format!("{base}/api/profile"))
+            .json(&serde_json::json!({"name": "ARES Net"}))
+            .send()
+            .await
+            .expect("profile posts")
+            .json()
+            .await
+            .expect("switch json");
+        assert_eq!(switched["active"], "ARES Net");
+        let missing = client
+            .post(format!("{base}/api/profile"))
+            .json(&serde_json::json!({"name": "Nope"}))
+            .send()
+            .await
+            .expect("unknown posts");
+        assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+        // Name with a quote: stored/executed as data, still just 404.
+        let quoted = client
+            .post(format!("{base}/api/profile"))
+            .json(&serde_json::json!({"name": "A' OR '1'='1"}))
+            .send()
+            .await
+            .expect("quoted posts");
+        assert_eq!(quoted.status(), reqwest::StatusCode::NOT_FOUND);
+        let back: serde_json::Value = client
+            .post(format!("{base}/api/profile"))
+            .json(&serde_json::json!({"name": "Normal"}))
+            .send()
+            .await
+            .expect("back posts")
+            .json()
+            .await
+            .expect("back json");
+        assert_eq!(back["active"], "Normal");
     }
 
     fn read_zip(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> String {

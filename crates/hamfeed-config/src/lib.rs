@@ -13,6 +13,8 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub audio: Audio,
+    #[serde(default)]
+    pub ingest: Ingest,
     pub vad: Vad,
     pub segment: Segment,
     pub stt: Stt,
@@ -76,6 +78,18 @@ pub struct VadProfile {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Segment {
     pub max_s: u64,
+}
+
+/// Enhancement ahead of the segmenter (006/007). Old configs omit both
+/// flags (stay off); prod enables them explicitly after the ear test.
+/// `voice_clarity` subsumes `denoise`: its chain already contains the
+/// spectral gate, so setting it alone is the full treatment.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Ingest {
+    #[serde(default)]
+    pub denoise: bool,
+    #[serde(default)]
+    pub voice_clarity: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -405,6 +419,36 @@ mod tests {
         assert_eq!(cfg.stt.lang_whitelist, vec!["fr", "en"]);
         assert_eq!(cfg.stt.initial_prompt, None);
         assert_eq!(cfg.storage.retention_days, 90);
+    }
+
+    #[test]
+    fn ingest_voice_clarity_flag() {
+        // 007: absent section stays off (old configs unchanged); explicit
+        // true parses through, independently of denoise.
+        assert!(
+            !parse(EXAMPLE)
+                .expect("example must parse")
+                .ingest
+                .voice_clarity
+        );
+        let text = EXAMPLE.replace("[vad]", "[ingest]\nvoice_clarity = true\n\n[vad]");
+        let cfg = parse(&text).expect("ingest section must parse").ingest;
+        assert!(cfg.voice_clarity);
+        assert!(!cfg.denoise);
+    }
+
+    #[test]
+    fn ingest_denoise_flag() {
+        // 006: absent section stays off (old configs unchanged); explicit
+        // true parses through.
+        assert!(!parse(EXAMPLE).expect("example must parse").ingest.denoise);
+        let text = EXAMPLE.replace("[vad]", "[ingest]\ndenoise = true\n\n[vad]");
+        assert!(
+            parse(&text)
+                .expect("ingest section must parse")
+                .ingest
+                .denoise
+        );
     }
 
     #[test]

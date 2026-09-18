@@ -51,8 +51,17 @@
       "</span><span class=\"freq\">" + esc(m.freq_label) +
       '</span><span class="dur">' + fmtDur(m.duration_ms) + "</span></div>";
     // Alert banners (Slice 2): emergency wins when both bits are set.
-    // Icons match the approved T10 mockup.
-    if (m.alert & 2) {
+    // Icons match the approved T10 mockup. Bit 4 is the Slice-3 disaster
+    // cue hit: same triangle, violet, so event traffic reads distinct.
+    if (m.alert & 4) {
+      body += '<div class="banner disaster">' +
+        '<svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">' +
+        '<path d="M7 1L13.5 12.5H0.5Z" fill="none" stroke="currentColor"' +
+        ' stroke-width="1.8" stroke-linejoin="round"/>' +
+        '<line x1="7" y1="5.5" x2="7" y2="9" stroke="currentColor" stroke-width="1.8"/>' +
+        '<circle cx="7" cy="10.8" r="1" fill="currentColor"/></svg>' +
+        "<span>DISASTER</span></div>";
+    } else if (m.alert & 2) {
       body += '<div class="banner emergency">' +
         '<svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">' +
         '<path d="M7 1L13.5 12.5H0.5Z" fill="none" stroke="currentColor"' +
@@ -289,7 +298,7 @@
   pauseBtn.addEventListener("click", function () {
     paused = !paused;
     pauseBtn.setAttribute("aria-pressed", String(paused));
-    pauseBtn.textContent = paused ? "resume live" : "pause live";
+    pauseBtn.textContent = paused ? "Resume feed" : "Pause feed";
     if (!paused && pendingNew > 0) {
       pendingNew = 0;
       jumpPill.style.display = "none";
@@ -313,13 +322,121 @@
     moreBtn.style.display = cursor ? "" : "none";
   }
 
+  var profileSel = document.getElementById("profile");
+  var modeBanner = document.getElementById("modeBanner");
+
+  async function setProfile(name) {
+    var res = await fetch("/api/profile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name }),
+    });
+    refreshProfile();
+  }
+
+  async function refreshProfile() {
+    var res = await fetch("/api/profile");
+    if (!res.ok) return;
+    var p = await res.json();
+    // Rebuild options from the server list (no innerHTML: profile names
+    // stay text, never markup).
+    profileSel.innerHTML = "";
+    p.profiles.forEach(function (pr) {
+      var o = document.createElement("option");
+      o.value = pr.name;
+      o.textContent = pr.name;
+      if (pr.name === p.active) o.selected = true;
+      profileSel.appendChild(o);
+    });
+    if (p.active !== "Normal") {
+      modeBanner.innerHTML = "";
+      var span = document.createElement("span");
+      span.textContent = "DISASTER MODE \u2014 " + p.active;
+      var btn = document.createElement("button");
+      btn.textContent = "return to Normal";
+      btn.addEventListener("click", function () { setProfile("Normal"); });
+      modeBanner.appendChild(span);
+      modeBanner.appendChild(btn);
+      modeBanner.style.display = "";
+    } else {
+      modeBanner.style.display = "none";
+    }
+  }
+
+  profileSel.addEventListener("change", function () {
+    setProfile(profileSel.value);
+  });
+
+  // Listen to radio (Slice 3, R7): one press streams /api/live into the
+  // audio element (the click is the autoplay gesture); a second press pauses
+  // and drops src, which releases the server stream. Transient stalls and
+  // pipeline restarts reconnect on their own (a few tries, then honest
+  // stop); only an explicit second press means "stay stopped".
+  var listenBtn = document.getElementById("listen");
+  var liveAudio = document.getElementById("liveAudio");
+  var listening = false;
+  var listenRetries = 0;
+  listenBtn.addEventListener("click", function () {
+    if (listening) stopListening();
+    else startListening();
+  });
+  function startListening() {
+    listening = true;
+    listenRetries = 0;
+    listenBtn.setAttribute("aria-pressed", "true");
+    listenBtn.textContent = "Stop radio";
+    playLive();
+  }
+  function playLive() {
+    liveAudio.src = "/api/live";
+    var pr = liveAudio.play();
+    if (pr && pr.catch) {
+      pr.catch(function () { scheduleRetry(); });
+    }
+  }
+  function scheduleRetry() {
+    // Generous on purpose: a transcription stall (drain blocks the frame
+    // loop) starves the relay for the length of a segment, and a pipeline
+    // restart rebinds the socket seconds later. Backoff caps at 8 s; the
+    // counter resets on every playing event, so only a truly dead relay
+    // (minutes of nothing) gives up.
+    if (!listening) return;
+    if (listenRetries >= 60) { stopListening(); return; }
+    listenRetries++;
+    setTimeout(function () {
+      if (!listening) return;
+      playLive();
+    }, Math.min(1500 * listenRetries, 8000));
+  }
+  function stopListening() {
+    listening = false;
+    listenRetries = 0;
+    listenBtn.setAttribute("aria-pressed", "false");
+    listenBtn.textContent = "Listen to radio";
+    liveAudio.pause();
+    liveAudio.removeAttribute("src");
+    liveAudio.load();
+  }
+  liveAudio.addEventListener("playing", function () {
+    listenRetries = 0;
+  });
+  liveAudio.addEventListener("error", function () {
+    if (listening) scheduleRetry();
+  });
+  liveAudio.addEventListener("ended", function () {
+    if (listening) scheduleRetry();
+  });
+
   var es = new EventSource("/api/events");
   es.addEventListener("message", function (ev) {
     var m;
     try { m = JSON.parse(ev.data); } catch (e) { return; }
+    // Profile-switch broadcasts carry no card: refresh the banner instead
+    // of feeding them to the card renderer (no id, no transcript).
+    if (m && m.profile && !m.id) { refreshProfile(); return; }
     if (paused || window.scrollY > 400) {
       pendingNew++;
-      jumpPill.textContent = pendingNew + " new — jump to live";
+      jumpPill.textContent = pendingNew + " new — show latest";
       jumpPill.style.display = "";
       if (!paused) upsert(m);
     } else {
@@ -327,5 +444,7 @@
     }
   });
 
+  pauseBtn.textContent = "Pause feed";
   loadMore();
+  refreshProfile();
 })();

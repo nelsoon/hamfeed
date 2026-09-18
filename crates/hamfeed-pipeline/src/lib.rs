@@ -5,7 +5,13 @@
 //! (S11). Group contract: web may call the `enrich`/triage helpers here, but
 //! pipeline never depends on web.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use hamfeed_callbook::Callbook;
@@ -209,6 +215,10 @@ impl CarryState {
 pub const ALERT_ME: i32 = 1;
 /// Alert bit: the message matches an emergency cue (R6).
 pub const ALERT_EMERGENCY: i32 = 2;
+/// Alert bit: the message matches a disaster-profile cue (Slice 3).
+/// Set alone, never alongside ALERT_EMERGENCY (ADR-8): Normal vs
+/// disaster classifications stay distinguishable and G5 is exact.
+pub const ALERT_DISASTER: i32 = 4;
 
 /// True when the transcript addresses my callsign — plain or spelled
 /// (both resolve through the same extractor, so `VE2ABC` and `victor
@@ -249,6 +259,29 @@ pub fn enrich(
     my_callsign: Option<&str>,
     emergency_cues: &[String],
 ) -> Enrichment {
+    enrich_profiled(
+        transcript,
+        lang,
+        carry,
+        lookup,
+        my_callsign,
+        emergency_cues,
+        &[],
+    )
+}
+
+/// Profile-aware enrichment (Slice 3): `disaster_cues` is the active
+/// profile's extra set (empty under Normal). A disaster hit sets ONLY
+/// ALERT_DISASTER (ADR-8), so baseline callers see bit-identical output.
+pub fn enrich_profiled(
+    transcript: &str,
+    lang: &str,
+    carry: Option<&str>,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    my_callsign: Option<&str>,
+    emergency_cues: &[String],
+    disaster_cues: &[String],
+) -> Enrichment {
     let mut alert = 0;
     if let Some(mine) = my_callsign {
         if matches_me(transcript, lang, mine) {
@@ -257,6 +290,9 @@ pub fn enrich(
     }
     if matches_emergency(transcript, emergency_cues) {
         alert |= ALERT_EMERGENCY;
+    }
+    if matches_emergency(transcript, disaster_cues) {
+        alert |= ALERT_DISASTER;
     }
     if let Some(hit) = hamfeed_callsign::extract(transcript, lang).first() {
         let cs = hit.normalized.clone();
@@ -285,18 +321,77 @@ pub fn enrich(
 /// Language recorded when detection was skipped (failed/system rows).
 pub const LANG_UNKNOWN: &str = "und";
 
+/// Live monitor tap (Slice 3, R7): the `run_source` loop forks every
+/// source PCM chunk here; `/api/live` readers follow from the tail.
+/// Bounded (30 s at 16 kHz); overflow drops the oldest. `seq` counts every
+/// sample ever pushed, so readers detect overwrite and skip ahead instead
+/// of replaying stale audio.
+pub const LIVE_TAP_CAP: usize = 16_000 * 30;
+
+pub struct LiveTap {
+    inner: Mutex<LiveTapInner>,
+}
+
+struct LiveTapInner {
+    buf: VecDeque<i16>,
+    seq: u64,
+}
+
+impl LiveTap {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(LiveTapInner {
+                buf: VecDeque::new(),
+                seq: 0,
+            }),
+        }
+    }
+
+    pub fn push(&self, pcm: &[i16]) {
+        let mut g = self.inner.lock().expect("live tap mutex");
+        for &s in pcm {
+            if g.buf.len() == LIVE_TAP_CAP {
+                g.buf.pop_front();
+            }
+            g.buf.push_back(s);
+        }
+        g.seq += pcm.len() as u64;
+    }
+
+    /// Samples pushed since `since`, plus the current sequence. When `since`
+    /// predates the retained window the reader jumps to its oldest sample
+    /// (live, not archive — T3 skip-ahead lives here, not in web).
+    pub fn read_since(&self, since: u64) -> (u64, Vec<i16>) {
+        let g = self.inner.lock().expect("live tap mutex");
+        let oldest = g.seq - g.buf.len() as u64;
+        let skip = since.saturating_sub(oldest) as usize;
+        (g.seq, g.buf.iter().skip(skip).copied().collect())
+    }
+
+    pub fn current_seq(&self) -> u64 {
+        self.inner.lock().expect("live tap mutex").seq
+    }
+}
+
+impl Default for LiveTap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Live pipeline: config + store + transcriber + queue + spill.
 pub struct Pipeline {
     cfg: Config,
     store: Store,
     transcriber: Transcriber,
-    queue: IngestQueue,
+    queue: Mutex<IngestQueue>,
     spill: SpillDir,
     storage_dir: PathBuf,
-    drains: u64,
-    carry: CarryState,
+    drains: AtomicU64,
+    carry: Mutex<CarryState>,
     callbook: Callbook,
-    voice: VoiceState,
+    voice: Mutex<VoiceState>,
+    tap: Arc<LiveTap>,
 }
 
 impl Pipeline {
@@ -348,22 +443,28 @@ impl Pipeline {
             cfg: cfg.clone(),
             store,
             transcriber,
-            queue: IngestQueue::new(100),
-            drains: 0,
+            queue: Mutex::new(IngestQueue::new(100)),
+            drains: AtomicU64::new(0),
             spill,
             storage_dir,
-            carry: CarryState::new(window_ms),
+            carry: Mutex::new(CarryState::new(window_ms)),
             callbook,
-            voice: VoiceState::new(
+            voice: Mutex::new(VoiceState::new(
                 cfg.voiceprint.threshold,
                 #[cfg(feature = "voice")]
                 embedder,
-            ),
+            )),
+            tap: Arc::new(LiveTap::new()),
         })
     }
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Live monitor tap (Slice 3): web `/api/live` readers share this.
+    pub fn live_tap(&self) -> Arc<LiveTap> {
+        Arc::clone(&self.tap)
     }
 
     pub fn config(&self) -> &Config {
@@ -375,13 +476,13 @@ impl Pipeline {
     }
 
     pub fn queue_len(&self) -> usize {
-        self.queue.len()
+        self.queue.lock().expect("queue mutex").len()
     }
 
     /// Boot recovery: replay spilled rows into the queue, oldest first, and
     /// leave a system gap marker when anything was recovered (S9). Also
     /// purges expired voice aliases (R4 library bound).
-    pub fn startup_recovery(&mut self) -> Result<usize> {
+    pub fn startup_recovery(&self) -> Result<usize> {
         let purged = self
             .store
             .purge_aliases(self.cfg.voiceprint.retention_days, now_ms())?;
@@ -391,7 +492,10 @@ impl Pipeline {
         let items = self.spill.replay_items()?;
         let n = items.len();
         for item in items {
-            self.queue.push(item, &self.spill)?;
+            self.queue
+                .lock()
+                .expect("queue mutex")
+                .push(item, &self.spill)?;
         }
         if n > 0 {
             self.record_gap(&format!(
@@ -403,7 +507,7 @@ impl Pipeline {
 
     /// Persist one closed segment's audio, then queue its metadata.
     /// The queue item exists only after the file has landed (S6).
-    pub fn enqueue_segment(&mut self, seg: &Segment) -> Result<()> {
+    pub fn enqueue_segment(&self, seg: &Segment) -> Result<()> {
         let meta = hamfeed_ingest::write_clip_atomic(
             &self.storage_dir,
             &seg.id,
@@ -411,7 +515,7 @@ impl Pipeline {
             seg.duration_ms,
             &seg.pcm,
         )?;
-        self.queue.push(
+        self.queue.lock().expect("queue mutex").push(
             QueueItem {
                 id: meta.id,
                 audio_path: meta.path.to_string_lossy().into_owned(),
@@ -428,10 +532,10 @@ impl Pipeline {
     /// Drain the queue: transcribe each clip, store the row. Returns the
     /// number of clips processed. Spilled-then-replayed items are removed
     /// from the spill dir once stored.
-    pub fn drain(&mut self) -> Result<usize> {
-        self.drains += 1;
+    pub fn drain(&self) -> Result<usize> {
+        self.drains.fetch_add(1, Ordering::Relaxed);
         let mut n = 0;
-        while let Some(item) = self.queue.pop() {
+        while let Some(item) = self.queue.lock().expect("queue mutex").pop() {
             self.process_item(&item)?;
             let _ = self.spill.remove(&item.id);
             n += 1;
@@ -441,7 +545,7 @@ impl Pipeline {
 
     /// How many times the queue was drained (live loop drains per segment).
     pub fn drain_count(&self) -> u64 {
-        self.drains
+        self.drains.load(Ordering::Relaxed)
     }
 
     /// Past-window voice suggestion (S7): a stored alias for this key at
@@ -488,35 +592,53 @@ impl Pipeline {
         Ok(())
     }
 
-    fn process_item(&mut self, item: &QueueItem) -> Result<()> {
+    fn process_item(&self, item: &QueueItem) -> Result<()> {
         let msg = match self.transcriber.transcribe(Path::new(&item.audio_path)) {
             Ok(out) => {
                 // Spoken phonetics collapse to letter groups ("alpha lima
                 // lima oscar" -> "ALLO") so callsigns read and search as
                 // written; ham shortcuts ("73", "QTH") pass through.
                 let transcript = hamfeed_stt::normalize_phonetics(&out.transcript);
-                // Voice key first: the alias link below needs it.
-                self.voice.roll_window(&item.group_id);
-                let speaker_key = self.voice.key_for(
-                    &self.store,
-                    &decode_for_voice(&item.audio_path),
-                    item.duration_ms,
-                    "ok",
-                    &self.cfg.station.freq_label,
-                    &day_of(item.ts_start_ms),
-                    self.cfg.voiceprint.min_embed_s,
-                    &item.id,
-                );
-                if let Some(k) = &speaker_key {
-                    self.voice.group_keys.push((k.clone(), item.ts_start_ms));
-                }
-                let mut e = enrich(
+                // Voice key first: the alias link below needs it. One
+                // guard for the whole voice block (same sequential order
+                // the single worker always had); group keys are cloned
+                // out for the link step below.
+                let (speaker_key, group_keys) = {
+                    let mut v = self.voice.lock().expect("voice mutex");
+                    v.roll_window(&item.group_id);
+                    let k = v.key_for(
+                        &self.store,
+                        &decode_for_voice(&item.audio_path),
+                        item.duration_ms,
+                        "ok",
+                        &self.cfg.station.freq_label,
+                        &day_of(item.ts_start_ms),
+                        self.cfg.voiceprint.min_embed_s,
+                        &item.id,
+                    );
+                    if let Some(kk) = &k {
+                        v.group_keys.push((kk.clone(), item.ts_start_ms));
+                    }
+                    (k, v.group_keys.clone())
+                };
+                // Active profile cues per segment: always fresh across the
+                // web/pipeline handles with no cache to invalidate. A failed
+                // read degrades to Normal (empty cues), never louder.
+                let disaster_cues = self.store.active_cues().unwrap_or_default();
+                let carried = self
+                    .carry
+                    .lock()
+                    .expect("carry mutex")
+                    .carried(item.ts_start_ms)
+                    .map(str::to_string);
+                let mut e = enrich_profiled(
                     &transcript,
                     &out.lang,
-                    self.carry.carried(item.ts_start_ms),
+                    carried.as_deref(),
                     &|cs| self.callbook.lookup(cs).ok().flatten().map(|c| c.name),
                     self.cfg.station.my_callsign.as_deref(),
                     &self.cfg.notify.emergency_cues,
+                    &disaster_cues,
                 );
                 e.speaker_key = speaker_key.clone();
                 // A heard self-ID refreshes the carry window (R2) and
@@ -524,10 +646,13 @@ impl Pipeline {
                 // only — never sender_*).
                 if e.sender_source == "heard" {
                     if let Some(cs) = &e.sender_callsign {
-                        self.carry.observe(Some(cs.clone()), item.ts_start_ms);
+                        self.carry
+                            .lock()
+                            .expect("carry mutex")
+                            .observe(Some(cs.clone()), item.ts_start_ms);
                         link_alias(
                             &self.store,
-                            &self.voice.group_keys,
+                            &group_keys,
                             item.ts_start_ms,
                             cs,
                             self.cfg.identity.link_window_min * 60_000,
@@ -606,14 +731,14 @@ impl Pipeline {
     /// not choose. `Retry` re-queues the clip for another pass.
     ///
     /// Web helper: [`drop_with_config`] resolves the config default.
-    pub fn set_triage(&mut self, id: &str, action: TriageAction) -> Result<()> {
+    pub fn set_triage(&self, id: &str, action: TriageAction) -> Result<()> {
         match &action {
             TriageAction::Drop { .. } => {
                 self.store.set_triage(id, &action)?;
                 // A retry may still be queued or draining: the row stays
                 // dropped (upsert skips dropped rows) and the queue entry
                 // goes away so it is never re-processed.
-                self.queue.remove(id);
+                self.queue.lock().expect("queue mutex").remove(id);
             }
             TriageAction::Retry => {
                 self.store.set_triage(id, &TriageAction::Retry)?;
@@ -627,7 +752,7 @@ impl Pipeline {
                 if !Path::new(&audio).exists() {
                     anyhow::bail!("retry: audio missing for {id}");
                 }
-                self.queue.push(
+                self.queue.lock().expect("queue mutex").push(
                     QueueItem {
                         id: msg.id,
                         audio_path: audio,
@@ -690,8 +815,14 @@ impl Pipeline {
 
     /// Feed one audio source through segment → clip → queue → store.
     /// Headless Slice-1 loop without web (T9 Done clause).
+    /// Live loop with transcription as a background job (Slice 3 fix):
+    /// the capture thread reads frames, feeds the live tap, and enqueues
+    /// segments without ever waiting on STT; one worker thread drains the
+    /// queue FIFO in order. Returns when the source ends AND the queue is
+    /// empty, with the drained count — same contract as before, so the
+    /// `--fake` harness and tests behave identically.
     pub fn run_source(
-        &mut self,
+        &self,
         source: &mut dyn AudioSource,
         hang_ms: u64,
         max_s: u64,
@@ -708,23 +839,66 @@ impl Pipeline {
             },
             now_ms(),
         );
-        let mut total = 0;
-        let stream = source.stream();
-        for frame in stream {
-            for s in seg.push(&frame.samples) {
-                self.enqueue_segment(&s)?;
-                // Drain per segment: a live mic never ends its stream, so a
-                // drain-only-at-end would buffer forever and store nothing.
-                // STT latency only delays the feed; capture keeps buffering
-                // frames in order behind it.
-                total += self.drain()?;
-            }
-        }
-        for s in seg.flush() {
-            self.enqueue_segment(&s)?;
-        }
-        total += self.drain()?;
-        Ok(total)
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            // Worker: chew through the queue FIFO; idle-poll when empty so
+            // a live mic's pauses cost nothing; exit once capture ends AND
+            // nothing remains. Its error surfaces below after the join.
+            let worker = s.spawn(|| -> Result<usize> {
+                let mut n = 0;
+                loop {
+                    let k = self.drain()?;
+                    n += k;
+                    if k == 0 {
+                        if done.load(Ordering::Acquire) {
+                            return Ok(n);
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            });
+            // Capture: frames, tap, and queue only — never STT. A capture
+            // error still flushes first (worker drains the remainder below)
+            // and then surfaces, same as the old inline order. Enhancement
+            // (006/007) sits ahead of everything when enabled, so tap,
+            // segmenter, and archive all hear the same clean audio.
+            // VoiceClarity already contains the spectral gate, so it
+            // subsumes the denoise flag; denoise-alone keeps the 006
+            // gate exactly; both off is byte-identical passthrough.
+            let mut dn = self.cfg.ingest.denoise.then(hamfeed_ingest::Denoiser::new);
+            let mut vc = self
+                .cfg
+                .ingest
+                .voice_clarity
+                .then(hamfeed_ingest::VoiceClarity::new);
+            let capture = (|| -> Result<()> {
+                let stream = source.stream();
+                for frame in stream {
+                    // Borrow dance: the enhancers are capture-local state.
+                    let samples: Vec<i16> = if let Some(v) = vc.as_mut() {
+                        v.process(&frame.samples)
+                    } else if let Some(d) = dn.as_mut() {
+                        d.process(&frame.samples)
+                    } else {
+                        frame.samples.clone()
+                    };
+                    self.tap.push(&samples);
+                    for sg in seg.push(&samples) {
+                        self.enqueue_segment(&sg)?;
+                    }
+                }
+                for sg in seg.flush() {
+                    self.enqueue_segment(&sg)?;
+                }
+                Ok(())
+            })();
+            done.store(true, Ordering::Release);
+            let n = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("drain worker panicked"))??;
+            capture?;
+            Ok(n)
+        })
     }
 }
 
@@ -830,7 +1004,7 @@ freq_label = "TEST"
     #[test]
     fn undecodable_clip_triage() {
         let dir = test_dir("triage");
-        let mut pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
         pipe.startup_recovery().unwrap();
 
         // Corrupt clip → failed row with error text.
@@ -940,7 +1114,7 @@ freq_label = "TEST"
         // segments close — draining only at end-of-stream would buffer
         // forever. Three bursts must trigger at least three drains.
         let dir = test_dir("livedrain");
-        let mut pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
         let mut pcm = Vec::new();
         for _ in 0..3 {
             pcm.extend(fixture::speech_like(2));
@@ -967,7 +1141,7 @@ freq_label = "TEST"
         // Synthetic FakeSource transmission through the whole headless loop
         // lands rows whose audio files exist (T9 Done clause).
         let dir = test_dir("fakerun");
-        let mut pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
         let mut pcm = fixture::speech_like(6);
         pcm.extend(fixture::silence_ms(1200));
         let frames = fixture::chunks(&pcm, 1600);
@@ -1411,7 +1585,7 @@ freq_label = "TEST"
     fn failed_row_skips_enrich() {
         // Corrupt clip → failed row stays sender-less with alert 0 (S11).
         let dir = test_dir("noenrich");
-        let mut pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
         let item = failed_item(&dir, "bad2");
         pipe.process_item(&item).unwrap();
         let row = pipe.store.get("bad2").unwrap().expect("row stored");
@@ -1419,5 +1593,148 @@ freq_label = "TEST"
         assert_eq!(row.sender_callsign, None);
         assert_eq!(row.sender_source, "none");
         assert_eq!(row.alert, 0);
+    }
+
+    #[test]
+    fn disaster_cue_sets_bit4_alone() {
+        // G2: a disaster-only cue under a disaster profile flags bit 4
+        // without touching the Normal emergency bit.
+        let disaster = vec!["net control".to_string()];
+        let e = enrich_profiled(
+            "net control, go ahead with traffic",
+            "en",
+            None,
+            &|_| None,
+            None,
+            &[],
+            &disaster,
+        );
+        assert_eq!(e.alert & ALERT_DISASTER, ALERT_DISASTER);
+        assert_eq!(e.alert & ALERT_EMERGENCY, 0);
+    }
+
+    #[test]
+    fn baseline_enrich_ignores_disaster_only_cue() {
+        // G1: the baseline path never sees disaster cues, so a
+        // disaster-only phrase stays silent.
+        let e = enrich(
+            "net control, go ahead with traffic",
+            "en",
+            None,
+            &|_| None,
+            None,
+            &[],
+        );
+        assert_eq!(e.alert, 0);
+    }
+
+    #[test]
+    fn profiled_enrich_matches_baseline_under_normal() {
+        // G5: empty disaster cues (Normal) classify bit-identically to the
+        // Slice-2 baseline across sender, emergency, and quiet cases.
+        let cases = [
+            "ici VE2DEM, a vous",
+            "mayday mayday, engine fire",
+            "ok merci, a plus tard",
+        ];
+        for tx in cases {
+            let a = enrich(tx, "fr", None, &|_| None, None, &cues());
+            let b = enrich_profiled(tx, "fr", None, &|_| None, None, &cues(), &[]);
+            assert_eq!(a, b, "divergence on {tx:?}");
+        }
+    }
+
+    #[test]
+    fn live_tap_caps_and_skips_ahead() {
+        let tap = LiveTap::new();
+        tap.push(&vec![7i16; LIVE_TAP_CAP + 100]);
+        // A reader from the start jumps to the retained window (skip-ahead).
+        let (seq, first) = tap.read_since(0);
+        assert_eq!(seq as usize, LIVE_TAP_CAP + 100);
+        assert_eq!(first.len(), LIVE_TAP_CAP);
+        // A caught-up reader gets only what is new.
+        let (seq2, second) = tap.read_since(seq);
+        assert!(second.is_empty());
+        assert_eq!(seq2, seq);
+        tap.push(&[1, 2, 3]);
+        let (seq3, third) = tap.read_since(seq2);
+        assert_eq!(third, vec![1, 2, 3]);
+        assert_eq!(seq3, seq2 + 3);
+    }
+
+    #[test]
+    fn drain_runs_concurrent_with_capture_side() {
+        use std::sync::Arc;
+        // Queued-background contract (Slice 3 fix): the capture side
+        // (enqueue + tap) proceeds while a drain is in flight. Under the
+        // old &mut design this test could not compile — no shared access
+        // existed. Behaviorally: every item stored exactly once, FIFO.
+        let dir = test_dir("bgdrain");
+        let pipe = Arc::new(Pipeline::open_with(test_config(&dir, &test_model())).unwrap());
+        let seg = |i: u32| Segment {
+            id: format!("bg-{i}"),
+            group_id: "g".into(),
+            seq: i,
+            ts_start_ms: u64::from(i) * 4000,
+            ts_end_ms: u64::from(i) * 4000 + 3000,
+            duration_ms: 3000,
+            pcm: hamfeed_ingest::fixture::speech_like(8),
+        };
+        pipe.enqueue_segment(&seg(0)).unwrap();
+        pipe.enqueue_segment(&seg(1)).unwrap();
+        let worker = {
+            let pipe = Arc::clone(&pipe);
+            std::thread::spawn(move || pipe.drain().unwrap())
+        };
+        pipe.enqueue_segment(&seg(2)).unwrap();
+        pipe.enqueue_segment(&seg(3)).unwrap();
+        pipe.live_tap().push(&[0i16; 160]);
+        let first = worker.join().unwrap();
+        let rest = pipe.drain().unwrap();
+        assert_eq!(first + rest, 4);
+        for i in 0..4 {
+            let id = format!("bg-{i}");
+            assert!(pipe.store().get(&id).unwrap().is_some(), "{id} stored");
+        }
+        assert_eq!(pipe.queue_len(), 0);
+    }
+
+    #[test]
+    fn voice_clarity_flag_drives_tap_chain() {
+        // T3 (007): the flag audibly changes what the tap hears, end to
+        // end. A sub-threshold 100 Hz tone opens no segments (no STT
+        // model needed — drain idles at zero) while every frame still
+        // reaches the tap through the active enhancer.
+        fn tap_rms(clarity: bool) -> (usize, f64) {
+            let dir = test_dir(if clarity { "clar-on" } else { "clar-off" });
+            let mut cfg = test_config(&dir, &test_model());
+            cfg.ingest.voice_clarity = clarity;
+            let pipe = Pipeline::open_with(cfg).unwrap();
+            let frames = vec![hamfeed_source::PcmFrame::tone(100.0, 1600, 200); 40];
+            let mut src = hamfeed_source::FakeSource::once(frames);
+            let drained = pipe.run_source(&mut src, 400, 120, true, 150).unwrap();
+            assert_eq!(drained, 0, "sub-threshold tone must open nothing");
+            let (_, tap) = pipe.live_tap().read_since(0);
+            // Common steady window: past the filter/gate transient,
+            // inside both taps (the gated path lags by under two hops —
+            // the live-never-flushes tail contract, same as 006).
+            let steady = &tap[16000..48000];
+            let rms = (steady.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>()
+                / steady.len() as f64)
+                .sqrt();
+            (tap.len(), rms)
+        }
+        let (len_off, off) = tap_rms(false);
+        let (len_on, on) = tap_rms(true);
+        assert_eq!(len_off, 40 * 1600, "passthrough stays sample-exact");
+        assert!(
+            (len_off - len_on) <= 256,
+            "gated tail lag bonded: {len_on} vs {len_off}"
+        );
+        assert!(off > 100.0, "off-path tap must hear the tone: {off:.1}");
+        assert!(
+            20.0 * (on / off).log10() < -20.0,
+            "clarity must crush CTCSS-band lows: off {off:.1} on {on:.1}"
+        );
     }
 }
