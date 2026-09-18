@@ -6,6 +6,7 @@
 //! hamfeed-train manifest --csv manifest.csv --audio-dir pairs/ \
 //!     --source gold --out manifest.json
 //! hamfeed-train audit --manifest dataset/manifest.json [...]
+//! hamfeed-train decode --in clip.ogg --out clip.wav
 //! ```
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -101,14 +102,45 @@ fn cmd_audit(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// 16 kHz mono S16 WAV writer (no extra deps for a 44-byte header).
+fn write_wav_16k_mono(pcm: &[i16]) -> Vec<u8> {
+    let data_len = pcm.len() * 2;
+    let mut out = Vec::with_capacity(44 + data_len);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&16000u32.to_le_bytes());
+    out.extend_from_slice(&32000u32.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(data_len as u32).to_le_bytes());
+    for s in pcm {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+fn cmd_decode(args: &[String]) -> Result<()> {
+    let bytes = fs::read(arg(args, "--in")?).context("read ogg")?;
+    let pcm = hamfeed_ingest::decode_ogg_to_pcm(&bytes).context("decode ogg")?;
+    fs::write(arg(args, "--out")?, write_wav_16k_mono(&pcm)).context("write wav")?;
+    eprintln!("decode: {} samples", pcm.len());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("ship-plan") => cmd_ship_plan(&args),
         Some("manifest") => cmd_manifest(&args),
         Some("audit") => cmd_audit(&args),
+        Some("decode") => cmd_decode(&args),
         _ => {
-            eprintln!("usage: hamfeed-train (ship-plan|manifest|audit) ...");
+            eprintln!("usage: hamfeed-train (ship-plan|manifest|audit|decode) ...");
             std::process::exit(2);
         }
     }

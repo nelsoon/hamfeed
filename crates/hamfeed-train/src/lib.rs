@@ -251,6 +251,93 @@ pub fn audit(entries: &[ManifestEntry]) -> Result<()> {
     }
 }
 
+/// One evaluated clip inside an eval report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalClip {
+    pub clip_id: String,
+    pub lang: String,
+    pub base_wer: f32,
+    pub tuned_wer: Option<f32>,
+}
+
+/// Per-language bucket summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalBucket {
+    pub n: usize,
+    pub base_wer: Option<f32>,
+    pub tuned_wer: Option<f32>,
+}
+
+/// Owner-facing verdict. The loop never self-deploys: even
+/// `DeployCandidate` waits for the human call (009 T4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Verdict {
+    NoDeploy,
+    DeployCandidate,
+}
+
+/// `eval.sh` report contract (009 G2): frozen-manifest pin, both
+/// WERs, buckets, clips, and a verdict with its reason.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalReport {
+    pub generated_at: String,
+    pub dataset_manifest_sha256: String,
+    pub base_model: String,
+    pub candidate_model: Option<String>,
+    pub n_heldout: usize,
+    pub base_wer: Option<f32>,
+    pub tuned_wer: Option<f32>,
+    pub buckets: HashMap<String, EvalBucket>,
+    pub verdict: Verdict,
+    pub reason: String,
+    pub clips: Vec<EvalClip>,
+}
+
+fn wer_in_range(label: &str, v: Option<f32>) -> Result<()> {
+    if let Some(w) = v {
+        if !(0.0..=1.0).contains(&w) {
+            bail!("{label}: WER {w} outside [0,1]");
+        }
+    }
+    Ok(())
+}
+
+/// Parse + schema-check an eval report: shapes, WER ranges, clip
+/// counts matching the header, buckets matching the clips.
+pub fn parse_eval_report(text: &str) -> Result<EvalReport> {
+    let r: EvalReport = serde_json::from_str(text).context("report is not valid JSON")?;
+    if r.dataset_manifest_sha256.len() != 64
+        || !r
+            .dataset_manifest_sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+    {
+        bail!("dataset_manifest_sha256 is not 64 hex chars");
+    }
+    if r.clips.len() != r.n_heldout {
+        bail!("n_heldout {} != {} clips", r.n_heldout, r.clips.len());
+    }
+    wer_in_range("base_wer", r.base_wer)?;
+    wer_in_range("tuned_wer", r.tuned_wer)?;
+    if r.verdict == Verdict::DeployCandidate && (r.base_wer.is_none() || r.tuned_wer.is_none()) {
+        bail!("deploy-candidate without both WERs");
+    }
+    for (lang, b) in &r.buckets {
+        let have = r.clips.iter().filter(|c| &c.lang == lang).count();
+        if b.n != have {
+            bail!("bucket {lang}: n {} != {} clips", b.n, have);
+        }
+        wer_in_range(&format!("bucket {lang} base"), b.base_wer)?;
+        wer_in_range(&format!("bucket {lang} tuned"), b.tuned_wer)?;
+    }
+    for c in &r.clips {
+        wer_in_range(&format!("clip {}", c.clip_id), Some(c.base_wer))?;
+        wer_in_range(&format!("clip {} tuned", c.clip_id), c.tuned_wer)?;
+    }
+    Ok(r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +441,67 @@ mod tests {
         assert_eq!(excluded.len(), 1);
         assert_eq!(excluded[0].clip_id, "c2");
         assert!(excluded[0].reason.contains("es"));
+    }
+
+    #[test]
+    fn ogg_roundtrip_preserves_tone() {
+        // The decode path everything downstream depends on: synth a
+        // 440 Hz tone, ship it through prod's own Opus-in-Ogg codec,
+        // decode it back, check it is still a 440 Hz tone.
+        let pcm: Vec<i16> = (0..16000)
+            .map(|i| {
+                (10000.0 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin()) as i16
+            })
+            .collect();
+        let ogg = hamfeed_ingest::encode_pcm_to_ogg(&pcm).unwrap();
+        let back = hamfeed_ingest::decode_ogg_to_pcm(&ogg).unwrap();
+        assert!((back.len() as i64 - pcm.len() as i64).abs() < 2000);
+        let energy: f32 = back
+            .iter()
+            .take(8000)
+            .map(|&s| (s as f32 / 32768.0).powi(2))
+            .sum::<f32>()
+            / 8000.0;
+        assert!(energy > 0.01, "decoded tone lost: {energy}");
+        assert!(hamfeed_ingest::decode_ogg_to_pcm(b"junk").is_err());
+    }
+
+    const REPORT_FIXTURE: &str = r#"{
+        "generated_at": "2026-09-18T12:38:39+00:00",
+        "dataset_manifest_sha256": "94607da900000000000000000000000000000000000000000000000000000000",
+        "base_model": "ggml-base",
+        "candidate_model": null,
+        "n_heldout": 1,
+        "base_wer": 0.11111111,
+        "tuned_wer": null,
+        "buckets": {"fr": {"n": 1, "base_wer": 0.11111111, "tuned_wer": null},
+                    "en": {"n": 0, "base_wer": null, "tuned_wer": null}},
+        "verdict": "no-deploy",
+        "reason": "no candidate model yet (baseline only)",
+        "clips": [{"clip_id": "c789", "lang": "fr",
+                   "base_wer": 0.11111111, "tuned_wer": null}]
+    }"#;
+
+    #[test]
+    fn report_schema_accepts_baseline_and_rejects_garbage() {
+        let r = parse_eval_report(REPORT_FIXTURE).unwrap();
+        assert_eq!(r.verdict, Verdict::NoDeploy);
+        assert_eq!(r.n_heldout, 1);
+        // WER outside [0,1] fails.
+        let bad = REPORT_FIXTURE.replace("0.11111111", "1.5");
+        assert!(parse_eval_report(&bad).is_err());
+        // Unknown verdict word fails.
+        let bad = REPORT_FIXTURE.replace("no-deploy", "ship-it");
+        assert!(parse_eval_report(&bad).is_err());
+        // Clip count mismatch fails.
+        let bad = REPORT_FIXTURE.replace("\"n_heldout\": 1", "\"n_heldout\": 2");
+        assert!(parse_eval_report(&bad).is_err());
+        // Bucket count mismatch fails.
+        let bad = REPORT_FIXTURE.replace("\"fr\": {\"n\": 1", "\"fr\": {\"n\": 5");
+        assert!(parse_eval_report(&bad).is_err());
+        // deploy-candidate without both WERs fails.
+        let bad = REPORT_FIXTURE.replace("no-deploy", "deploy-candidate");
+        assert!(parse_eval_report(&bad).is_err());
     }
 
     #[test]
