@@ -20,13 +20,22 @@ use crate::SAMPLE_RATE;
 pub const FRAME_SAMPLES: usize = 320;
 /// Archive bitrate: speech remains intelligible, files stay small.
 pub const BITRATE_BPS: i32 = 16_000;
+/// Live bitrate (007 ear-test finding): the 16 kbit/s archive setting
+/// leaves a speech-locked hash on sibilants over `/api/live` (silence
+/// encodes trivially, so it only ever rides on talking). 32 kbit/s
+/// costs ~2 KB/s extra on the LAN and never touches the archive.
+pub const LIVE_BITRATE_BPS: i32 = 32_000;
 
-fn encoder() -> Result<Encoder> {
+fn encoder_with(bitrate: i32) -> Result<Encoder> {
     let mut enc = Encoder::new(SampleRate::Hz16000, Channels::Mono, Application::Voip)
         .context("cannot create Opus encoder")?;
-    enc.set_bitrate(Bitrate::BitsPerSecond(BITRATE_BPS))
+    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate))
         .context("cannot set Opus bitrate")?;
     Ok(enc)
+}
+
+fn encoder() -> Result<Encoder> {
+    encoder_with(BITRATE_BPS)
 }
 
 /// Encode 16 kHz mono S16 into a self-describing Opus-in-Ogg byte buffer.
@@ -93,7 +102,7 @@ impl LiveEncoder {
         Ok((
             head,
             Self {
-                enc: encoder()?,
+                enc: encoder_with(LIVE_BITRATE_BPS)?,
                 serial,
                 granule: 0,
                 pending: Vec::new(),
@@ -314,6 +323,31 @@ mod tests {
         let bytes = enc.push(&vec![0i16; FRAME_SAMPLES - 100]).unwrap();
         assert!(!bytes.is_empty());
         assert_eq!(&bytes[..4], b"OggS");
+    }
+
+    #[test]
+    fn live_encoder_spends_more_bits_than_archive() {
+        // The live wire runs hotter than the archive on purpose
+        // (LIVE_BITRATE_BPS > BITRATE_BPS): sibilant-heavy input must
+        // come out measurably larger through LiveEncoder than through
+        // the clip encoder, with margin to spare for page layout.
+        let a = fixture::tone_ms(5233.0, 2000, 6000);
+        let b = fixture::tone_ms(6117.0, 2000, 6000);
+        let pcm: Vec<i16> = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| x.saturating_add(*y))
+            .collect();
+        let (_, mut live) = LiveEncoder::new().unwrap();
+        let mut live_bytes = 0usize;
+        for chunk in pcm.chunks(1600) {
+            live_bytes += live.push(chunk).unwrap().len();
+        }
+        let clip_bytes = encode_pcm_to_ogg(&pcm).unwrap().len();
+        assert!(
+            live_bytes as f64 > clip_bytes as f64 * 1.3,
+            "live {live_bytes} should exceed archive {clip_bytes} with margin"
+        );
     }
 
     #[test]

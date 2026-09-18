@@ -17,11 +17,23 @@ const HOP: usize = 128;
 /// Bins for real input (DC..Nyquist).
 const BINS: usize = N / 2 + 1;
 /// Oversubtraction: how far below the floor a bin must sink to open.
-const OVER: f32 = 1.3;
-/// Gain floor: static never fully mutes (no gating "holes").
-const FLOOR: f32 = 0.08;
-/// Gain smoothing per hop (slow both ways — this is the anti-pump).
+/// Middle ground (007 ear loop): 1.3 chops weak onsets (robotic),
+/// 1.1 lets bins breathe around the threshold (chatter).
+const OVER: f32 = 1.2;
+/// Gain floor: static never fully mutes (no gating "holes"). Caps
+/// suppression near 16 dB: the floor drops audibly, but bins never
+/// dive deep enough to warble the voice riding above them.
+const FLOOR: f32 = 0.15;
+/// Gain smoothing per hop, symmetric and slow. The gate must never add
+/// wander beyond what the input hiss already has (see
+/// `steady_gate_adds_no_wander`): slow glide is the anti-pump and the
+/// anti-chatter. Onset crispness is protected by OVER, not by speed.
 const SMOOTH: f32 = 0.12;
+/// Gentle preset (007 hybrid): the expander owns silence now, so the
+/// gate only trims in-speech hash — opens readily, never dives past
+/// -6 dB, carves too little to sound robotic.
+const GENTLE_OVER: f32 = 1.1;
+const GENTLE_FLOOR: f32 = 0.5;
 /// Noise-floor tracking: fast down (new quiet wins immediately), measured
 /// up (loud is usually signal — but a silence-primed gate must still find
 /// the static within about a second, hence 0.01 not 0.002).
@@ -44,10 +56,22 @@ pub struct Denoiser {
     primed: bool,
     total_in: u64,
     total_out: u64,
+    over: f32,
+    floor_gain: f32,
 }
 
 impl Denoiser {
     pub fn new() -> Self {
+        Self::with(OVER, FLOOR)
+    }
+
+    /// Gentle in-speech trim for the hybrid chain: the expander owns
+    /// silence, so this preset only shaves hash riding on voice.
+    pub fn gentle() -> Self {
+        Self::with(GENTLE_OVER, GENTLE_FLOOR)
+    }
+
+    fn with(over: f32, floor_gain: f32) -> Self {
         let mut planner = FftPlanner::new();
         Self {
             fft: planner.plan_fft_forward(N),
@@ -59,6 +83,8 @@ impl Denoiser {
             primed: false,
             total_in: 0,
             total_out: 0,
+            over,
+            floor_gain,
         }
     }
 
@@ -126,7 +152,7 @@ impl Denoiser {
                 } else {
                     *f += TRACK_UP * (p - *f);
                 }
-                let target = ((p - OVER * *f) / p.max(1e-12)).clamp(FLOOR, 1.0);
+                let target = ((p - self.over * *f) / p.max(1e-12)).clamp(self.floor_gain, 1.0);
                 let g = &mut self.gains[i];
                 *g += SMOOTH * (target - *g);
             }
@@ -273,6 +299,68 @@ mod tests {
             (e1 - e2).abs() < 1.5,
             "gain hunting on steady input: {e1:.1} vs {e2:.1} dB"
         );
+    }
+
+    #[test]
+    fn steady_gate_adds_no_wander() {
+        // Robotic-artifact guard (007 ear loop: raw sounds natural,
+        // gated sounded synthetic). On stationary frying static, the
+        // gate must not spray hop energies wider than the input hiss
+        // already wanders on its own — chattering bins would.
+        let mut seed = 7u64;
+        let steady = hiss(48000, &mut seed);
+        let span = |v: &[i16]| {
+            let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+            for hop in v.chunks(128) {
+                let e = db(hop);
+                lo = lo.min(e);
+                hi = hi.max(e);
+            }
+            hi - lo
+        };
+        let in_span = span(&steady[1600..]);
+        let mut d = Denoiser::new();
+        let _ = d.process(&steady[..1600]); // prime the floor
+        let mut out = Vec::new();
+        for chunk in steady[1600..].chunks(1600) {
+            out.extend_from_slice(&d.process(chunk));
+        }
+        out.extend_from_slice(&d.flush());
+        let out_span = span(&out[1600..]);
+        assert!(
+            out_span <= in_span + 0.5,
+            "gate adds wander: in {in_span:.1} dB, out {out_span:.1} dB"
+        );
+    }
+
+    #[test]
+    fn gentle_preset_trims_without_carving() {
+        // Hybrid role (007): shave in-speech hash audibly, but never
+        // dive — bed drops a few dB, clean tone passes near unity.
+        let mut seed = 21u64;
+        let bed = hiss(48000, &mut seed);
+        let mut g = Denoiser::gentle();
+        let _ = g.process(&bed[..1600]);
+        let mut out = Vec::new();
+        for chunk in bed[1600..].chunks(1600) {
+            out.extend_from_slice(&g.process(chunk));
+        }
+        out.extend_from_slice(&g.flush());
+        let drop = db(&bed) - db(&out);
+        assert!(
+            (2.0..9.0).contains(&drop),
+            "gentle bed trim out of band: {drop:.1} dB"
+        );
+        let tone = crate::fixture::tone_ms(1000.0, 1000, 9000);
+        let mut g2 = Denoiser::gentle();
+        let _ = g2.process(&hiss(1600, &mut seed));
+        let mut tout = Vec::new();
+        for chunk in tone.chunks(1600) {
+            tout.extend_from_slice(&g2.process(chunk));
+        }
+        tout.extend_from_slice(&g2.flush());
+        let kept = db(&tout) - db(&tone);
+        assert!(kept.abs() < 2.0, "gentle preset carved tone: {kept:.1} dB");
     }
 
     #[test]

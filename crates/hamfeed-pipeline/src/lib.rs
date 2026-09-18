@@ -859,18 +859,28 @@ impl Pipeline {
             });
             // Capture: frames, tap, and queue only — never STT. A capture
             // error still flushes first (worker drains the remainder below)
-            // and then surfaces, same as the old inline order. Denoise
-            // (006) sits ahead of everything when enabled, so tap,
+            // and then surfaces, same as the old inline order. Enhancement
+            // (006/007) sits ahead of everything when enabled, so tap,
             // segmenter, and archive all hear the same clean audio.
-            let denoise = self.cfg.ingest.denoise;
-            let mut dn = denoise.then(hamfeed_ingest::Denoiser::new);
+            // VoiceClarity already contains the spectral gate, so it
+            // subsumes the denoise flag; denoise-alone keeps the 006
+            // gate exactly; both off is byte-identical passthrough.
+            let mut dn = self.cfg.ingest.denoise.then(hamfeed_ingest::Denoiser::new);
+            let mut vc = self
+                .cfg
+                .ingest
+                .voice_clarity
+                .then(hamfeed_ingest::VoiceClarity::new);
             let capture = (|| -> Result<()> {
                 let stream = source.stream();
                 for frame in stream {
-                    // Borrow dance: the denoiser is capture-local state.
-                    let samples: Vec<i16> = match dn.as_mut() {
-                        Some(d) => d.process(&frame.samples),
-                        None => frame.samples.clone(),
+                    // Borrow dance: the enhancers are capture-local state.
+                    let samples: Vec<i16> = if let Some(v) = vc.as_mut() {
+                        v.process(&frame.samples)
+                    } else if let Some(d) = dn.as_mut() {
+                        d.process(&frame.samples)
+                    } else {
+                        frame.samples.clone()
                     };
                     self.tap.push(&samples);
                     for sg in seg.push(&samples) {
@@ -1687,5 +1697,44 @@ freq_label = "TEST"
             assert!(pipe.store().get(&id).unwrap().is_some(), "{id} stored");
         }
         assert_eq!(pipe.queue_len(), 0);
+    }
+
+    #[test]
+    fn voice_clarity_flag_drives_tap_chain() {
+        // T3 (007): the flag audibly changes what the tap hears, end to
+        // end. A sub-threshold 100 Hz tone opens no segments (no STT
+        // model needed — drain idles at zero) while every frame still
+        // reaches the tap through the active enhancer.
+        fn tap_rms(clarity: bool) -> (usize, f64) {
+            let dir = test_dir(if clarity { "clar-on" } else { "clar-off" });
+            let mut cfg = test_config(&dir, &test_model());
+            cfg.ingest.voice_clarity = clarity;
+            let pipe = Pipeline::open_with(cfg).unwrap();
+            let frames = vec![hamfeed_source::PcmFrame::tone(100.0, 1600, 200); 40];
+            let mut src = hamfeed_source::FakeSource::once(frames);
+            let drained = pipe.run_source(&mut src, 400, 120, true, 150).unwrap();
+            assert_eq!(drained, 0, "sub-threshold tone must open nothing");
+            let (_, tap) = pipe.live_tap().read_since(0);
+            // Common steady window: past the filter/gate transient,
+            // inside both taps (the gated path lags by under two hops —
+            // the live-never-flushes tail contract, same as 006).
+            let steady = &tap[16000..48000];
+            let rms = (steady.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>()
+                / steady.len() as f64)
+                .sqrt();
+            (tap.len(), rms)
+        }
+        let (len_off, off) = tap_rms(false);
+        let (len_on, on) = tap_rms(true);
+        assert_eq!(len_off, 40 * 1600, "passthrough stays sample-exact");
+        assert!(
+            (len_off - len_on) <= 256,
+            "gated tail lag bonded: {len_on} vs {len_off}"
+        );
+        assert!(off > 100.0, "off-path tap must hear the tone: {off:.1}");
+        assert!(
+            20.0 * (on / off).log10() < -20.0,
+            "clarity must crush CTCSS-band lows: off {off:.1} on {on:.1}"
+        );
     }
 }
