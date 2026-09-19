@@ -295,7 +295,19 @@ pub fn enrich_profiled(
         alert |= ALERT_DISASTER;
     }
     if let Some(hit) = hamfeed_callsign::extract(transcript, lang).first() {
-        let cs = hit.normalized.clone();
+        let mut cs = hit.normalized.clone();
+        // Québec repair: a bare-V shape is a dropped Echo/Alfa in fast
+        // French. Trust the callbook first — repair only when the heard
+        // form is unknown AND off the Canadian blocks, and keep the
+        // heard form when no candidate is known either (never invent).
+        if lookup(&cs).is_none() && !hamfeed_callsign::canadian_prefix_ok(&cs) {
+            for cand in hamfeed_callsign::bare_v_repair_candidates(&cs) {
+                if lookup(&cand).is_some() {
+                    cs = cand;
+                    break;
+                }
+            }
+        }
         return Enrichment {
             sender_callsign: Some(cs.clone()),
             sender_name: lookup(&cs),
@@ -1298,6 +1310,26 @@ freq_label = "TEST"
         );
         assert_eq!(e.sender_callsign.as_deref(), Some("VE3MA"));
         assert_eq!(e.sender_source, "heard");
+    }
+
+    #[test]
+    fn heard_bare_v_repaired_via_callbook() {
+        // Live report: "V2CRS qui reprend" — the Echo drowned in fast
+        // French. The book knows VE2CRS, so the badge repairs to it.
+        let book = |cs: &str| {
+            if cs == "VE2CRS" {
+                Some("Opérateur".to_string())
+            } else {
+                None
+            }
+        };
+        let e = enrich("V2CRS qui reprend", "fr", None, &book, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2CRS"));
+        assert_eq!(e.sender_source, "heard");
+        // Nobody known under any repair: the heard form stands, never
+        // an invented callsign.
+        let e2 = enrich("V2CRS qui reprend", "fr", None, &|_| None, None, &[]);
+        assert_eq!(e2.sender_callsign.as_deref(), Some("V2CRS"));
     }
 
     #[test]
