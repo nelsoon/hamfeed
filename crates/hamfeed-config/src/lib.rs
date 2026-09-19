@@ -45,7 +45,7 @@ fn default_beep_split() -> bool {
 }
 
 fn default_beep_min_ms() -> u64 {
-    150
+    100
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -29,7 +29,7 @@ impl Default for SegmenterConfig {
             energy_threshold: 300.0,
             max_segment_ms: 120_000,
             beep_split: true,
-            beep_min_ms: 150,
+            beep_min_ms: 100,
         }
     }
 }
@@ -162,6 +162,39 @@ fn is_tone(win: &[i16], threshold: f32) -> bool {
         .all(|s| sub_is_tonal(&hann(s), threshold, s))
 }
 
+/// Stride for the tone-run scan: 10 ms pins a beep onset within half a
+/// push chunk without changing the 50 ms analysis windows.
+const TONE_STRIDE_SAMPLES: usize = 10 * SAMPLE_RATE as usize / 1000;
+
+/// Earliest offset (in samples, relative to `region`) where `need`
+/// consecutive 50 ms sub-windows are all tonal, scanning at 10 ms
+/// stride. Unlike grid-locked `is_tone`, persistence here is exact: an
+/// 80 ms blip can never satisfy `need = 2` no matter how it aligns, so
+/// sub-persistence beeps stay glued (B4) on every path.
+fn find_tone_run(region: &[i16], need: usize, threshold: f32) -> Option<usize> {
+    let sub = BEEP_SUB_MS as usize * SAMPLE_RATE as usize / 1000;
+    if region.len() < need * sub || need == 0 {
+        return None;
+    }
+    let last_start = region.len() - need * sub;
+    let mut start = 0;
+    while start <= last_start {
+        let mut ok = true;
+        for k in 0..need {
+            let w = &region[start + k * sub..start + (k + 1) * sub];
+            if !sub_is_tonal(&hann(w), threshold, w) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return Some(start);
+        }
+        start += TONE_STRIDE_SAMPLES;
+    }
+    None
+}
+
 /// Gate window for the idle-drop and `voice_seen` tone checks: 50 ms of
 /// audio is enough for the bank test, short enough to react fast.
 const GATE_SAMPLES: usize = 50 * SAMPLE_RATE as usize / 1000;
@@ -210,13 +243,6 @@ impl Segmenter {
         sum as f32 / chunk.len() as f32
     }
 
-    /// Trailing evaluation window covering `beep_min_ms`, rounded up to whole
-    /// 50 ms sub-windows.
-    fn beep_window_samples(&self) -> usize {
-        let subs = self.cfg.beep_min_ms.div_ceil(BEEP_SUB_MS).max(1);
-        subs as usize * BEEP_SUB_MS as usize * SAMPLE_RATE as usize / 1000
-    }
-
     /// Trailing gate window (last 50 ms of everything pushed), when buffered.
     fn gate_win(&self) -> Option<&[i16]> {
         if self.recent.len() < GATE_SAMPLES {
@@ -231,16 +257,27 @@ impl Segmenter {
     /// NEW group. Tone windows never mark `voice_seen`, so a beep alone can
     /// neither split nor (via the hang-close drop) emit; windows too short
     /// to judge leave it unset, so sub-50 ms blips stay dropped too.
-    fn beep_step(&mut self, chunk_end: u64, out: &mut Vec<Segment>) {
-        let win = self.beep_window_samples();
-        let tonal = self.open.as_ref().is_some_and(|o| {
-            o.pcm.len() >= win && is_tone(&o.pcm[o.pcm.len() - win..], self.cfg.energy_threshold)
+    /// Persistence is stride-exact (`find_tone_run`): only a full
+    /// `beep_min_ms` run cuts, so sub-persistence blips glue on any
+    /// alignment (B4).
+    fn beep_step(&mut self, out: &mut Vec<Segment>) {
+        let sub = BEEP_SUB_MS as usize * SAMPLE_RATE as usize / 1000;
+        let need = self.cfg.beep_min_ms.div_ceil(BEEP_SUB_MS).max(1) as usize;
+        let threshold = self.cfg.energy_threshold;
+        let scan = (need + 2) * sub;
+        let hit = self.open.as_ref().and_then(|o| {
+            if o.pcm.len() < scan {
+                return None;
+            }
+            let base = o.pcm.len() - scan;
+            find_tone_run(&o.pcm[base..], need, threshold)
+                .map(|off| (o.start_sample + (base + off) as u64, o.voice_seen))
         });
-        if tonal {
-            if self.open.as_ref().is_some_and(|o| o.voice_seen) {
+        if let Some((beep_start, voice_seen)) = hit {
+            if voice_seen {
                 let mut o = self.open.take().expect("just checked");
-                o.pcm.truncate(o.pcm.len() - win);
-                out.push(self.close(&o, chunk_end - win as u64));
+                o.pcm.truncate((beep_start - o.start_sample) as usize);
+                out.push(self.close(&o, beep_start));
             }
             return;
         }
@@ -262,6 +299,65 @@ impl Segmenter {
                 o.voice_streak = 0;
             }
         }
+    }
+
+    /// Beep look-back at the voice→silence transition (turn rule). The
+    /// live `beep_step` only re-examines trailing audio while voice
+    /// chunks flow, so a courtesy beep followed by a carrier drop is
+    /// invisible to it; here the drop itself triggers one backward look:
+    /// skip the trailing silence (bounded by hang), then require a full
+    /// `beep_min_ms` run of sustained tone (`find_tone_run`, stride-exact
+    /// like the live path) ending where the voice stopped, extended back
+    /// while the tone continues so long beeps trim at onset too. On a hit
+    /// the tone is trimmed and the turn closes at the beep start — the
+    /// same outcome as `beep_step`, new group on next voice. Runs once
+    /// per silence stretch (first non-voice chunk after voice), so
+    /// steady-state silence costs one cheap level walk.
+    fn beep_lookback(&mut self, chunk_start: u64, out: &mut Vec<Segment>) {
+        if !self.cfg.beep_split {
+            return;
+        }
+        let sub = BEEP_SUB_MS as usize * SAMPLE_RATE as usize / 1000;
+        let need = self.cfg.beep_min_ms.div_ceil(BEEP_SUB_MS).max(1) as usize;
+        let threshold = self.cfg.energy_threshold;
+        let hang = self.hang_samples();
+        let start_sample = match self.open.as_ref() {
+            Some(o) if o.voice_seen && o.last_voice_sample == chunk_start => o.start_sample,
+            _ => return,
+        };
+        let pcm = &self.open.as_ref().expect("just checked").pcm;
+        let mut idx = pcm.len();
+        let mut skipped: u64 = 0;
+        while idx >= sub {
+            if Self::mean_abs(&pcm[idx - sub..idx]) >= threshold {
+                break;
+            }
+            idx -= sub;
+            skipped += 1;
+            if skipped * sub as u64 > hang {
+                return;
+            }
+        }
+        let scan_back = (need + 2) * sub;
+        let region_base = idx.saturating_sub(scan_back);
+        let hit =
+            find_tone_run(&pcm[region_base..idx], need, threshold).map(|off| region_base + off);
+        let Some(mut run_start) = hit else {
+            return;
+        };
+        // Extend back through a longer beep so the trim lands at onset
+        // (bounded by the scanned region: beeps far longer than the
+        // window still split, with a rough trim).
+        while run_start >= sub && run_start - sub >= region_base && {
+            let w = &pcm[run_start - sub..run_start];
+            sub_is_tonal(&hann(w), threshold, w)
+        } {
+            run_start -= sub;
+        }
+        let beep_start = start_sample + run_start as u64;
+        let mut o = self.open.take().expect("just checked");
+        o.pcm.truncate((beep_start - o.start_sample) as usize);
+        out.push(self.close(&o, beep_start));
     }
 
     fn close(&self, o: &Open, end_sample: u64) -> Segment {
@@ -323,18 +419,28 @@ impl Segmenter {
                 }
             }
             if self.cfg.beep_split {
-                self.beep_step(chunk_end, &mut out);
+                self.beep_step(&mut out);
             } else if let Some(o) = self.open.as_mut() {
                 o.voice_seen = true;
             }
-        } else if let Some(o) = self.open.as_mut() {
-            o.pcm.extend_from_slice(chunk);
-            if chunk_end - o.last_voice_sample >= self.hang_samples() {
-                let o = self.open.take().expect("just checked");
-                // Tone-only segments (beep tails, kerchunks) are dropped,
-                // never transcribed — only voice-bearing ones close (B5).
-                if o.voice_seen {
-                    out.push(self.close(&o, o.last_voice_sample));
+        } else if self.open.is_some() {
+            self.open
+                .as_mut()
+                .expect("just checked")
+                .pcm
+                .extend_from_slice(chunk);
+            // Turn rule first: a beep ending at the drop cuts here even
+            // when the following silence is shorter than hang.
+            self.beep_lookback(chunk_start, &mut out);
+            if let Some(o) = self.open.as_mut() {
+                if chunk_end - o.last_voice_sample >= self.hang_samples() {
+                    let o = self.open.take().expect("just checked");
+                    // Tone-only segments (beep tails, kerchunks) are
+                    // dropped, never transcribed — only voice-bearing ones
+                    // close (B5).
+                    if o.voice_seen {
+                        out.push(self.close(&o, o.last_voice_sample));
+                    }
                 }
             }
         }
@@ -491,7 +597,9 @@ mod tests {
         );
     }
 
-    /// A beep shorter than `beep_min_ms` never cuts (B4 persistence gate).
+    /// A blip far under `beep_min_ms` never cuts (B4 persistence gate).
+    /// 40 ms vs 100 ms: the margin must exceed the 50 ms analysis window,
+    /// inside which a tone-adjacent mixed sub-window still reads tonal.
     #[test]
     fn short_beep_ignored() {
         let cfg = SegmenterConfig {
@@ -499,7 +607,7 @@ mod tests {
             ..Default::default()
         };
         let mut pcm = fixture::speech_like(4);
-        pcm.extend(fixture::tone_ms(1000.0, 80, 9_000));
+        pcm.extend(fixture::tone_ms(1000.0, 40, 9_000));
         pcm.extend(fixture::speech_like(4));
         pcm.extend(fixture::silence_ms(1500));
         let segs = run(&cfg, &pcm);
@@ -597,6 +705,81 @@ mod tests {
             (on[1].ts_start_ms as i64 - 4700).abs() <= 200,
             "second turn start: {}",
             on[1].ts_start_ms
+        );
+    }
+
+    /// Turn rule: voice, courtesy beep, then a SHORT silence (under hang)
+    /// and more voice still cuts at the beep — the live beep_step never
+    /// re-examines trailing audio once voice chunks stop, so the silence
+    /// transition must look back. Regression test for the 08:48:55
+    /// report (four glued transmissions, 1100 Hz beeps).
+    #[test]
+    fn beep_then_silence_splits() {
+        let cfg = SegmenterConfig {
+            hang_ms: 800,
+            ..Default::default()
+        };
+        let speech_ms = 4 * (150 + 80); // speech_like(4)
+        let mut pcm = fixture::speech_like(4);
+        pcm.extend(fixture::tone_ms(1100.0, 120, 9_000));
+        pcm.extend(fixture::silence_ms(400));
+        pcm.extend(fixture::speech_like(4));
+        pcm.extend(fixture::silence_ms(1500));
+        let segs = run(&cfg, &pcm);
+        assert_eq!(segs.len(), 2, "beep+silence must cut, got {}", segs.len());
+        assert_ne!(segs[0].group_id, segs[1].group_id, "new turn, new group");
+        assert_eq!(segs[0].seq, 0);
+        assert_eq!(segs[1].seq, 0);
+        assert!(
+            (segs[0].ts_end_ms as i64 - speech_ms as i64).abs() <= 40,
+            "first ends at beep start ~{speech_ms}, got {}",
+            segs[0].ts_end_ms
+        );
+        // Second speech resumes after the 400 ms drop: the beep and the
+        // silence belong to neither turn.
+        let speech2_start = speech_ms + 120 + 400;
+        assert!(
+            (segs[1].ts_start_ms as i64 - speech2_start as i64).abs() <= 40,
+            "second starts at resumed speech ~{speech2_start}, got {}",
+            segs[1].ts_start_ms
+        );
+    }
+
+    /// A sub-persistence beep before silence still glues: 40 ms cannot
+    /// carry a turn boundary even with the look-back (same 50 ms
+    /// analysis-window margin as above).
+    #[test]
+    fn short_beep_then_silence_ignored() {
+        let cfg = SegmenterConfig {
+            hang_ms: 800,
+            ..Default::default()
+        };
+        let mut pcm = fixture::speech_like(4);
+        pcm.extend(fixture::tone_ms(1100.0, 40, 9_000));
+        pcm.extend(fixture::silence_ms(400));
+        pcm.extend(fixture::speech_like(4));
+        pcm.extend(fixture::silence_ms(1500));
+        let segs = run(&cfg, &pcm);
+        assert_eq!(segs.len(), 1, "short beep must glue, got {}", segs.len());
+    }
+
+    /// A beep with no prior voice followed by speech yields exactly the
+    /// speech segment (B5 holds across the look-back too).
+    #[test]
+    fn beep_only_then_speech_single() {
+        let cfg = SegmenterConfig {
+            ..Default::default()
+        };
+        let mut pcm = fixture::tone_ms(1100.0, 400, 9_000);
+        pcm.extend(fixture::silence_ms(1500));
+        pcm.extend(fixture::speech_like(4));
+        pcm.extend(fixture::silence_ms(1500));
+        let segs = run(&cfg, &pcm);
+        assert_eq!(segs.len(), 1, "only speech emits, got {}", segs.len());
+        assert!(
+            (segs[0].ts_start_ms as i64 - 1900).abs() <= 60,
+            "starts at speech, got {}",
+            segs[0].ts_start_ms
         );
     }
 
