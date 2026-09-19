@@ -56,6 +56,10 @@ emergency_cues = ["mayday", "may-day", "urgence", "emergency", "sos", "détresse
 # fatal). min_embed_s gates short blips; threshold is the cosine gate
 # (0.0..=1.0); suggest_min_conf gates past-window suggestions.
 [voiceprint]
+# Master switch (default false): voice embeddings are derived only when
+# you opt in here AND point model_path at a readable model. A public
+# broadcast is not consent to biometric enrollment — see README "Privacy".
+enabled = false
 model_path = ""
 min_embed_s = 1.5
 threshold = 0.55

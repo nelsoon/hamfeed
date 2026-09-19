@@ -512,14 +512,21 @@ impl Pipeline {
         let window_ms = cfg.identity.link_window_min * 60_000;
         let callbook = hamfeed_callbook::open(&cfg.callbook.resolved_db_path(&cfg.storage.dir));
         #[cfg(feature = "voice")]
-        let embedder = match cfg.voiceprint.model_path.trim() {
-            "" => {
+        let embedder = match (cfg.voiceprint.enabled, cfg.voiceprint.model_path.trim()) {
+            (false, _) => {
+                eprintln!(
+                    "voice: disabled ([voiceprint] enabled = false) — voiceprints off; \
+                     set enabled = true with a model to opt in"
+                );
+                None
+            }
+            (true, "") => {
                 eprintln!(
                     "voice: no model configured ([voiceprint] model_path empty) — voiceprints off"
                 );
                 None
             }
-            path => match Embedder::open(path) {
+            (true, path) => match Embedder::open(path) {
                 Ok(e) => Some(e),
                 Err(err) => {
                     eprintln!("voice: cannot load {path} ({err:?})");
