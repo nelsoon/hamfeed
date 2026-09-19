@@ -102,6 +102,7 @@ struct MessagesQuery {
     limit: Option<usize>,
     order: Option<String>,
     cursor: Option<String>,
+    hide_noise: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +212,7 @@ async fn api_messages(
         .search(&SearchQuery {
             limit: q.limit.unwrap_or(20),
             cursor: q.cursor,
+            hide_noise: q.hide_noise.unwrap_or(false),
             ..Default::default()
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
