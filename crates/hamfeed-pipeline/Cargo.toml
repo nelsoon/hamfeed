@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+# Deploy note: prod runs `cargo build --release -p hamfeed-pipeline
+# --features capture` (live mic). A build without `capture` starts and
+# exits 2 in a restart loop. `voice` needs wespeaker.onnx on the box.
 capture = ["hamfeed-source/capture"]
 voice = ["hamfeed-speaker/voice"]
 

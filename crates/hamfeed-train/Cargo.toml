@@ -1,0 +1,15 @@
+[package]
+name = "hamfeed-train"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hamfeed-ingest = { path = "../hamfeed-ingest", features = ["opus"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[[bin]]
+name = "hamfeed-train"
+path = "src/main.rs"

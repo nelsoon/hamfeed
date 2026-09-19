@@ -51,6 +51,46 @@ pub fn is_valid(normalized: &str) -> bool {
     plain_re().is_match(normalized)
 }
 
+/// Canadian amateur prefix blocks (operator-supplied allocation table):
+/// CF–CK, CY–CZ, VA–VG (covers VA2/VE2 Québec), VO, VX–VY, XJ–XO.
+/// True when the leading letters fall inside one of them; anything else
+/// (including a bare single letter) is not a plannable Canadian prefix.
+pub fn canadian_prefix_ok(normalized: &str) -> bool {
+    let letters: String = normalized
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    let mut it = letters.chars();
+    match (it.next(), it.next(), it.next()) {
+        (Some(a), Some(b), None) => matches!(
+            (a, b),
+            ('C', 'F'..='K')
+                | ('C', 'Y'..='Z')
+                | ('V', 'A'..='G')
+                | ('V', 'O')
+                | ('V', 'X'..='Y')
+                | ('X', 'J'..='O')
+        ),
+        _ => false,
+    }
+}
+
+/// Repair candidates for a bare-V shape ("V2CRS"): on a Québec repeater
+/// the lone Victor is a dropped middle word — Echo or Alfa. Returns the
+/// VE- and VA-prefixed forms in that order; empty for anything else.
+/// The caller picks via the callbook and never invents: no book hit
+/// means the heard form stands.
+pub fn bare_v_repair_candidates(normalized: &str) -> Vec<String> {
+    let mut chars = normalized.chars();
+    match (chars.next(), chars.next()) {
+        (Some('V'), Some(d)) if d.is_ascii_digit() => {
+            let rest = &normalized[1..];
+            vec![format!("VE{rest}"), format!("VA{rest}")]
+        }
+        _ => vec![],
+    }
+}
+
 /// Lowercase + strip accents so Écho/echo/ECHO all match.
 pub fn fold(s: &str) -> String {
     s.to_lowercase()
@@ -285,6 +325,27 @@ mod tests {
         assert_eq!(hits[0].normalized, "VE2DEM");
         assert_eq!(hits[0].kind, HitKind::Plain);
         assert_eq!(hits[0].raw, "VE2DEM");
+    }
+
+    #[test]
+    fn canadian_blocks_and_bare_v_repair() {
+        // Operator allocation table: CF–CK, CY–CZ, VA–VG, VO, VX–VY, XJ–XO.
+        for ok in [
+            "VE2DEM", "VA2ABC", "VE2CRS", "VO1XYZ", "CY2ABC", "CF2ABC", "VX2ABC", "XJ2ABC",
+            "VG2ABC", "CK2ABC", "CZ2ABC", "VY2ABC", "XO2ABC",
+        ] {
+            assert!(canadian_prefix_ok(ok), "{ok} must pass");
+        }
+        for bad in ["V2CRS", "W1AW", "F5ABC", "G2ABC", "2CRS"] {
+            assert!(!canadian_prefix_ok(bad), "{bad} must fail");
+        }
+        // Bare-V repair: dropped Echo or Alfa, VE tried first.
+        assert_eq!(
+            bare_v_repair_candidates("V2CRS"),
+            vec!["VE2CRS".to_string(), "VA2CRS".to_string()]
+        );
+        assert!(bare_v_repair_candidates("VE2DEM").is_empty());
+        assert!(bare_v_repair_candidates("W1AW").is_empty());
     }
 
     #[test]

@@ -45,7 +45,7 @@ fn default_beep_split() -> bool {
 }
 
 fn default_beep_min_ms() -> u64 {
-    150
+    100
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -204,10 +204,14 @@ fn default_voice_retention_days() -> u64 {
     7
 }
 
-/// Voiceprint settings (R4). Empty `model_path` (or an unreadable file)
-/// disables voice with a loud log line — never a startup refusal.
+/// Voiceprint settings (R4). `enabled` is the master switch (default
+/// off): embeddings are derived only when the operator opts in AND a
+/// readable model is configured. An unreadable file still disables voice
+/// with a loud log line — never a startup refusal.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Voiceprint {
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default)]
     pub model_path: String,
     #[serde(default = "default_min_embed_s")]
@@ -223,6 +227,7 @@ pub struct Voiceprint {
 impl Default for Voiceprint {
     fn default() -> Self {
         Self {
+            enabled: false,
             model_path: String::new(),
             min_embed_s: default_min_embed_s(),
             threshold: default_voice_threshold(),
@@ -512,6 +517,11 @@ mod tests {
         assert_eq!(cfg.voiceprint.threshold, 0.55);
         assert_eq!(cfg.voiceprint.min_embed_s, 1.5);
         assert_eq!(cfg.voiceprint.retention_days, 7);
+        // Voice is opt-in: the example ships disabled.
+        assert!(!cfg.voiceprint.enabled);
+        let on = parse(&EXAMPLE.replace("enabled = false", "enabled = true"))
+            .expect("enabled = true must parse");
+        assert!(on.voiceprint.enabled);
         // Empty db_path derives from the storage dir.
         assert_eq!(
             cfg.callbook.resolved_db_path(&cfg.storage.dir),
@@ -543,6 +553,8 @@ freq_label = "TEST"
         let cfg = parse(text).expect("pre-slice-2 config must still parse");
         assert_eq!(cfg.identity.link_window_min, 30);
         assert!(cfg.voiceprint.model_path.is_empty());
+        // Old configs omit the switch: voice stays off (serde default).
+        assert!(!cfg.voiceprint.enabled);
     }
 
     #[test]

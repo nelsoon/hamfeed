@@ -270,6 +270,72 @@ pub fn enrich(
     )
 }
 
+/// Speaker attribution from QSO self-ID conventions (FR+EN). Only
+/// explicit on-air markers move the pick away from the first hit:
+/// - `ici Y` / `this is Y` (incl. `d'ici Y`): Y names themselves → Y.
+/// - `X de Y` with another callsign just before the `de`: Y names
+///   themselves last (`VE2CRS de VE2ABC` is ABC talking) → Y.
+/// - `merci Y` / `QSL Y`: Y is the ADDRESSEE, never the speaker — a
+///   lone addressee hit yields no sender (falls through to carry or
+///   sender-less) instead of badging the other party.
+///
+/// Bare sign-off callsigns and bare `73` carry no role information and
+/// keep the legacy first-hit pick. When no marker fires and every hit
+/// is negated, returns `None` so the ambiguity stays visible.
+fn pick_sender<'h>(
+    transcript: &str,
+    hits: &'h [hamfeed_callsign::CallsignHit],
+) -> Option<&'h hamfeed_callsign::CallsignHit> {
+    /// Last whitespace token, punctuation-trimmed (`merci,` → `merci`).
+    fn word(s: &str) -> &str {
+        s.split_whitespace()
+            .next_back()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\''))
+            .unwrap_or("")
+    }
+    let mut positive: Option<(usize, usize)> = None; // (score, idx)
+    let mut first_plain: Option<usize> = None;
+    for (i, h) in hits.iter().enumerate() {
+        let before = transcript
+            .get(..h.pos)
+            .unwrap_or("")
+            .trim_end()
+            .to_lowercase();
+        let last = word(&before).to_string();
+        let prev = {
+            let cut = before.trim_end_matches(&last).trim_end();
+            word(cut).to_string()
+        };
+        // Self-ID: "ici Y", "d'ici Y", "this is Y".
+        let self_id = last == "ici" || last.ends_with("'ici") || (prev == "this" && last == "is");
+        // "X de Y": another callsign heard just before the "de".
+        let mut de_y = false;
+        if last == "de" {
+            let pre = before.trim_end_matches("de").trim_end();
+            if hits
+                .iter()
+                .any(|o| o.pos < h.pos && o.pos + 80 >= pre.len())
+            {
+                de_y = true;
+            }
+        }
+        // Addressee: "merci Y", "QSL Y" — Y is spoken TO.
+        let addressee = matches!(last.as_str(), "merci" | "thank" | "thanks" | "qsl");
+        if self_id || de_y {
+            let score = usize::from(self_id) + usize::from(de_y);
+            if positive.map(|(s, _)| score > s).unwrap_or(true) {
+                positive = Some((score, i));
+            }
+        } else if !addressee && first_plain.is_none() {
+            first_plain = Some(i);
+        }
+    }
+    if let Some((_, i)) = positive {
+        return Some(&hits[i]);
+    }
+    first_plain.map(|i| &hits[i])
+}
+
 /// Profile-aware enrichment (Slice 3): `disaster_cues` is the active
 /// profile's extra set (empty under Normal). A disaster hit sets ONLY
 /// ALERT_DISASTER (ADR-8), so baseline callers see bit-identical output.
@@ -294,8 +360,35 @@ pub fn enrich_profiled(
     if matches_emergency(transcript, disaster_cues) {
         alert |= ALERT_DISASTER;
     }
-    if let Some(hit) = hamfeed_callsign::extract(transcript, lang).first() {
-        let cs = hit.normalized.clone();
+    let hits = hamfeed_callsign::extract(transcript, lang);
+    if let Some(hit) = pick_sender(transcript, &hits) {
+        let mut cs = hit.normalized.clone();
+        // Québec repair: a bare-V shape is a dropped Echo/Alfa in fast
+        // French. Trust the callbook first — repair only when the heard
+        // form is unknown AND off the Canadian blocks. Repair applies
+        // only when EXACTLY ONE candidate is known: if both VE and VA
+        // forms exist, choosing silently would be an invisible guess, so
+        // the heard form stays and the operator sees the ambiguity (the
+        // correction then feeds the finetune loop's human gate).
+        if lookup(&cs).is_none() && !hamfeed_callsign::canadian_prefix_ok(&cs) {
+            let mut known: Option<String> = None;
+            let mut ambiguous = false;
+            for cand in hamfeed_callsign::bare_v_repair_candidates(&cs) {
+                if lookup(&cand).is_some() {
+                    if known.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    known = Some(cand);
+                }
+            }
+            if !ambiguous {
+                if let Some(k) = known {
+                    cs = k;
+                }
+            }
+        }
+
         return Enrichment {
             sender_callsign: Some(cs.clone()),
             sender_name: lookup(&cs),
@@ -420,14 +513,21 @@ impl Pipeline {
         let window_ms = cfg.identity.link_window_min * 60_000;
         let callbook = hamfeed_callbook::open(&cfg.callbook.resolved_db_path(&cfg.storage.dir));
         #[cfg(feature = "voice")]
-        let embedder = match cfg.voiceprint.model_path.trim() {
-            "" => {
+        let embedder = match (cfg.voiceprint.enabled, cfg.voiceprint.model_path.trim()) {
+            (false, _) => {
+                eprintln!(
+                    "voice: disabled ([voiceprint] enabled = false) — voiceprints off; \
+                     set enabled = true with a model to opt in"
+                );
+                None
+            }
+            (true, "") => {
                 eprintln!(
                     "voice: no model configured ([voiceprint] model_path empty) — voiceprints off"
                 );
                 None
             }
-            path => match Embedder::open(path) {
+            (true, path) => match Embedder::open(path) {
                 Ok(e) => Some(e),
                 Err(err) => {
                     eprintln!("voice: cannot load {path} ({err:?})");
@@ -1298,6 +1398,62 @@ freq_label = "TEST"
         );
         assert_eq!(e.sender_callsign.as_deref(), Some("VE3MA"));
         assert_eq!(e.sender_source, "heard");
+    }
+
+    #[test]
+    fn heard_bare_v_repaired_via_callbook() {
+        // Live report: "V2CRS qui reprend" — the Echo drowned in fast
+        // French. The book knows VE2CRS, so the badge repairs to it.
+        let book = |cs: &str| {
+            if cs == "VE2CRS" {
+                Some("Opérateur".to_string())
+            } else {
+                None
+            }
+        };
+        let e = enrich("V2CRS qui reprend", "fr", None, &book, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2CRS"));
+        assert_eq!(e.sender_source, "heard");
+        // Nobody known under any repair: the heard form stands, never
+        // an invented callsign.
+        let e2 = enrich("V2CRS qui reprend", "fr", None, &|_| None, None, &[]);
+        assert_eq!(e2.sender_callsign.as_deref(), Some("V2CRS"));
+    }
+
+    #[test]
+    fn heard_bare_v_ambiguous_both_known_stays_heard() {
+        // Both VE2CRS and VA2CRS are in the book: silently picking VE
+        // would be an invisible guess, so the
+        // heard form stays and the operator sees the ambiguity.
+        let book = |cs: &str| {
+            if cs == "VE2CRS" || cs == "VA2CRS" {
+                Some("Opérateur".to_string())
+            } else {
+                None
+            }
+        };
+        let e = enrich("V2CRS qui reprend", "fr", None, &book, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("V2CRS"));
+        assert_eq!(e.sender_source, "heard");
+    }
+
+    #[test]
+    fn sender_attribution_self_id_markers() {
+        let nobook = &|_: &str| None;
+        // "X de Y": Y names themselves last — Y speaks.
+        let e = enrich("VE2CRS de VE2ABC, bonsoir", "fr", None, nobook, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2ABC"));
+        // "ici Y" / "this is Y": Y names themselves — Y speaks.
+        let e = enrich("ici VE2ABC, à l'écoute", "fr", None, nobook, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2ABC"));
+        let e = enrich("73, this is VE2ABC", "en", None, nobook, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2ABC"));
+        // "merci Y": Y is the addressee — no sender, never the badge.
+        let e = enrich("merci VE2CRS, 73", "fr", None, nobook, None, &[]);
+        assert_eq!(e.sender_callsign, None);
+        // No marker at all: legacy first-hit pick is unchanged.
+        let e = enrich("bonsoir VE2CRS", "fr", None, nobook, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2CRS"));
     }
 
     #[test]

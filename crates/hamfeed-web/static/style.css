@@ -101,7 +101,6 @@ body {
   color: var(--muted);
 }
 .ts { font-family: var(--mono); }
-.freq { font-family: var(--mono); }
 .dur {
   margin-left: auto;
   font-family: var(--mono);

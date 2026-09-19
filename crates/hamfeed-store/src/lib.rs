@@ -825,6 +825,17 @@ impl Store {
         }
         if q.hide_noise {
             sql.push_str(" AND short_flag = 0");
+            // Beep/noise shorts: sub-5s rows where whisper found no words
+            // and no callsign was actually heard. Carried/suggested badges
+            // on beep slivers are carry artifacts, not traffic — only a
+            // heard self-ID keeps a wordless short visible. Failed rows
+            // stay visible: an honest error is not noise.
+            sql.push_str(
+                " AND NOT (duration_ms < 5000 \
+                 AND (transcript IS NULL OR transcript = '') \
+                 AND sender_source != 'heard' \
+                 AND status != 'failed')",
+            );
         }
         // Exact callsign match (Slice 2): callsigns are compact tokens, so
         // `=` is precise where FTS/LIKE would false-positive (VE2DE ⊂ VE2DEM).
@@ -1196,6 +1207,74 @@ mod tests {
         }
         assert_eq!(seen.len(), 6);
         assert_eq!(seen[0], "m-fr-ok");
+    }
+
+    #[test]
+    fn hide_noise_drops_wordless_shorts() {
+        let store = Store::open_memory().unwrap();
+        let put = |id: &str, dur_ms: u64, text: &str, status: &str, cs: Option<&str>, src: &str| {
+            store
+                .insert(&NewMessage {
+                    id: id.into(),
+                    ts_start_ms: 1_000,
+                    ts_end_ms: 1_000 + dur_ms,
+                    freq_label: "TEST".into(),
+                    lang: "fr".into(),
+                    lang_conf: 0.9,
+                    transcript: text.into(),
+                    stt_conf: 0.8,
+                    conf_flag: "ok".into(),
+                    status: status.into(),
+                    fail_reason: None,
+                    audio_path: Some(format!("/tmp/{id}.ogg")),
+                    duration_ms: Some(dur_ms),
+                    size_bytes: Some(100),
+                    short_flag: false,
+                    group_id: "g".into(),
+                    seq: 0,
+                    sender_callsign: cs.map(str::to_string),
+                    sender_name: None,
+                    sender_source: src.into(),
+                    alert: 0,
+                    speaker_key: None,
+                    corrected_text: None,
+                })
+                .expect("seed insert");
+        };
+        // Beep sliver: wordless, carried badge = carry artifact → hidden.
+        put("beep", 128, "", "ok", Some("VE2CRS"), "carried");
+        // Real quick self-ID: heard sender keeps it, whatever the size.
+        put(
+            "quick",
+            2_500,
+            "VE2ABC à l'écoute",
+            "ok",
+            Some("VE2ABC"),
+            "heard",
+        );
+        // Honest error states stay visible: failed short, long wordless.
+        put("fail", 2_500, "", "failed", None, "none");
+        put("long", 9_000, "", "ok", None, "none");
+        let ids = |hide_noise: bool| {
+            store
+                .search(&SearchQuery {
+                    hide_noise,
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .messages
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let hidden = ids(true);
+        assert!(!hidden.contains(&"beep".to_string()));
+        for keep in ["quick", "fail", "long"] {
+            assert!(hidden.contains(&keep.to_string()), "{keep} must stay");
+        }
+        // Off: everything shows (reveal on demand).
+        assert_eq!(ids(false).len(), 4);
     }
 
     #[test]

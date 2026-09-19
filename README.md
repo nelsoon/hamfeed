@@ -53,7 +53,30 @@ Open `http://127.0.0.1:8080/` for the live feed.
   `voice` cargo feature)
 - `scripts/download-model.sh` — fetch a whisper model (tiny/base/small)
 - `scripts/download-voice-model.sh` — fetch the wespeaker voice model
-  (checksum-verified; optional — voiceprints stay off without it)
+  (checksum-verified; optional — voiceprints stay off unless opted in
+  with it)
+
+## Privacy
+
+Ham radio is public by design: regulators (ISED in Canada via the
+Radiocommunication Act, equivalents elsewhere) prohibit encryption on
+amateur bands, require on-air self-identification, and allow anyone to
+listen. Recording what anyone may lawfully hear needs no consent — but
+what hamfeed *derives and keeps* is a separate matter, and laws about
+that vary by jurisdiction:
+
+- Everything stays on the machine: capture → transcribe → store → serve
+  makes zero network calls. Audio clips, transcripts, and callsign links
+  live in the local SQLite store with time-based retention janitors.
+- Voiceprints are off by default (`[voiceprint] enabled = false`) and
+  stay off without a model file. A public broadcast is not consent to
+  biometric enrollment: enable them only deliberately, keep retention
+  short, and purge on request (alias rows are operator-purgeable;
+  embeddings never leave RAM).
+- If you publish the feed beyond your own household — especially for a
+  club — check your local privacy law first (e.g. Québec's Law 25 treats
+  biometric data as sensitive). That call belongs to the operator, not
+  the software.
 
 ## Docs
 
