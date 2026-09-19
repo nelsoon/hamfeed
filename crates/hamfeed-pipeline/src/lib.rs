@@ -388,6 +388,7 @@ pub fn enrich_profiled(
                 }
             }
         }
+
         return Enrichment {
             sender_callsign: Some(cs.clone()),
             sender_name: lookup(&cs),
