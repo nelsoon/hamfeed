@@ -277,7 +277,9 @@ impl Segmenter {
             if voice_seen {
                 let mut o = self.open.take().expect("just checked");
                 o.pcm.truncate((beep_start - o.start_sample) as usize);
-                out.push(self.close(&o, beep_start));
+                if self.voice_confirmed(&o.pcm) {
+                    out.push(self.close(&o, beep_start));
+                }
             }
             return;
         }
@@ -357,7 +359,34 @@ impl Segmenter {
         let beep_start = start_sample + run_start as u64;
         let mut o = self.open.take().expect("just checked");
         o.pcm.truncate((beep_start - o.start_sample) as usize);
-        out.push(self.close(&o, beep_start));
+        if self.voice_confirmed(&o.pcm) {
+            out.push(self.close(&o, beep_start));
+        }
+    }
+
+    /// Close-time voice confirmation: at least 300 ms (6 windows) of
+    /// loud, spectrally-spread audio in the closed PCM. The open-time
+    /// latch can be set by a ~150 ms squelch crash before a beep tail,
+    /// so a latched segment with almost no voiced content still drops.
+    /// Mixed "hello + trailing beep" passes on the speech part; pure
+    /// tones fail (tonal windows never count); sub-300 ms real speech is
+    /// the accepted loss — whisper hallucinates below that anyway, and
+    /// the open gate already demands 100 ms. Weak-signal traffic is
+    /// unaffected: anything below the energy gate never opens at all.
+    fn voice_confirmed(&self, pcm: &[i16]) -> bool {
+        let sub = BEEP_SUB_MS as usize * SAMPLE_RATE as usize / 1000;
+        let mut voiced = 0u32;
+        for w in pcm.chunks_exact(sub) {
+            if Segmenter::mean_abs(w) >= self.cfg.energy_threshold
+                && !sub_is_tonal(&hann(w), self.cfg.energy_threshold, w)
+            {
+                voiced += 1;
+                if voiced >= 6 {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn close(&self, o: &Open, end_sample: u64) -> Segment {
@@ -437,8 +466,10 @@ impl Segmenter {
                     let o = self.open.take().expect("just checked");
                     // Tone-only segments (beep tails, kerchunks) are
                     // dropped, never transcribed — only voice-bearing ones
-                    // close (B5).
-                    if o.voice_seen {
+                    // close (B5). The latch alone is not enough: a crash
+                    // can set it before a beep tail, so the closed audio
+                    // must confirm 300 ms of voiced content too.
+                    if o.voice_seen && self.voice_confirmed(&o.pcm) {
                         out.push(self.close(&o, o.last_voice_sample));
                     }
                 }
@@ -476,7 +507,8 @@ impl Segmenter {
     pub fn flush(&mut self) -> Vec<Segment> {
         let mut out = Vec::new();
         if let Some(o) = self.open.take() {
-            if o.voice_seen && o.last_voice_sample > o.start_sample {
+            if o.voice_seen && o.last_voice_sample > o.start_sample && self.voice_confirmed(&o.pcm)
+            {
                 out.push(self.close(&o, o.last_voice_sample));
             }
         }
@@ -627,6 +659,40 @@ mod tests {
         assert!(segs.is_empty(), "tone-only must drop, got {}", segs.len());
     }
 
+    /// A squelch crash latched as voice followed by a sub-persistence
+    /// beep must not become a clip: the closed audio holds ~150 ms of
+    /// voiced content, under the 300 ms confirmation floor. Regression:
+    /// prod showed 85–128 ms "Bye. Thank you." slivers (whisper
+    /// hallucinating on beeps) wearing carried callsign badges.
+    #[test]
+    fn crash_then_beep_sliver_dropped() {
+        let cfg = SegmenterConfig {
+            ..Default::default()
+        };
+        let mut pcm = fixture::noise_floor_ms(150, 9_000);
+        pcm.extend(fixture::tone_ms(1000.0, 80, 9_000));
+        pcm.extend(fixture::silence_ms(1500));
+        let segs = run(&cfg, &pcm);
+        assert!(
+            segs.is_empty(),
+            "crash+beep sliver must drop, got {}",
+            segs.len()
+        );
+    }
+
+    /// Three syllables (~700 ms) confirm well above the floor: the
+    /// confirmation must not eat short but real speech.
+    #[test]
+    fn short_speech_confirms() {
+        let cfg = SegmenterConfig {
+            ..Default::default()
+        };
+        let mut pcm = fixture::speech_like(3);
+        pcm.extend(fixture::silence_ms(1500));
+        let segs = run(&cfg, &pcm);
+        assert_eq!(segs.len(), 1, "short speech must keep, got {}", segs.len());
+    }
+
     /// Syllable bursts are irregular: speech-like audio must not false-split
     /// even though each burst is a pure tone (B3 stability gate).
     #[test]
@@ -692,10 +758,23 @@ mod tests {
             out.extend(seg.flush());
             out
         };
+        // Close-time confirmation drops tone-only blips with or without
+        // split; unsplit, the two turns land whole (beeps glued on).
+        // Compact summary: a full PCM dump on failure floods the log.
+        let summary = |segs: &[Segment]| {
+            segs.iter()
+                .map(|s| (s.ts_start_ms, s.ts_end_ms))
+                .collect::<Vec<_>>()
+        };
         let off = run(false);
-        assert_eq!(off.len(), 4, "beep blips land without split: {off:?}");
+        assert_eq!(
+            off.len(),
+            2,
+            "tone-only blips must drop: {:?}",
+            summary(&off)
+        );
         let on = run(true);
-        assert_eq!(on.len(), 2, "beep blips must drop: {on:?}");
+        assert_eq!(on.len(), 2, "beep blips must drop: {:?}", summary(&on));
         assert!(
             (on[0].ts_end_ms as i64 - 1600).abs() <= 200,
             "first turn end: {}",
