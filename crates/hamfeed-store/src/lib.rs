@@ -1610,7 +1610,6 @@ mod tests {
                     id: id.into(),
                     ts_start_ms: 1_000,
                     ts_end_ms: 2_000,
-                    freq_label: "TEST".into(),
                     lang: "fr".into(),
                     lang_conf: 0.9,
                     transcript: text.into(),

@@ -1610,28 +1610,12 @@ delete_audio_on_drop = false
         let store = Store::open_memory().unwrap();
         let mut v = test_voice_state();
         assert_eq!(
-            v.key_for(
-                &store,
-                &vec![0i16; 32000],
-                500,
-                "ok",
-                "1",
-                1.5,
-                "s1"
-            ),
+            v.key_for(&store, &vec![0i16; 32000], 500, "ok", "1", 1.5, "s1"),
             None
         );
         // Failed rows never key either.
         assert_eq!(
-            v.key_for(
-                &store,
-                &vec![0i16; 96000],
-                6000,
-                "failed",
-                "1",
-                1.5,
-                "s2"
-            ),
+            v.key_for(&store, &vec![0i16; 96000], 6000, "failed", "1", 1.5, "s2"),
             None
         );
     }
