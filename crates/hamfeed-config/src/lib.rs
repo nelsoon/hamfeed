@@ -100,6 +100,21 @@ pub struct Stt {
     /// repeater context (`hamfeed_stt::DEFAULT_INITIAL_PROMPT`).
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    /// Decoder thread cap. Omitted → all cores minus one (never 0):
+    /// a saturated box starves capture + the live relay, which is
+    /// worse than a slower transcript.
+    #[serde(default)]
+    pub threads: Option<usize>,
+    /// Language-detection confidence floor. When the top detection
+    /// scores below this AND `lang_fallback` names a whitelisted
+    /// language, the decode runs in the fallback instead of a
+    /// low-confidence guess (short/noisy clips misdetect most).
+    /// 0.0 (default) keeps pure detection.
+    #[serde(default)]
+    pub lang_min_conf: f64,
+    /// See `lang_min_conf`. Omitted → no fallback.
+    #[serde(default)]
+    pub lang_fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -423,7 +438,24 @@ mod tests {
         assert_eq!(cfg.segment.max_s, 120);
         assert_eq!(cfg.stt.lang_whitelist, vec!["fr", "en"]);
         assert_eq!(cfg.stt.initial_prompt, None);
+        // New [stt] knobs default to old behavior: pure detection,
+        // automatic thread budget (old configs parse unchanged).
+        assert_eq!(cfg.stt.threads, None);
+        assert_eq!(cfg.stt.lang_min_conf, 0.0);
+        assert_eq!(cfg.stt.lang_fallback, None);
         assert_eq!(cfg.storage.retention_days, 90);
+    }
+
+    #[test]
+    fn stt_knobs_parse() {
+        let text = EXAMPLE.replace(
+            "lang_whitelist = [\"fr\", \"en\"]",
+            "lang_whitelist = [\"fr\", \"en\"]\nthreads = 2\nlang_min_conf = 0.85\nlang_fallback = \"fr\"",
+        );
+        let stt = parse(&text).expect("stt knobs must parse").stt;
+        assert_eq!(stt.threads, Some(2));
+        assert_eq!(stt.lang_min_conf, 0.85);
+        assert_eq!(stt.lang_fallback.as_deref(), Some("fr"));
     }
 
     #[test]

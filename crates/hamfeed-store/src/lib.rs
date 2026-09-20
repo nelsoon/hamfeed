@@ -756,6 +756,23 @@ impl Store {
         .context("cannot read alias")
     }
 
+    /// Repeater regulars: callsigns attributed at least `min_count`
+    /// times (any source). The agreement rule's local prior — a name or
+    /// fragment matching a regular outranks the whole country's
+    /// phonebook. Alphabetical; empty when the receiver is new.
+    pub fn regulars(&self, min_count: u32) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let mut stmt = conn.prepare(
+            "SELECT sender_callsign FROM messages
+             WHERE sender_callsign IS NOT NULL
+             GROUP BY sender_callsign HAVING COUNT(*) >= ?
+             ORDER BY sender_callsign",
+        )?;
+        let rows = stmt.query_map([min_count], |r| r.get(0))?;
+        rows.collect::<std::result::Result<Vec<String>, _>>()
+            .context("cannot read regulars")
+    }
+
     /// Allocate the next per-day speaker number for a label
     /// (`speaker_seq_{label}_{day}`); never reused within the store.
     pub fn alloc_speaker_n(&self, label: &str, day: &str) -> Result<u32> {
@@ -1638,6 +1655,30 @@ mod tests {
             speaker_key: None,
             corrected_text: None,
         }
+    }
+
+    #[test]
+    fn regulars_lists_repeat_senders() {
+        // The agreement rule's local prior: callsigns attributed at
+        // least min_count times, alphabetical. One-offs and
+        // sender-less rows never qualify.
+        let store = Store::open_memory().unwrap();
+        store
+            .insert(&sender_msg("m1", 1, Some("VE2DEM"), "heard"))
+            .unwrap();
+        store
+            .insert(&sender_msg("m2", 2, Some("VE2DEM"), "carried"))
+            .unwrap();
+        store
+            .insert(&sender_msg("m3", 3, Some("W1AW"), "heard"))
+            .unwrap();
+        store.insert(&sender_msg("m4", 4, None, "none")).unwrap();
+        assert_eq!(store.regulars(2).unwrap(), vec!["VE2DEM".to_string()]);
+        assert_eq!(
+            store.regulars(1).unwrap(),
+            vec!["VE2DEM".to_string(), "W1AW".to_string()]
+        );
+        assert!(store.regulars(3).unwrap().is_empty());
     }
 
     #[test]

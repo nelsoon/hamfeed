@@ -75,6 +75,82 @@ pub fn canadian_prefix_ok(normalized: &str) -> bool {
     }
 }
 
+/// Q brevity codes are procedure words, never callsigns — but a spelled
+/// run ("quebec sierra lima") assembles them letter-perfect. Anything
+/// in this set is rejected wherever a candidate is admitted, both
+/// passes. Shape alone cannot tell QSL from a callsign; the list can.
+pub fn is_qcode(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "QRA"
+            | "QRG"
+            | "QRH"
+            | "QRI"
+            | "QRK"
+            | "QRL"
+            | "QRM"
+            | "QRN"
+            | "QRO"
+            | "QRP"
+            | "QRQ"
+            | "QRS"
+            | "QRT"
+            | "QRU"
+            | "QRV"
+            | "QRW"
+            | "QRX"
+            | "QRZ"
+            | "QSA"
+            | "QSB"
+            | "QSD"
+            | "QSG"
+            | "QSK"
+            | "QSL"
+            | "QSM"
+            | "QSN"
+            | "QSO"
+            | "QSP"
+            | "QST"
+            | "QSU"
+            | "QSV"
+            | "QSW"
+            | "QSX"
+            | "QSY"
+            | "QSZ"
+            | "QTC"
+            | "QTH"
+            | "QTR"
+            | "QTU"
+    )
+}
+
+/// US amateur prefix blocks (operator-supplied): single K/N/W, or
+/// AA–AL, KA–KZ, NA–NZ, WA–WZ pairs — each followed by a digit.
+/// True only when the shape matches; the digit itself is not range
+/// checked (district 0–9 all exist).
+pub fn us_prefix_ok(normalized: &str) -> bool {
+    let mut chars = normalized.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(a), Some(d), _) if d.is_ascii_digit() => {
+            matches!(a, 'K' | 'N' | 'W')
+        }
+        (Some(a), Some(b), Some(d)) if d.is_ascii_digit() => {
+            matches!(
+                (a, b),
+                ('A', 'A'..='L') | ('K', 'A'..='Z') | ('N', 'A'..='Z') | ('W', 'A'..='Z')
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Nationally plannable: Canadian or US prefix. Shape-only `is_valid`
+/// admits junk like `V2CSQ` (no such block); learning and suggestion
+/// must gate on this, never on shape alone.
+pub fn national_ok(normalized: &str) -> bool {
+    canadian_prefix_ok(normalized) || us_prefix_ok(normalized)
+}
+
 /// Repair candidates for a bare-V shape ("V2CRS"): on a Québec repeater
 /// the lone Victor is a dropped middle word — Echo or Alfa. Returns the
 /// VE- and VA-prefixed forms in that order; empty for anything else.
@@ -173,9 +249,15 @@ pub fn extract(text: &str, _lang: &str) -> Vec<CallsignHit> {
     // length-preserving, so byte offsets match the original text.
     let upper = text.to_ascii_uppercase();
     for m in plain_re().find_iter(&upper) {
+        let norm = normalize(m.as_str());
+        // The shape regex needs a digit, so most Q codes never reach
+        // here; the ban stays explicit so no pass can admit one.
+        if is_qcode(&norm) {
+            continue;
+        }
         hits.push(CallsignHit {
             raw: m.as_str().to_string(),
-            normalized: normalize(m.as_str()),
+            normalized: norm,
             kind: HitKind::Plain,
             confidence: 0.9,
             pos: m.start(),
@@ -205,7 +287,9 @@ pub fn extract(text: &str, _lang: &str) -> Vec<CallsignHit> {
                     }
                 }
             }
-            if is_valid(&norm) {
+            // A spelled run assembles Q codes letter-perfect ("quebec
+            // sierra lima" → QSL): shape is not enough, ban them here.
+            if is_valid(&norm) && !is_qcode(&norm) {
                 // No dedupe against plain hits: spelled raw contains spaces
                 // so byte spans never overlap; ranking decides the sender.
                 hits.push(CallsignHit {
@@ -368,6 +452,37 @@ mod tests {
     fn run_gate_rejects_short() {
         // Three NATO words: below the run gate, and no plain hit either.
         assert!(extract("bravo delta mike over", "en").is_empty());
+    }
+
+    #[test]
+    fn qcodes_never_admit() {
+        // Procedure words assemble letter-perfect through the spelled
+        // pass; the ban kills them. "merci QSL" names an addressee, not
+        // a sender — and QSL is not a callsign either way.
+        assert!(extract("quebec sierra lima over", "en").is_empty());
+        assert!(extract("merci QSL et à la prochaine", "fr").is_empty());
+        assert!(extract("QTH Montréal, QSB ce soir", "fr").is_empty());
+        assert!(is_qcode("QSL") && is_qcode("QTH") && is_qcode("QRZ"));
+        assert!(!is_qcode("VE2DEM"));
+        // Real callsigns still pass through both passes.
+        assert_eq!(extract("ici VE2DEM", "fr")[0].normalized, "VE2DEM");
+    }
+
+    #[test]
+    fn us_blocks_and_national_gate() {
+        for ok in [
+            "W1AW", "K2ABC", "N0CALL", "AA2XYZ", "KA1ABC", "VE2DEM", "VA2LHA",
+        ] {
+            assert!(national_ok(ok), "{ok} must pass");
+        }
+        for bad in ["V2CSQ", "F5ABC", "G2ABC", "QSL", "2CRS", "ZZ9ZZZ"] {
+            assert!(!national_ok(bad), "{bad} must fail");
+        }
+        // Single-letter US prefixes need the digit right after;
+        // two-letter blocks (KA–KZ…) take it third.
+        assert!(us_prefix_ok("K2A"));
+        assert!(us_prefix_ok("KA2A"));
+        assert!(!us_prefix_ok("AZ2A"));
     }
 
     #[test]

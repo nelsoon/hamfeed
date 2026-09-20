@@ -25,6 +25,14 @@ lang_whitelist = ["fr", "en"]
 # Optional whisper initial-prompt override. Omitted → built-in bilingual
 # (FR/EN) repeater context: callsigns, NATO words, Q codes.
 # initial_prompt = "VE2ABC net, nightly round table, over."
+# Decoder thread cap. Omitted → all cores minus one (never 0): a
+# saturated box starves capture + the live relay.
+# threads = 3
+# Low-confidence language fallback: when detection scores below
+# lang_min_conf, decode in lang_fallback (must be whitelisted)
+# instead of a guess. Omitted → pure detection.
+# lang_min_conf = 0.85
+# lang_fallback = "fr"
 
 [storage]
 dir = "./data/audio"
