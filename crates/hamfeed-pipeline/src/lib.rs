@@ -258,8 +258,8 @@ pub fn enrich(
     my_callsign: Option<&str>,
     emergency_cues: &[String],
 ) -> Enrichment {
-    // Unit-test path: no voice alias, no regulars — only markers and
-    // the callbook may corroborate.
+    // Unit-test path: no voice alias, no regulars, trusted decode —
+    // only markers and the callbook may corroborate.
     enrich_profiled(
         transcript,
         lang,
@@ -270,6 +270,7 @@ pub fn enrich(
         &[],
         None,
         &|_| false,
+        false,
     )
 }
 
@@ -352,7 +353,12 @@ fn pick_sender<'h>(
 /// fuzzy hit becomes `suggested` (one-tap confirm in the UI) instead
 /// of a confident wrong badge; silence (`none`) still beats a guess.
 /// `alias_cs` is the voice-alias callsign for this clip, if any;
-/// `is_regular` tests repeater-regular membership.
+/// `is_regular` tests repeater-regular membership; `unreliable` marks
+/// a decode carrying hallucination boilerplate (subtitle tags), where
+/// even a suggestion would ask the operator to confirm garbage.
+/// Two distrust rules: an unreliable decode withholds lone picks
+/// entirely, and a voice alias naming someone else vetoes every
+/// non-marker pick (explicit self-IDs still outrank a stale alias).
 #[allow(clippy::too_many_arguments)]
 pub fn enrich_profiled(
     transcript: &str,
@@ -364,6 +370,7 @@ pub fn enrich_profiled(
     disaster_cues: &[String],
     alias_cs: Option<&str>,
     is_regular: &dyn Fn(&str) -> bool,
+    unreliable: bool,
 ) -> Enrichment {
     let mut alert = 0;
     if let Some(mine) = my_callsign {
@@ -411,8 +418,22 @@ pub fn enrich_profiled(
         // Corroboration votes for the (possibly repaired) candidate.
         let known = lookup(&cs).is_some();
         let voice = alias_cs == Some(cs.as_str());
+        let conflict = alias_cs.is_some() && !voice;
+        if conflict && !marker {
+            // The voice says someone else and nothing explicit was
+            // spoken: withhold entirely, transcript and alerts stand.
+            let mut e = Enrichment::none();
+            e.alert = alert;
+            return e;
+        }
         let source = if marker || known || voice || is_regular(&cs) {
             "heard"
+        } else if unreliable {
+            // Hallucinated decode: a lone pick is not even worth a
+            // suggestion — confirming garbage teaches garbage.
+            let mut e = Enrichment::none();
+            e.alert = alert;
+            return e;
         } else {
             // Lone fuzzy hit: suggest for one-tap confirm, never badge.
             "suggested"
@@ -776,6 +797,10 @@ impl Pipeline {
                 // Repeater regulars: callsigns this receiver actually
                 // hears. A degraded query degrades to no vote, never louder.
                 let regulars = self.store.regulars(2).unwrap_or_default();
+                // Hallucinated decodes (subtitle boilerplate) lose the
+                // right to suggest: lone picks are withheld, corroborated
+                // paths stand.
+                let unreliable = hamfeed_store::has_hallucination_tag(&transcript);
                 let mut e = enrich_profiled(
                     &transcript,
                     &out.lang,
@@ -786,6 +811,7 @@ impl Pipeline {
                     &disaster_cues,
                     alias_cs.as_deref(),
                     &|cs| regulars.iter().any(|r| r == cs),
+                    unreliable,
                 );
                 e.speaker_key = speaker_key.clone();
                 // A heard self-ID refreshes the carry window (R2) and
@@ -1521,6 +1547,7 @@ delete_audio_on_drop = false
             &[],
             None,
             &|cs| cs == "VE2CRS",
+            false,
         );
         assert_eq!(e.sender_source, "heard");
         let e = enrich_profiled(
@@ -1533,6 +1560,7 @@ delete_audio_on_drop = false
             &[],
             Some("VE2CRS"),
             &|_| false,
+            false,
         );
         assert_eq!(e.sender_source, "heard");
         let book = &|cs: &str| (cs == "VE2CRS").then(|| "Op".to_string());
@@ -1540,6 +1568,109 @@ delete_audio_on_drop = false
         assert_eq!(e.sender_source, "heard");
         // And the marker path never needed corroboration.
         let e = enrich("ici VE2CRS", "fr", None, nobook, None, &[]);
+        assert_eq!(e.sender_source, "heard");
+    }
+
+    #[test]
+    fn unreliable_decode_withholds_lone_pick() {
+        // The VE2TNP case: a hallucinated decode names the wrong
+        // callsign with no marker. A suggestion would ask the operator
+        // to confirm garbage — withhold the sender, keep the transcript.
+        let nobook = &|_: &str| None;
+        let tx = "VE2LHA, LHAAQ. Sous-titrage Société Radio-Canada";
+        let e = enrich_profiled(
+            tx,
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            None,
+            &|_| false,
+            true,
+        );
+        assert_eq!(e.sender_callsign, None);
+        assert_eq!(e.sender_source, "none");
+        // Trusted decode of the same text still suggests (control).
+        let e = enrich_profiled(
+            tx,
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            None,
+            &|_| false,
+            false,
+        );
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2LHA"));
+        assert_eq!(e.sender_source, "suggested");
+        // An explicit self-ID survives the unreliable flag.
+        let e = enrich_profiled(
+            "ici VE2CRS. Sous-titrage Société Radio-Canada",
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            None,
+            &|_| false,
+            true,
+        );
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2CRS"));
+        assert_eq!(e.sender_source, "heard");
+    }
+
+    #[test]
+    fn alias_conflict_vetoes_bare_pick() {
+        // The voice is a known VE2TNP but the transcript offers VE2LHA
+        // with no marker: silence beats the wrong badge.
+        let nobook = &|_: &str| None;
+        let e = enrich_profiled(
+            "VE2LHA, à vous",
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            Some("VE2TNP"),
+            &|_| false,
+            false,
+        );
+        assert_eq!(e.sender_callsign, None);
+        assert_eq!(e.sender_source, "none");
+        // Agreement still badges: alias and pick name the same station.
+        let e = enrich_profiled(
+            "VE2LHA, à vous",
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            Some("VE2LHA"),
+            &|_| false,
+            false,
+        );
+        assert_eq!(e.sender_source, "heard");
+        // Explicit self-ID outranks a stale alias.
+        let e = enrich_profiled(
+            "ici VE2LHA",
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            Some("VE2TNP"),
+            &|_| false,
+            false,
+        );
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2LHA"));
         assert_eq!(e.sender_source, "heard");
     }
 
@@ -1834,6 +1965,7 @@ delete_audio_on_drop = false
             &disaster,
             None,
             &|_| false,
+            false,
         );
         assert_eq!(e.alert & ALERT_DISASTER, ALERT_DISASTER);
         assert_eq!(e.alert & ALERT_EMERGENCY, 0);
@@ -1865,9 +1997,18 @@ delete_audio_on_drop = false
         ];
         for tx in cases {
             let a = enrich(tx, "fr", None, &|_| None, None, &cues());
-            let b = enrich_profiled(tx, "fr", None, &|_| None, None, &cues(), &[], None, &|_| {
-                false
-            });
+            let b = enrich_profiled(
+                tx,
+                "fr",
+                None,
+                &|_| None,
+                None,
+                &cues(),
+                &[],
+                None,
+                &|_| false,
+                false,
+            );
             assert_eq!(a, b, "divergence on {tx:?}");
         }
     }

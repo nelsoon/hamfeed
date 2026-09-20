@@ -201,6 +201,17 @@ impl Transcriber {
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_suppress_blank(true);
+        // Anti-hallucination ladder (upstream reference defaults): retry
+        // weak decodes at rising temperatures, and reject segments whose
+        // entropy/logprob/no-speech scores mark guessing. A rejected
+        // decode yields no segments → `Undecodable` → an honest failed
+        // row instead of a confident hallucination. Greedy best_of stays
+        // 1: the ladder, not the beam, buys the quality on small boxes.
+        params.set_temperature(0.0);
+        params.set_temperature_inc(0.2);
+        params.set_entropy_thold(2.4);
+        params.set_logprob_thold(-1.0);
+        params.set_no_speech_thold(0.6);
         state
             .full(params, &pcm_f32)
             .map_err(|e| SttErr::Backend(format!("decode: {e:?}")))?;

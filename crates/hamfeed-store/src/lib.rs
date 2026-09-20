@@ -42,15 +42,42 @@ const NOISE_BOILER: &[&str] = &[
     "soirée",
 ];
 
+/// Whisper's French subtitle hallucinations (`Sous-titrage Société
+/// Radio-Canada`, variants): emitted over silence/noise, never spoken.
+/// Matching is accent/case/separator-insensitive; the `sous-titr*`
+/// prefix is required so a real mention of the broadcaster stays content.
+pub fn has_hallucination_tag(text: &str) -> bool {
+    let folded = hamfeed_callsign::fold(text).replace('-', " ");
+    let flat: String = folded.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.contains("sous titrage societe radio canada")
+        || flat.contains("sous titres societe radio canada")
+}
+
+/// The hallucination phrases above, for stripping before the content
+/// check (a tag alone is wordless; a tag after real speech keeps the row).
+fn strip_hallucination_tags(text: &str) -> String {
+    // Fold first so one pass covers accents, case, and separators.
+    let mut out = hamfeed_callsign::fold(text).replace('-', " ");
+    for phrase in [
+        "sous titrage societe radio canada",
+        "sous titres societe radio canada",
+    ] {
+        out = out.replace(phrase, " ");
+    }
+    out
+}
+
 /// True when a transcript holds no speech content: only bracketed
-/// non-speech tags, sign-off boilerplate, filler, and punctuation.
+/// non-speech tags, subtitle hallucinations, sign-off boilerplate,
+/// filler, and punctuation.
 /// Conservative by construction — a single content word keeps the row,
 /// so weak-signal fragments and hallucinations with word-shape stay
 /// visible (indistinguishable from real speech, honestly shown).
 pub fn transcript_is_noise_text(text: &str) -> bool {
-    let mut stripped = String::with_capacity(text.len());
+    let destrip = strip_hallucination_tags(text);
+    let mut stripped = String::with_capacity(destrip.len());
     let mut depth = 0u32;
-    for c in text.chars() {
+    for c in destrip.chars() {
         if c == '[' {
             depth += 1;
         } else if c == ']' {
@@ -1478,6 +1505,30 @@ mod tests {
         ] {
             assert!(!transcript_is_noise_text(t), "{t:?} must stay visible");
         }
+    }
+
+    #[test]
+    fn subtitle_hallucination_hides_and_flags() {
+        // Whisper's French subtitle boilerplate over silence/noise: the
+        // tag alone is wordless, and its presence marks the decode
+        // unreliable for attribution even beside real words.
+        for t in [
+            "Sous-titrage Société Radio-Canada",
+            "SOUS-TITRES SOCIÉTÉ RADIO-CANADA",
+            "Sous titrage Societe Radio Canada",
+        ] {
+            assert!(transcript_is_noise_text(t), "{t:?} must read as noise");
+            assert!(has_hallucination_tag(t), "{t:?} must flag");
+        }
+        // Real speech beside the tag stays visible (tag stripped, words
+        // remain) — but still flags unreliable.
+        let mixed = "Bonjour à tous, sous-titrage Société Radio-Canada";
+        assert!(!transcript_is_noise_text(mixed));
+        assert!(has_hallucination_tag(mixed));
+        // A genuine mention of the broadcaster without the subtitle
+        // prefix is content, not a hallucination.
+        assert!(!has_hallucination_tag("entendu à Radio-Canada hier"));
+        assert!(!has_hallucination_tag("ici VE2DEM, à vous"));
     }
 
     #[test]
