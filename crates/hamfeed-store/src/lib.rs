@@ -82,7 +82,6 @@ pub struct Message {
     pub id: String,
     pub ts_start_ms: u64,
     pub ts_end_ms: u64,
-    pub freq_label: String,
     pub lang: String,
     pub lang_conf: f64,
     pub transcript: String,
@@ -107,7 +106,7 @@ pub struct Message {
     pub sender_source: String,
     /// Bitmask: 1 = for-you, 2 = emergency (Slice 2).
     pub alert: i32,
-    /// Per-segment voice key (`Unknown-N|label|day`), if any (Slice 2).
+    /// Per-segment voice key (`Unknown-N|day`), if any (Slice 2).
     pub speaker_key: Option<String>,
     /// Operator correction of the transcript, if any (004). The model's
     /// original stays in `transcript`; this is the label, never a wipe.
@@ -120,7 +119,6 @@ pub struct NewMessage {
     pub id: String,
     pub ts_start_ms: u64,
     pub ts_end_ms: u64,
-    pub freq_label: String,
     pub lang: String,
     pub lang_conf: f64,
     pub transcript: String,
@@ -195,7 +193,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY,
   ts_start INT NOT NULL, ts_end INT NOT NULL,
-  freq_label TEXT NOT NULL, lang TEXT NOT NULL, lang_conf REAL NOT NULL,
+  lang TEXT NOT NULL, lang_conf REAL NOT NULL,
   transcript TEXT NOT NULL, stt_conf REAL NOT NULL,
   conf_flag TEXT NOT NULL, status TEXT NOT NULL,
   fail_reason TEXT NULL, audio_path TEXT NULL,
@@ -248,6 +246,18 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF transcript, corrected_t
     VALUES (new.rowid, new.transcript, new.corrected_text);
 END;
 ";
+
+/// `Unknown-N|label|day` → `Unknown-N|day`. Anything else (already
+/// short, or a foreign shape) is left alone — returns `None`.
+fn short_speaker_key(key: &str) -> Option<String> {
+    let mut parts = key.split('|');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(n), Some(_label), Some(day), None) if n.starts_with("Unknown-") => {
+            Some(format!("{n}|{day}"))
+        }
+        _ => None,
+    }
+}
 
 /// Escape user input for a LIKE pattern: an unescaped `%` matches
 /// everything, `_` matches any char, and a bare `\` escapes the next
@@ -377,6 +387,15 @@ impl Store {
                     .with_context(|| format!("cannot migrate column {col}"))?;
             }
         }
+        // Label deletion: a pre-deletion file still carries `freq_label`
+        // on messages, `Unknown-N|label|day` speaker keys, label
+        // namespaced sequence counters, and possibly junk aliases
+        // learned before the national gate. All of it goes here, once.
+        if cols.iter().any(|c| c == "freq_label") {
+            conn.execute_batch("ALTER TABLE messages DROP COLUMN freq_label")
+                .context("cannot drop freq_label")?;
+        }
+        Self::strip_speaker_key_labels(conn)?;
         // FTS index: virtual tables cannot be ALTERed, so an older
         // single-column index is dropped outright (its content lives in
         // `messages`; the schema batch recreates the two-column index and
@@ -459,17 +478,16 @@ impl Store {
     pub fn insert(&self, m: &NewMessage) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex");
         conn.execute(
-            "INSERT INTO messages(id,ts_start,ts_end,freq_label,lang,lang_conf,
+            "INSERT INTO messages(id,ts_start,ts_end,lang,lang_conf,
               transcript,stt_conf,conf_flag,status,fail_reason,audio_path,
               duration_ms,size_bytes,short_flag,group_id,seq,
               sender_callsign,sender_name,sender_source,alert,speaker_key,
               corrected_text)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             rusqlite::params![
                 m.id,
                 m.ts_start_ms as i64,
                 m.ts_end_ms as i64,
-                m.freq_label,
                 m.lang,
                 m.lang_conf,
                 m.transcript,
@@ -509,12 +527,12 @@ impl Store {
     pub fn upsert(&self, m: &NewMessage) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex");
         conn.execute(
-            "INSERT INTO messages(id,ts_start,ts_end,freq_label,lang,lang_conf,
+            "INSERT INTO messages(id,ts_start,ts_end,lang,lang_conf,
               transcript,stt_conf,conf_flag,status,fail_reason,audio_path,
               duration_ms,size_bytes,short_flag,group_id,seq,
               sender_callsign,sender_name,sender_source,alert,speaker_key,
               corrected_text)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(id) DO UPDATE SET
               ts_end=excluded.ts_end, lang=excluded.lang,
               lang_conf=excluded.lang_conf, transcript=excluded.transcript,
@@ -540,7 +558,6 @@ impl Store {
                 m.id,
                 m.ts_start_ms as i64,
                 m.ts_end_ms as i64,
-                m.freq_label,
                 m.lang,
                 m.lang_conf,
                 m.transcript,
@@ -773,11 +790,104 @@ impl Store {
             .context("cannot read regulars")
     }
 
-    /// Allocate the next per-day speaker number for a label
-    /// (`speaker_seq_{label}_{day}`); never reused within the store.
-    pub fn alloc_speaker_n(&self, label: &str, day: &str) -> Result<u32> {
+    /// One-shot label cleanup for pre-deletion files. `Unknown-N|label|day`
+    /// keys become `Unknown-N|day` on messages and aliases; label
+    /// sequence counters go away; aliases no administration could have
+    /// issued (junk learned before the national gate) are purged.
+    /// Idempotent: reruns find no three-segment keys, no label counters
+    /// (new counters are day-digits only), and no junk aliases left.
+    fn strip_speaker_key_labels(conn: &Connection) -> Result<()> {
+        // Very old files predate the alias/settings tables entirely.
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let has = |t: &str| tables.iter().any(|x| x == t);
+        if !has("messages") {
+            return Ok(());
+        }
+        let mut msgs = conn
+            .prepare("SELECT id, speaker_key FROM messages WHERE speaker_key LIKE 'Unknown-%'")?;
+        let rewrites: Vec<(String, String)> = msgs
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<(String, String)>, _>>()?
+            .into_iter()
+            .filter_map(|(id, key)| short_speaker_key(&key).map(|short| (id, short)))
+            .collect();
+        for (id, short) in &rewrites {
+            conn.execute("UPDATE messages SET speaker_key=? WHERE id=?", [short, id])?;
+        }
+        if !has("speaker_alias") {
+            return Ok(());
+        }
+        let mut aliases = conn.prepare("SELECT key FROM speaker_alias")?;
+        let alias_rewrites: Vec<(String, String)> = aliases
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?
+            .into_iter()
+            .filter_map(|key| short_speaker_key(&key).map(|short| (key, short)))
+            .collect();
+        for (old, short) in &alias_rewrites {
+            // Two labels could share a number on one day
+            // (`Unknown-1|A|d` + `Unknown-1|B|d`): keep the more
+            // confident row, never fail the migration on a key clash.
+            let incumbent: Option<f32> = conn
+                .query_row(
+                    "SELECT confidence FROM speaker_alias WHERE key=?",
+                    [short],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let incoming: f32 = conn.query_row(
+                "SELECT confidence FROM speaker_alias WHERE key=?",
+                [old],
+                |r| r.get(0),
+            )?;
+            if incumbent.is_some_and(|c| c >= incoming) {
+                conn.execute("DELETE FROM speaker_alias WHERE key=?", [old])?;
+            } else {
+                if incumbent.is_some() {
+                    conn.execute("DELETE FROM speaker_alias WHERE key=?", [short])?;
+                }
+                conn.execute("UPDATE speaker_alias SET key=? WHERE key=?", [short, old])?;
+            }
+        }
+        // Label counters (`speaker_seq_WX-MARINE_20716`) die; day counters
+        // (`speaker_seq_20716`) survive — the GLOB tells them apart so a
+        // rerun can never reset a live counter and reuse a number.
+        if has("settings") {
+            conn.execute(
+                "DELETE FROM settings WHERE key LIKE 'speaker_seq!_%' ESCAPE '!'\n             AND key NOT GLOB 'speaker_seq_[0-9]*'",
+                [],
+            )
+            .context("cannot drop label sequence counters")?;
+        }
+        // Junk aliases predate the national gate and would otherwise live
+        // forever (nothing revalidates them).
+        let junk: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT key, callsign FROM speaker_alias")?;
+            let rows = stmt.query_map([], |r| {
+                let k: String = r.get(0)?;
+                let cs: String = r.get(1)?;
+                Ok((k, cs))
+            })?;
+            rows.collect::<std::result::Result<Vec<(String, String)>, _>>()?
+                .into_iter()
+                .filter(|(_, cs)| !hamfeed_callsign::national_ok(cs))
+                .map(|(k, _)| k)
+                .collect()
+        };
+        for key in &junk {
+            conn.execute("DELETE FROM speaker_alias WHERE key=?", [key])?;
+        }
+        Ok(())
+    }
+
+    /// Allocate the next per-day speaker number
+    /// (`speaker_seq_{day}`); never reused within the store.
+    pub fn alloc_speaker_n(&self, day: &str) -> Result<u32> {
         let conn = self.conn.lock().expect("store mutex");
-        let key = format!("speaker_seq_{label}_{day}");
+        let key = format!("speaker_seq_{day}");
         let cur: Option<String> = conn
             .query_row("SELECT value FROM settings WHERE key=?", [&key], |r| {
                 r.get(0)
@@ -1169,7 +1279,6 @@ fn row_to_msg(r: &rusqlite::Row) -> rusqlite::Result<Message> {
         id: r.get("id")?,
         ts_start_ms: r.get::<_, i64>("ts_start")? as u64,
         ts_end_ms: r.get::<_, i64>("ts_end")? as u64,
-        freq_label: r.get("freq_label")?,
         lang: r.get("lang")?,
         lang_conf: r.get("lang_conf")?,
         transcript: r.get("transcript")?,
@@ -1231,7 +1340,6 @@ pub mod testutil {
                     id: id.into(),
                     ts_start_ms: ts,
                     ts_end_ms: ts + 500,
-                    freq_label: "TEST".into(),
                     lang: lang.into(),
                     lang_conf: 0.9,
                     transcript: text.into(),
@@ -1387,7 +1495,6 @@ mod tests {
                     id: id.into(),
                     ts_start_ms: 1_000,
                     ts_end_ms: 1_000 + dur_ms,
-                    freq_label: "TEST".into(),
                     lang: "fr".into(),
                     lang_conf: 0.9,
                     transcript: text.into(),
@@ -1552,7 +1659,6 @@ mod tests {
                 id: msg.id.clone(),
                 ts_start_ms: msg.ts_start_ms,
                 ts_end_ms: msg.ts_end_ms,
-                freq_label: msg.freq_label.clone(),
                 lang: "en".into(),
                 lang_conf: 1.0,
                 transcript: "late re-transcription".into(),
@@ -1634,7 +1740,6 @@ mod tests {
             id: id.into(),
             ts_start_ms: ts,
             ts_end_ms: ts + 500,
-            freq_label: "TEST".into(),
             lang: "fr".into(),
             lang_conf: 0.9,
             transcript: "ici VE2DEM".into(),
@@ -1881,11 +1986,112 @@ mod tests {
     #[test]
     fn alloc_never_reuses() {
         let store = Store::open_memory().unwrap();
-        assert_eq!(store.alloc_speaker_n("TEST", "2026-09-16").unwrap(), 1);
-        assert_eq!(store.alloc_speaker_n("TEST", "2026-09-16").unwrap(), 2);
+        assert_eq!(store.alloc_speaker_n("2026-09-16").unwrap(), 1);
+        assert_eq!(store.alloc_speaker_n("2026-09-16").unwrap(), 2);
         // A new day starts over; the old day's numbers are never re-minted.
-        assert_eq!(store.alloc_speaker_n("TEST", "2026-09-17").unwrap(), 1);
-        assert_eq!(store.alloc_speaker_n("TEST", "2026-09-16").unwrap(), 3);
+        assert_eq!(store.alloc_speaker_n("2026-09-17").unwrap(), 1);
+        assert_eq!(store.alloc_speaker_n("2026-09-16").unwrap(), 3);
+    }
+
+    #[test]
+    fn migrate_drops_label_and_rewrites_keys() {
+        // A pre-deletion file: freq_label column, three-segment speaker
+        // keys, label sequence counters, one junk alias, and a key
+        // collision across labels. Open must delete every trace.
+        let dir = std::env::temp_dir().join(format!("hamfeed-miglabel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages(
+                   id TEXT PRIMARY KEY, ts_start INT NOT NULL, ts_end INT NOT NULL,
+                   freq_label TEXT NOT NULL, lang TEXT NOT NULL, lang_conf REAL NOT NULL,
+                   transcript TEXT NOT NULL, stt_conf REAL NOT NULL,
+                   conf_flag TEXT NOT NULL, status TEXT NOT NULL,
+                   fail_reason TEXT NULL, audio_path TEXT NULL,
+                   audio_purged BOOL NOT NULL DEFAULT 0,
+                   duration_ms INT NULL, size_bytes INT NULL,
+                   short_flag BOOL NOT NULL DEFAULT 0,
+                   group_id TEXT NOT NULL, seq INT NOT NULL,
+                   review_flag TEXT NOT NULL DEFAULT 'none', flag_reason TEXT NULL,
+                   sender_callsign TEXT NULL, sender_name TEXT NULL,
+                   sender_source TEXT NOT NULL DEFAULT 'none',
+                   alert INT NOT NULL DEFAULT 0,
+                   speaker_key TEXT NULL, corrected_text TEXT NULL);
+                 CREATE TABLE speaker_alias(
+                   key TEXT PRIMARY KEY, callsign TEXT NOT NULL,
+                   confidence REAL NOT NULL, updated_ts INT NOT NULL);
+                 CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages(id,ts_start,ts_end,freq_label,lang,lang_conf,
+                 transcript,stt_conf,conf_flag,status,group_id,seq,speaker_key)
+                 VALUES('m1',1000,1500,'WX-MARINE','fr',0.9,'bonjour',0.8,'ok','ok',
+                 'g',0,'Unknown-7|WX-MARINE|20716')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO speaker_alias(key,callsign,confidence,updated_ts)
+                 VALUES('Unknown-7|WX-MARINE|20716','VE2DEM',1.0,1000),
+                        ('Unknown-1|A|20716','VE2DEM',0.6,1000),
+                        ('Unknown-1|B|20716','VE2ABC',0.9,1000),
+                        ('Unknown-9|WX-MARINE|20716','V2CSQ',1.0,1000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO settings(key,value)
+                 VALUES('speaker_seq_WX-MARINE_20716','44'),('active_profile','Normal')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        // Column gone.
+        let cols: Vec<String> = store
+            .conn
+            .lock()
+            .expect("store mutex")
+            .prepare("PRAGMA table_info(messages)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(!cols.iter().any(|c| c == "freq_label"));
+        // Keys shortened on messages and aliases.
+        let m = store.get("m1").unwrap().expect("old row readable");
+        assert_eq!(m.speaker_key.as_deref(), Some("Unknown-7|20716"));
+        assert_eq!(
+            store.get_alias("Unknown-7|20716").unwrap(),
+            Some(("VE2DEM".to_string(), 1.0))
+        );
+        // Collision keeps the more confident row.
+        assert_eq!(
+            store.get_alias("Unknown-1|20716").unwrap(),
+            Some(("VE2ABC".to_string(), 0.9))
+        );
+        // Junk alias purged (V2CSQ was never issuable).
+        assert_eq!(store.get_alias("Unknown-9|20716").unwrap(), None);
+        // Label counter gone, unrelated settings survive, and the live
+        // day counter still allocates from 1 (no stale state).
+        let left: Vec<String> = store
+            .conn
+            .lock()
+            .expect("store mutex")
+            .prepare("SELECT key FROM settings ORDER BY key")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, vec!["active_profile".to_string()]);
+        assert_eq!(store.alloc_speaker_n("20716").unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2123,7 +2329,6 @@ mod tests {
             id: id.into(),
             ts_start_ms: 1000,
             ts_end_ms: 1500,
-            freq_label: "TEST".into(),
             lang: "en".into(),
             lang_conf: 0.9,
             transcript: transcript.into(),

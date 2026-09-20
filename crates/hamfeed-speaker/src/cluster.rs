@@ -3,8 +3,8 @@
 //! Greedy nearest-prototype matcher: the nearest proto with cosine ≥
 //! threshold wins (and absorbs the frame into its L2-normalized running
 //! mean); otherwise a fresh persisted N is minted via the caller-supplied
-//! `alloc` closure (`|| store.alloc_speaker_n(label, day)` at the
-//! pipeline call site).
+//! `alloc` closure (`|| store.alloc_speaker_n(day)` at the pipeline
+//! call site).
 
 /// Greedy nearest-proto clusterer over one window (group).
 #[derive(Debug, Default)]

@@ -7,3 +7,4 @@ edition.workspace = true
 anyhow.workspace = true
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 serde_json.workspace = true
+hamfeed-callsign = { path = "../hamfeed-callsign" }

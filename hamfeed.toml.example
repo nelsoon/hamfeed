@@ -41,7 +41,6 @@ retention_days = 90
 delete_audio_on_drop = false
 
 [station]
-freq_label = "REPEATER-XXX.XXX"
 # Your own callsign: messages addressed to it raise a for-you notification.
 # Spelled forms ("Victor Echo 2 ...") are derived automatically.
 # my_callsign = "VE2XXX"

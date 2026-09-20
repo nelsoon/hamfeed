@@ -44,7 +44,6 @@ impl AppState {
 pub struct ApiMessage {
     pub id: String,
     pub ts_start_ms: u64,
-    pub freq_label: String,
     pub lang: String,
     pub lang_conf: f64,
     pub transcript: String,
@@ -101,7 +100,6 @@ impl ApiMessage {
         Self {
             id: m.id.clone(),
             ts_start_ms: m.ts_start_ms,
-            freq_label: m.freq_label.clone(),
             lang: m.lang.clone(),
             lang_conf: m.lang_conf,
             transcript: m.transcript.clone(),
@@ -815,7 +813,6 @@ dir = "{}"
 db_path = "{}"
 retention_days = 90
 [station]
-freq_label = "TEST"
 "#,
             test_model().display(),
             dir.join("audio").display(),
@@ -1455,7 +1452,6 @@ freq_label = "TEST"
                     id: "m-alert".into(),
                     ts_start_ms: 9500,
                     ts_end_ms: 10000,
-                    freq_label: "TEST".into(),
                     lang: "en".into(),
                     lang_conf: 0.9,
                     transcript: "Mayday, mayday".into(),

@@ -85,7 +85,7 @@ impl VoiceState {
     }
 
     /// Per-segment speaker gate: long enough AND not failed → embed →
-    /// assign → `Unknown-N|label|day` key; else `None` (short blips,
+    /// assign → `Unknown-N|day` key; else `None` (short blips,
     /// failed rows, and voice-off builds stay keyless).
     #[allow(clippy::too_many_arguments)]
     fn key_for(
@@ -94,7 +94,6 @@ impl VoiceState {
         pcm: &[i16],
         duration_ms: u64,
         status: &str,
-        freq_label: &str,
         day: &str,
         min_embed_s: f32,
         seg_id: &str,
@@ -112,7 +111,7 @@ impl VoiceState {
             match emb.embed(pcm) {
                 Ok(vec) => {
                     let mut alloc_failed = false;
-                    let mut alloc = || match store.alloc_speaker_n(freq_label, day) {
+                    let mut alloc = || match store.alloc_speaker_n(day) {
                         Ok(n) => n,
                         Err(err) => {
                             eprintln!("pipeline: alloc_speaker_n failed: {err}");
@@ -122,12 +121,7 @@ impl VoiceState {
                     };
                     let (n, _is_new) = self.clusterer.assign(&vec, &mut alloc);
                     if !alloc_failed && n != 0 {
-                        return Some(format!(
-                            "{}|{}|{}",
-                            Clusterer::label(n),
-                            freq_label.replace('|', "-"),
-                            day
-                        ));
+                        return Some(format!("{}|{}", Clusterer::label(n), day));
                     }
                     None
                 }
@@ -139,7 +133,7 @@ impl VoiceState {
         }
         #[cfg(not(feature = "voice"))]
         {
-            let _ = (store, pcm, freq_label, day, seg_id);
+            let _ = (store, pcm, day, seg_id);
             None
         }
     }
@@ -754,7 +748,6 @@ impl Pipeline {
                         &decode_for_voice(&item.audio_path),
                         item.duration_ms,
                         "ok",
-                        &self.cfg.station.freq_label,
                         &day_of(item.ts_start_ms),
                         self.cfg.voiceprint.min_embed_s,
                         &item.id,
@@ -825,7 +818,6 @@ impl Pipeline {
                     id: item.id.clone(),
                     ts_start_ms: item.ts_start_ms,
                     ts_end_ms: item.ts_start_ms + item.duration_ms,
-                    freq_label: self.cfg.station.freq_label.clone(),
                     lang: out.lang,
                     lang_conf: out.lang_conf,
                     transcript,
@@ -853,7 +845,6 @@ impl Pipeline {
                 id: item.id.clone(),
                 ts_start_ms: item.ts_start_ms,
                 ts_end_ms: item.ts_start_ms + item.duration_ms,
-                freq_label: self.cfg.station.freq_label.clone(),
                 lang: LANG_UNKNOWN.into(),
                 lang_conf: 0.0,
                 transcript: String::new(),
@@ -932,7 +923,6 @@ impl Pipeline {
             id: uuid::Uuid::new_v4().to_string(),
             ts_start_ms: now,
             ts_end_ms: now,
-            freq_label: self.cfg.station.freq_label.clone(),
             lang: LANG_UNKNOWN.into(),
             lang_conf: 0.0,
             transcript: format!("system notice: {notice}"),
@@ -1115,7 +1105,6 @@ db_path = "{}"
 retention_days = 90
 delete_audio_on_drop = false
 [station]
-freq_label = "TEST"
 "#,
             model.display(),
             dir.join("audio").display(),
@@ -1593,7 +1582,6 @@ freq_label = "TEST"
             id: id.into(),
             ts_start_ms: 1000,
             ts_end_ms: 1500,
-            freq_label: "TEST".into(),
             lang: "fr".into(),
             lang_conf: 0.9,
             transcript: "bonjour".into(),
@@ -1627,7 +1615,6 @@ freq_label = "TEST"
                 &vec![0i16; 32000],
                 500,
                 "ok",
-                "TEST",
                 "1",
                 1.5,
                 "s1"
@@ -1641,7 +1628,6 @@ freq_label = "TEST"
                 &vec![0i16; 96000],
                 6000,
                 "failed",
-                "TEST",
                 "1",
                 1.5,
                 "s2"

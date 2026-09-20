@@ -47,9 +47,7 @@
       ? "failed"
       : esc(m.conf_flag) + " · " + Number(m.stt_conf).toFixed(2);
     var body = "";
-    // No source tag: single receiver, and the label carries no meaning
-    // for the reader (a future channel concept, if any, will be designed
-    // separately — not resurrected from freq_label).
+    // No source tag: single receiver, nothing to distinguish.
     body += '<div class="card-head"><span class="ts">' + fmtTs(m.ts_start_ms) +
       '</span><span class="dur">' + fmtDur(m.duration_ms) + "</span></div>";
     // Alert banners (Slice 2): emergency wins when both bits are set.

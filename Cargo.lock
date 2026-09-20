@@ -787,6 +787,7 @@ name = "hamfeed-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hamfeed-callsign",
  "rusqlite",
  "serde_json",
 ]
