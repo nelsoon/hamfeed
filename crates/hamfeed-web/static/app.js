@@ -98,6 +98,10 @@
     }
     body += '<div class="foot"><span class="badge lang">' + esc(m.lang) +
       '</span><span class="badge ' + conf + '">' + confText + "</span>";
+    if (m.noise) {
+      body += '<span class="badge noise" title="Hidden when hide-noise is on">' +
+        "noise · " + esc(m.noise) + "</span>";
+    }
     if (m.sender_callsign) {
       var who = esc(m.sender_callsign) +
         (m.sender_name ? " · " + esc(m.sender_name) : "");
@@ -250,10 +254,29 @@
     else feed.prepend(fresh);
   }
 
-  async function loadMore() {
+  // hide-noise is a view rule, not a search option: every live fetch
+  // carries it when the box is checked, so the feed opens filtered.
+  function hideNoiseOn() {
+    return document.getElementById("hidenoise").checked;
+  }
+
+  function liveParams() {
     var params = new URLSearchParams({ limit: "20" });
-    if (cursor) params.set("cursor", cursor);
-    var url = searching ? "/api/search?" + searchParams(params) : "/api/messages?" + params;
+    if (hideNoiseOn()) params.set("hide_noise", "true");
+    return params;
+  }
+
+  async function loadMore() {
+    var url;
+    if (searching) {
+      var params = new URLSearchParams({ limit: "20" });
+      if (cursor) params.set("cursor", cursor);
+      url = "/api/search?" + searchParams(params);
+    } else {
+      var live = liveParams();
+      if (cursor) live.set("cursor", cursor);
+      url = "/api/messages?" + live;
+    }
     var res = await fetch(url);
     if (!res.ok) return;
     var page = await res.json();
@@ -296,6 +319,24 @@
     feed.innerHTML = "";
     loadMore();
   });
+  // Toggling the checkbox reloads the current view at once (live feed or
+  // running search) — the box always shows what the feed holds.
+  document.getElementById("hidenoise").addEventListener("change", function () {
+    pendingNew = 0;
+    jumpPill.style.display = "none";
+    cursor = null;
+    feed.innerHTML = "";
+    loadMore();
+  });
+  // Enter in any filter field runs the search: no mouse round-trip.
+  ["q", "sender", "from", "to"].forEach(function (id) {
+    document.getElementById(id).addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        document.getElementById("apply").click();
+      }
+    });
+  });
   moreBtn.addEventListener("click", loadMore);
   pauseBtn.addEventListener("click", function () {
     paused = !paused;
@@ -314,7 +355,7 @@
   });
 
   async function refreshNewest() {
-    var res = await fetch("/api/messages?limit=20");
+    var res = await fetch("/api/messages?" + liveParams());
     if (!res.ok) return;
     var page = await res.json();
     feed.innerHTML = "";
@@ -436,6 +477,16 @@
     // Profile-switch broadcasts carry no card: refresh the banner instead
     // of feeding them to the card renderer (no id, no transcript).
     if (m && m.profile && !m.id) { refreshProfile(); return; }
+    // Noise stays out of a hidden feed even when it arrives live.
+    if (m.noise && hideNoiseOn()) return;
+    if (searching) {
+      // A search is a snapshot: live arrivals wait behind the pill instead
+      // of mixing into the filtered results.
+      pendingNew++;
+      jumpPill.textContent = pendingNew + " new — show latest";
+      jumpPill.style.display = "";
+      return;
+    }
     if (paused || window.scrollY > 400) {
       pendingNew++;
       jumpPill.textContent = pendingNew + " new — show latest";
