@@ -42,13 +42,57 @@ const NOISE_BOILER: &[&str] = &[
     "soirée",
 ];
 
-/// True when a transcript holds no speech content: only bracketed
-/// non-speech tags, sign-off boilerplate, filler, and punctuation.
-/// Conservative by construction — a single content word keeps the row,
-/// so weak-signal fragments and hallucinations with word-shape stay
-/// visible (indistinguishable from real speech, honestly shown).
-pub fn transcript_is_noise_text(text: &str) -> bool {
-    let mut stripped = String::with_capacity(text.len());
+/// Whisper's French subtitle hallucinations (`Sous-titrage Société
+/// Radio-Canada`, variants, and the truncated repeater-ID form
+/// `Sous-titrage ST' 501`): emitted over silence/beeps/noise, never
+/// spoken. Matching is accent/case/separator-insensitive; the
+/// `sous-titr*` prefix is required so a real mention of the broadcaster
+/// stays content.
+fn flatten_tags(text: &str) -> String {
+    let folded = hamfeed_callsign::fold(text);
+    let sep_free: String = folded
+        .chars()
+        .map(|c| {
+            if c == '-' || c == '\'' || c == '’' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    sep_free.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Hallucination phrases, flattened (see `flatten_tags`).
+const HALLUCINATION_PHRASES: &[&str] = &[
+    "sous titrage societe radio canada",
+    "sous titres societe radio canada",
+    "sous titrage st 501",
+    "sous titres st 501",
+];
+
+pub fn has_hallucination_tag(text: &str) -> bool {
+    let flat = flatten_tags(text);
+    HALLUCINATION_PHRASES.iter().any(|p| flat.contains(p))
+}
+
+/// Hallucination phrases as token runs (matches `flatten_tags` output
+/// token-for-token: folding lowercases and separators already split).
+fn hallucination_runs() -> Vec<Vec<&'static str>> {
+    HALLUCINATION_PHRASES
+        .iter()
+        .map(|p| p.split(' ').collect())
+        .collect()
+}
+
+/// Content tokens in original case: bracketed spans removed, then any
+/// token run matching a hallucination phrase skipped. Case is
+/// preserved (not folded) because the salad check needs original
+/// case — folding everything first is what would let `ABCXY` pass
+/// as a lowercase word.
+fn content_tokens(text: &str) -> Vec<String> {
+    // Bracket spans out (original case kept).
+    let mut debracket = String::with_capacity(text.len());
     let mut depth = 0u32;
     for c in text.chars() {
         if c == '[' {
@@ -56,24 +100,95 @@ pub fn transcript_is_noise_text(text: &str) -> bool {
         } else if c == ']' {
             depth = depth.saturating_sub(1);
         } else if depth == 0 {
-            stripped.push(c);
+            debracket.push(c);
         }
     }
-    let mut any_content = false;
-    let mut any_token = false;
-    for tok in stripped.split(|c: char| !c.is_alphanumeric()) {
-        if tok.is_empty() {
-            continue;
+    let toks: Vec<&str> = debracket
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let folded: Vec<String> = toks.iter().map(|t| hamfeed_callsign::fold(t)).collect();
+    let runs = hallucination_runs();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let mut skip = 0;
+        for run in &runs {
+            if run
+                .iter()
+                .enumerate()
+                .all(|(k, w)| folded.get(i + k).is_some_and(|f| f == w))
+            {
+                skip = run.len();
+                break;
+            }
         }
-        any_token = true;
+        if skip > 0 {
+            i += skip;
+        } else {
+            out.push(toks[i].to_string());
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Tone-junk token: whisper rendering a beep/CW-ID/squelch crash as
+/// 2–6 uppercase letters (`ABCXY`, `GHI`). Real words are never
+/// all-caps in transcripts; callsigns, Q-codes, and CQ/QRZ are
+/// procedure content and exempt. Letters-only on purpose: mixed
+/// letter-digit runs (`V12CRS`) are garbled-but-real callsign shapes
+/// and stay visible for attribution.
+fn is_salad_token(tok: &str) -> bool {
+    let len = tok.chars().count();
+    if !(2..=6).contains(&len) {
+        return false;
+    }
+    if !tok.chars().all(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    let norm = hamfeed_callsign::normalize(tok);
+    if hamfeed_callsign::is_valid(&norm) || hamfeed_callsign::is_qcode(&norm) {
+        return false;
+    }
+    !matches!(norm.as_str(), "CQ" | "QRZ")
+}
+
+/// True when a transcript holds no speech content: only bracketed
+/// non-speech tags, subtitle hallucinations, sign-off boilerplate,
+/// filler, digits, tone-junk salad, and punctuation.
+/// Conservative by construction — a single lowercase content word keeps
+/// the row, so weak-signal fragments and name-like hallucinations stay
+/// visible (indistinguishable from real speech, honestly shown). What
+/// the salad rule catches is narrower: every content token all-caps
+/// with no callsign among them, the shape whisper emits for beeps,
+/// CW-IDs, and crashes (`ABCXY`), never for speech.
+pub fn transcript_is_noise_text(text: &str) -> bool {
+    let mut any_letter = false;
+    let mut content: Vec<String> = Vec::new();
+    for tok in content_tokens(text) {
         let w = tok.to_lowercase();
         if NOISE_FILLER.contains(&w.as_str()) || NOISE_BOILER.contains(&w.as_str()) {
             continue;
         }
-        any_content = true;
-        break;
+        if tok.chars().any(|c| c.is_alphabetic()) {
+            any_letter = true;
+        }
+        content.push(tok);
     }
-    !any_token || !any_content
+    if content.is_empty() {
+        return true;
+    }
+    // Digit runs alone (`12. 13. 13.`, `00`): DTMF/countdown echoes,
+    // never speech content.
+    if !any_letter {
+        return true;
+    }
+    // Letter salad with no callsign: tone-junk shape, never speech.
+    if content.iter().all(|t| is_salad_token(t)) {
+        return true;
+    }
+    false
 }
 
 /// A stored message row (plan data model, Slice 1).
@@ -212,6 +327,14 @@ CREATE TABLE IF NOT EXISTS messages(
 CREATE TABLE IF NOT EXISTS speaker_alias(
   key TEXT PRIMARY KEY, callsign TEXT NOT NULL,
   confidence REAL NOT NULL, updated_ts INT NOT NULL
+);
+-- Persistent voice memory: the latest embedding per voice key, so a
+-- confirm taught on one key still matches the same voice after a
+-- pipeline restart or a UTC-day rollover (keys are day-scoped and the
+-- live clusterer is memory-only). Tiny rows; never pruned for now.
+CREATE TABLE IF NOT EXISTS voiceprints(
+  key TEXT PRIMARY KEY, embedding BLOB NOT NULL,
+  dim INT NOT NULL, updated_ts INT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS profiles(name TEXT PRIMARY KEY, cues TEXT NOT NULL DEFAULT '[]');
@@ -761,6 +884,50 @@ impl Store {
         Ok(())
     }
 
+    /// Persist a voice key's latest embedding (little-endian f32 blob).
+    /// Overwrites unconditionally: the newest sample best tracks voice
+    /// drift, and rows are tiny.
+    pub fn upsert_voiceprint(&self, key: &str, emb: &[f32], updated_ts_ms: u64) -> Result<()> {
+        let mut bytes = Vec::with_capacity(emb.len() * 4);
+        for v in emb {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let conn = self.conn.lock().expect("store mutex");
+        conn.execute(
+            "INSERT INTO voiceprints(key,embedding,dim,updated_ts)
+             VALUES(?,?,?,?)
+             ON CONFLICT(key) DO UPDATE SET
+              embedding=excluded.embedding, dim=excluded.dim,
+              updated_ts=excluded.updated_ts",
+            rusqlite::params![key, bytes, emb.len() as i64, updated_ts_ms as i64],
+        )
+        .with_context(|| format!("cannot upsert voiceprint {key}"))?;
+        Ok(())
+    }
+
+    /// All stored voiceprints: `(key, embedding)`. Corrupt rows
+    /// (byte length not a multiple of 4) are skipped, never fatal.
+    pub fn all_voiceprints(&self) -> Result<Vec<(String, Vec<f32>)>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let mut stmt = conn.prepare("SELECT key, embedding FROM voiceprints")?;
+        let rows = stmt.query_map([], |r| {
+            let key: String = r.get(0)?;
+            let bytes: Vec<u8> = r.get(1)?;
+            Ok((key, bytes))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, bytes) = row?;
+            if bytes.len() % 4 != 0 {
+                continue;
+            }
+            let (chunks, _) = bytes.as_chunks::<4>();
+            let emb: Vec<f32> = chunks.iter().map(|c| f32::from_le_bytes(*c)).collect();
+            out.push((key, emb));
+        }
+        Ok(out)
+    }
+
     /// Look up a voice key's linked callsign, if any.
     pub fn get_alias(&self, key: &str) -> Result<Option<(String, f32)>> {
         let conn = self.conn.lock().expect("store mutex");
@@ -1012,6 +1179,17 @@ impl Store {
         let cutoff = now_ms.saturating_sub(retention_days * 86_400_000) as i64;
         let conn = self.conn.lock().expect("store mutex");
         let n = conn.execute("DELETE FROM speaker_alias WHERE updated_ts < ?", [cutoff])?;
+        Ok(n)
+    }
+
+    /// Drop voiceprints silent longer than the alias retention bound.
+    /// Live voices re-persist on every assignment, so only truly gone
+    /// voices lose rows — and their aliases expired under the same
+    /// bound. Same cutoff, same boot call, no second bound to skew.
+    pub fn purge_voiceprints(&self, retention_days: u64, now_ms: u64) -> Result<usize> {
+        let cutoff = now_ms.saturating_sub(retention_days * 86_400_000) as i64;
+        let conn = self.conn.lock().expect("store mutex");
+        let n = conn.execute("DELETE FROM voiceprints WHERE updated_ts < ?", [cutoff])?;
         Ok(n)
     }
 
@@ -1475,6 +1653,68 @@ mod tests {
             "Yeah.",
             "il pleut",
             "Merci VE2ABC",
+        ] {
+            assert!(!transcript_is_noise_text(t), "{t:?} must stay visible");
+        }
+    }
+
+    #[test]
+    fn subtitle_hallucination_hides_and_flags() {
+        // Whisper's French subtitle boilerplate over silence/noise: the
+        // tag alone is wordless, and its presence marks the decode
+        // unreliable for attribution even beside real words.
+        for t in [
+            "Sous-titrage Société Radio-Canada",
+            "SOUS-TITRES SOCIÉTÉ RADIO-CANADA",
+            "Sous titrage Societe Radio Canada",
+            // Truncated repeater-ID form (prod: bare, with Merci, with
+            // the full tag appended) — same hallucination family.
+            "Sous-titrage ST' 501",
+            "Sous-titrage ST' 501 Merci.",
+            "Sous-titrage ST' 501 Sous-titrage Société Radio-Canada",
+            "00 Sous-titrage Société Radio-Canada",
+        ] {
+            assert!(transcript_is_noise_text(t), "{t:?} must read as noise");
+            assert!(has_hallucination_tag(t), "{t:?} must flag");
+        }
+        // Real speech beside the tag stays visible (tag stripped, words
+        // remain) — but still flags unreliable.
+        let mixed = "Bonjour à tous, sous-titrage Société Radio-Canada";
+        assert!(!transcript_is_noise_text(mixed));
+        assert!(has_hallucination_tag(mixed));
+        // A genuine mention of the broadcaster without the subtitle
+        // prefix is content, not a hallucination.
+        assert!(!has_hallucination_tag("entendu à Radio-Canada hier"));
+        assert!(!has_hallucination_tag("ici VE2DEM, à vous"));
+    }
+
+    /// Tone-junk shapes from prod (beeps/CW-IDs/crashes whisper renders
+    /// as letter salad or digit runs): every content token all-caps
+    /// with no callsign among them is never speech. Single lowercase
+    /// words, garbled callsign shapes, procedure tokens, and names
+    /// stay visible.
+    #[test]
+    fn tone_junk_salad_hides() {
+        // Observed junk: hide.
+        for t in ["ABCXY", "ABCX", "12. 13. 13.", "GHI KLL"] {
+            assert!(transcript_is_noise_text(t), "{t:?} must read as noise");
+        }
+        // Known residual: salad beside a real word stays visible rather
+        // than risk hiding speech (`California` could be spoken).
+        assert!(!transcript_is_noise_text("ABCXY California"));
+        // Real content that shares fragments with junk: visible.
+        for t in [
+            "VE2ABC",              // bare callsign self-ID
+            "V12CRS",              // garbled callsign shape (letters+digits)
+            "E2KSV en fréquence.", // malformed suggestion + real words
+            "CQ",                  // procedure call
+            "QRZ?",                // procedure call
+            "QTH",                 // Q-code
+            "Victor, on a bien l'arrivée.",
+            "What? What?",
+            "Et ça va ! Merci.",
+            "VA2K Juliette Golf. Merci.",
+            "VE2DBA LSA", // real callsign beside salad keeps the row
         ] {
             assert!(!transcript_is_noise_text(t), "{t:?} must stay visible");
         }
@@ -1962,6 +2202,26 @@ mod tests {
             store.get_alias("Unknown-1|x|d").unwrap(),
             Some(("VE3MA".to_string(), 1.0))
         );
+    }
+
+    #[test]
+    fn voiceprint_roundtrip_latest_wins() {
+        let store = Store::open_memory().unwrap();
+        assert!(store.all_voiceprints().unwrap().is_empty());
+        store
+            .upsert_voiceprint("K1", &[0.1, 0.2, 0.3], 1000)
+            .unwrap();
+        store.upsert_voiceprint("K2", &[0.4, 0.5], 2000).unwrap();
+        // Newest sample overwrites: drift tracking, not history.
+        store
+            .upsert_voiceprint("K1", &[0.7, 0.8, 0.9], 3000)
+            .unwrap();
+        let mut got = store.all_voiceprints().unwrap();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "K1");
+        assert_eq!(got[0].1, vec![0.7f32, 0.8, 0.9]);
+        assert_eq!(got[1].1, vec![0.4f32, 0.5]);
     }
 
     #[test]

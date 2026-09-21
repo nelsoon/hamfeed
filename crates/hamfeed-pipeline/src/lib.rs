@@ -61,6 +61,14 @@ pub struct VoiceState {
     last_group_id: String,
     #[cfg(feature = "voice")]
     embedder: Option<Embedder>,
+    /// Cosine threshold for both clustering and persistent-memory
+    /// fallback matching (same bar live and across restarts).
+    match_threshold: f32,
+    /// Persisted voiceprints `(key, embedding)`, loaded from the store
+    /// at startup and refreshed on every assignment. The live
+    /// clusterer is memory-only; these survive restarts and day
+    /// rollovers so confirms keep matching the same voice.
+    prints: Vec<(String, Vec<f32>)>,
 }
 
 impl VoiceState {
@@ -71,6 +79,50 @@ impl VoiceState {
             last_group_id: String::new(),
             #[cfg(feature = "voice")]
             embedder,
+            match_threshold: threshold,
+            prints: Vec::new(),
+        }
+    }
+
+    /// Load persisted voiceprints (wrong-dim rows skipped — an
+    /// embedder swap must never poison matching).
+    fn load_voiceprints(&mut self, store: &Store) {
+        match store.all_voiceprints() {
+            Ok(rows) => {
+                self.prints = rows
+                    .into_iter()
+                    .filter(|(_, e)| e.len() == hamfeed_speaker::EXPECTED_DIM)
+                    .collect();
+            }
+            Err(err) => eprintln!("pipeline: voiceprint load failed: {err}"),
+        }
+    }
+
+    /// Nearest persisted voiceprint at or above the match threshold:
+    /// `(cosine, key)`. Same bar as live clustering, so a restart
+    /// neither invents nor loses matches.
+    fn nearest_print(&self, emb: &[f32]) -> Option<(f32, String)> {
+        let mut best: Option<(f32, String)> = None;
+        for (key, proto) in &self.prints {
+            let s = hamfeed_speaker::cosine(proto, emb);
+            if s >= self.match_threshold && best.as_ref().is_none_or(|(b, _)| s > *b) {
+                best = Some((s, key.clone()));
+            }
+        }
+        best
+    }
+
+    /// Remember an assignment's embedding, in memory and on disk.
+    /// Voice-only: without the embedder nothing ever assigns.
+    #[cfg(feature = "voice")]
+    fn note_print(&mut self, store: &Store, key: &str, emb: &[f32]) {
+        if let Some(slot) = self.prints.iter_mut().find(|(k, _)| k == key) {
+            slot.1 = emb.to_vec();
+        } else {
+            self.prints.push((key.to_string(), emb.to_vec()));
+        }
+        if let Err(err) = store.upsert_voiceprint(key, emb, now_ms()) {
+            eprintln!("pipeline: voiceprint store failed: {err}");
         }
     }
 
@@ -85,8 +137,10 @@ impl VoiceState {
     }
 
     /// Per-segment speaker gate: long enough AND not failed → embed →
-    /// assign → `Unknown-N|day` key; else `None` (short blips,
-    /// failed rows, and voice-off builds stay keyless).
+    /// assign → `(Unknown-N|day key, normalized embedding)`; else `None`
+    /// (short blips, failed rows, and voice-off builds stay keyless).
+    /// The embedding feeds persistent voice memory (`note_print`) and
+    /// cross-key alias matching (`nearest_print`).
     #[allow(clippy::too_many_arguments)]
     fn key_for(
         &mut self,
@@ -97,7 +151,7 @@ impl VoiceState {
         day: &str,
         min_embed_s: f32,
         seg_id: &str,
-    ) -> Option<String> {
+    ) -> Option<(String, Vec<f32>)> {
         // Float seconds (no float→int truncation at the boundary).
         if (duration_ms as f32) < min_embed_s * 1000.0 {
             return None;
@@ -110,6 +164,11 @@ impl VoiceState {
             let emb = self.embedder.as_ref()?;
             match emb.embed(pcm) {
                 Ok(vec) => {
+                    // Normalize once here (assign re-normalizes
+                    // idempotently) so the persisted voiceprint matches
+                    // what the clusterer actually compared.
+                    let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+                    let normed: Vec<f32> = vec.iter().map(|x| x / norm).collect();
                     let mut alloc_failed = false;
                     let mut alloc = || match store.alloc_speaker_n(day) {
                         Ok(n) => n,
@@ -119,9 +178,11 @@ impl VoiceState {
                             0
                         }
                     };
-                    let (n, _is_new) = self.clusterer.assign(&vec, &mut alloc);
+                    let (n, _is_new) = self.clusterer.assign(&normed, &mut alloc);
                     if !alloc_failed && n != 0 {
-                        return Some(format!("{}|{}", Clusterer::label(n), day));
+                        let key = format!("{}|{}", Clusterer::label(n), day);
+                        self.note_print(store, &key, &normed);
+                        return Some((key, normed));
                     }
                     None
                 }
@@ -258,8 +319,8 @@ pub fn enrich(
     my_callsign: Option<&str>,
     emergency_cues: &[String],
 ) -> Enrichment {
-    // Unit-test path: no voice alias, no regulars — only markers and
-    // the callbook may corroborate.
+    // Unit-test path: no voice alias, no regulars, trusted decode —
+    // only markers and the callbook may corroborate.
     enrich_profiled(
         transcript,
         lang,
@@ -270,7 +331,24 @@ pub fn enrich(
         &[],
         None,
         &|_| false,
+        false,
     )
+}
+
+/// Suffix letters after the first digit of a normalized callsign
+/// (`VE2ABC` → 3, `VE2V` → 1). Issued Québec calls carry at least two;
+/// a shorter tail on a marker pick is a dropped-decode truncation.
+fn suffix_letters(normalized: &str) -> usize {
+    let mut seen_digit = false;
+    let mut n = 0;
+    for c in normalized.chars() {
+        if c.is_ascii_digit() {
+            seen_digit = true;
+        } else if seen_digit && c.is_ascii_alphabetic() {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Speaker attribution from QSO self-ID conventions (FR+EN). Only
@@ -352,7 +430,12 @@ fn pick_sender<'h>(
 /// fuzzy hit becomes `suggested` (one-tap confirm in the UI) instead
 /// of a confident wrong badge; silence (`none`) still beats a guess.
 /// `alias_cs` is the voice-alias callsign for this clip, if any;
-/// `is_regular` tests repeater-regular membership.
+/// `is_regular` tests repeater-regular membership; `unreliable` marks
+/// a decode carrying hallucination boilerplate (subtitle tags), where
+/// even a suggestion would ask the operator to confirm garbage.
+/// Two distrust rules: an unreliable decode withholds lone picks
+/// entirely, and a voice alias naming someone else vetoes every
+/// non-marker pick (explicit self-IDs still outrank a stale alias).
 #[allow(clippy::too_many_arguments)]
 pub fn enrich_profiled(
     transcript: &str,
@@ -364,6 +447,7 @@ pub fn enrich_profiled(
     disaster_cues: &[String],
     alias_cs: Option<&str>,
     is_regular: &dyn Fn(&str) -> bool,
+    unreliable: bool,
 ) -> Enrichment {
     let mut alert = 0;
     if let Some(mine) = my_callsign {
@@ -411,8 +495,29 @@ pub fn enrich_profiled(
         // Corroboration votes for the (possibly repaired) candidate.
         let known = lookup(&cs).is_some();
         let voice = alias_cs == Some(cs.as_str());
-        let source = if marker || known || voice || is_regular(&cs) {
+        let conflict = alias_cs.is_some() && !voice;
+        if conflict && !marker {
+            // The voice says someone else and nothing explicit was
+            // spoken: withhold entirely, transcript and alerts stand.
+            let mut e = Enrichment::none();
+            e.alert = alert;
+            return e;
+        }
+        // Truncated decode: a marker-picked callsign with fewer than two
+        // suffix letters (`VE2V`) is a whisper-dropped tail, not an
+        // issued call — the prod VE2V case badged a callsign the
+        // callbook never issued. Any other corroboration (callbook,
+        // voice alias, regular) still badges it heard; otherwise the
+        // marker alone only earns a suggestion, never a badge.
+        let truncated = marker && suffix_letters(&cs) < 2 && !known && !voice && !is_regular(&cs);
+        let source = if (marker && !truncated) || known || voice || is_regular(&cs) {
             "heard"
+        } else if unreliable {
+            // Hallucinated decode: a lone pick is not even worth a
+            // suggestion — confirming garbage teaches garbage.
+            let mut e = Enrichment::none();
+            e.alert = alert;
+            return e;
         } else {
             // Lone fuzzy hit: suggest for one-tap confirm, never badge.
             "suggested"
@@ -611,7 +716,8 @@ impl Pipeline {
 
     /// Boot recovery: replay spilled rows into the queue, oldest first, and
     /// leave a system gap marker when anything was recovered (S9). Also
-    /// purges expired voice aliases (R4 library bound).
+    /// purges expired voice aliases (R4 library bound) and reloads
+    /// persistent voice memory so confirms survive restarts.
     pub fn startup_recovery(&self) -> Result<usize> {
         let purged = self
             .store
@@ -619,6 +725,16 @@ impl Pipeline {
         if purged > 0 {
             eprintln!("voice: purged {purged} expired voice alias(es)");
         }
+        let purged_prints = self
+            .store
+            .purge_voiceprints(self.cfg.voiceprint.retention_days, now_ms())?;
+        if purged_prints > 0 {
+            eprintln!("voice: purged {purged_prints} expired voiceprint(s)");
+        }
+        self.voice
+            .lock()
+            .expect("voice mutex")
+            .load_voiceprints(&self.store);
         let items = self.spill.replay_items()?;
         let n = items.len();
         for item in items {
@@ -681,21 +797,40 @@ impl Pipeline {
     /// Past-window voice suggestion (S7): a stored alias for this key at
     /// or above the suggestion confidence becomes a `suggested` sender,
     /// awaiting confirm/correct. Never auto-links — the operator decides.
-    fn suggest_from_voice(&self, speaker_key: &str) -> Option<Enrichment> {
-        let (callsign, conf) = self.store.get_alias(speaker_key).ok()??;
-        if conf < self.cfg.voiceprint.suggest_min_conf {
+    /// `emb` is the clip's own embedding, when voice ran: when the
+    /// exact key has no alias (restart, day rollover), the nearest
+    /// persisted voiceprint with an alias still matches the same voice.
+    fn suggest_from_voice(&self, speaker_key: &str, emb: Option<&[f32]>) -> Option<Enrichment> {
+        if let Some(hit) = self.store.get_alias(speaker_key).ok()? {
+            if let Some(e) = self.suggest_alias(speaker_key, &hit) {
+                return Some(e);
+            }
+        }
+        // Persistent-memory fallback: same voice, different key.
+        let emb = emb?;
+        let v = self.voice.lock().expect("voice mutex");
+        let (_, key) = v.nearest_print(emb)?;
+        let hit = self.store.get_alias(&key).ok()??;
+        drop(v);
+        self.suggest_alias(speaker_key, &hit)
+    }
+
+    /// Build a `suggested` enrichment from an alias hit, gated on
+    /// suggestion confidence and national plannability. Junk learned
+    /// before the national gate (e.g. `V2CSQ`) never surfaces.
+    fn suggest_alias(&self, speaker_key: &str, hit: &(String, f32)) -> Option<Enrichment> {
+        let (callsign, conf) = hit;
+        if *conf < self.cfg.voiceprint.suggest_min_conf {
             return None;
         }
-        // Junk learned before the national gate (e.g. `V2CSQ`) must
-        // never surface as a suggestion.
-        if !hamfeed_callsign::national_ok(&callsign) {
+        if !hamfeed_callsign::national_ok(callsign) {
             return None;
         }
         Some(Enrichment {
             sender_callsign: Some(callsign.clone()),
             sender_name: self
                 .callbook
-                .lookup(&callsign)
+                .lookup(callsign)
                 .ok()
                 .flatten()
                 .map(|c| c.name),
@@ -740,7 +875,7 @@ impl Pipeline {
                 // guard for the whole voice block (same sequential order
                 // the single worker always had); group keys are cloned
                 // out for the link step below.
-                let (speaker_key, group_keys) = {
+                let (speaker_key, speaker_emb, group_keys) = {
                     let mut v = self.voice.lock().expect("voice mutex");
                     v.roll_window(&item.group_id);
                     let k = v.key_for(
@@ -752,10 +887,11 @@ impl Pipeline {
                         self.cfg.voiceprint.min_embed_s,
                         &item.id,
                     );
-                    if let Some(kk) = &k {
+                    if let Some((kk, _)) = &k {
                         v.group_keys.push((kk.clone(), item.ts_start_ms));
                     }
-                    (k, v.group_keys.clone())
+                    let (k, e) = k.unzip();
+                    (k, e, v.group_keys.clone())
                 };
                 // Active profile cues per segment: always fresh across the
                 // web/pipeline handles with no cache to invalidate. A failed
@@ -776,6 +912,10 @@ impl Pipeline {
                 // Repeater regulars: callsigns this receiver actually
                 // hears. A degraded query degrades to no vote, never louder.
                 let regulars = self.store.regulars(2).unwrap_or_default();
+                // Hallucinated decodes (subtitle boilerplate) lose the
+                // right to suggest: lone picks are withheld, corroborated
+                // paths stand.
+                let unreliable = hamfeed_store::has_hallucination_tag(&transcript);
                 let mut e = enrich_profiled(
                     &transcript,
                     &out.lang,
@@ -786,6 +926,7 @@ impl Pipeline {
                     &disaster_cues,
                     alias_cs.as_deref(),
                     &|cs| regulars.iter().any(|r| r == cs),
+                    unreliable,
                 );
                 e.speaker_key = speaker_key.clone();
                 // A heard self-ID refreshes the carry window (R2) and
@@ -806,10 +947,11 @@ impl Pipeline {
                         );
                     }
                 }
-                // Carry expired and nothing heard: ask the voice library.
+                // Carry expired and nothing heard: ask the voice library
+                // (exact key, else persistent-memory voiceprint match).
                 if e.sender_source == "none" {
                     if let Some(k) = &speaker_key {
-                        if let Some(sugg) = self.suggest_from_voice(k) {
+                        if let Some(sugg) = self.suggest_from_voice(k, speaker_emb.as_deref()) {
                             e = sugg;
                         }
                     }
@@ -1521,6 +1663,7 @@ delete_audio_on_drop = false
             &[],
             None,
             &|cs| cs == "VE2CRS",
+            false,
         );
         assert_eq!(e.sender_source, "heard");
         let e = enrich_profiled(
@@ -1533,6 +1676,7 @@ delete_audio_on_drop = false
             &[],
             Some("VE2CRS"),
             &|_| false,
+            false,
         );
         assert_eq!(e.sender_source, "heard");
         let book = &|cs: &str| (cs == "VE2CRS").then(|| "Op".to_string());
@@ -1540,6 +1684,131 @@ delete_audio_on_drop = false
         assert_eq!(e.sender_source, "heard");
         // And the marker path never needed corroboration.
         let e = enrich("ici VE2CRS", "fr", None, nobook, None, &[]);
+        assert_eq!(e.sender_source, "heard");
+    }
+
+    #[test]
+    fn marker_truncated_callsign_suggests_instead_of_heard() {
+        // Prod VE2V case: whisper dropped the suffix tail (`VE2V`
+        // Roméo Papa) and the `ici` marker badged a callsign no
+        // authority ever issued. A truncated marker pick with no other
+        // corroboration only earns a suggestion; any corroboration —
+        // callbook here — still badges it heard. Full-length marker
+        // picks are unaffected (control).
+        let nobook = &|_: &str| None;
+        let tx = "VE2CRS, ici VE2V";
+        let e = enrich(tx, "fr", None, nobook, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2V"));
+        assert_eq!(e.sender_source, "suggested");
+        let book = &|cs: &str| (cs == "VE2V").then(|| "Op".to_string());
+        let e = enrich(tx, "fr", None, book, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2V"));
+        assert_eq!(e.sender_source, "heard");
+        let e = enrich("ici VE2CRS", "fr", None, nobook, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2CRS"));
+        assert_eq!(e.sender_source, "heard");
+    }
+
+    #[test]
+    fn unreliable_decode_withholds_lone_pick() {
+        // The VE2TNP case: a hallucinated decode names the wrong
+        // callsign with no marker. A suggestion would ask the operator
+        // to confirm garbage — withhold the sender, keep the transcript.
+        let nobook = &|_: &str| None;
+        let tx = "VE2LHA, LHAAQ. Sous-titrage Société Radio-Canada";
+        let e = enrich_profiled(
+            tx,
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            None,
+            &|_| false,
+            true,
+        );
+        assert_eq!(e.sender_callsign, None);
+        assert_eq!(e.sender_source, "none");
+        // Trusted decode of the same text still suggests (control).
+        let e = enrich_profiled(
+            tx,
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            None,
+            &|_| false,
+            false,
+        );
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2LHA"));
+        assert_eq!(e.sender_source, "suggested");
+        // An explicit self-ID survives the unreliable flag.
+        let e = enrich_profiled(
+            "ici VE2CRS. Sous-titrage Société Radio-Canada",
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            None,
+            &|_| false,
+            true,
+        );
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2CRS"));
+        assert_eq!(e.sender_source, "heard");
+    }
+
+    #[test]
+    fn alias_conflict_vetoes_bare_pick() {
+        // The voice is a known VE2TNP but the transcript offers VE2LHA
+        // with no marker: silence beats the wrong badge.
+        let nobook = &|_: &str| None;
+        let e = enrich_profiled(
+            "VE2LHA, à vous",
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            Some("VE2TNP"),
+            &|_| false,
+            false,
+        );
+        assert_eq!(e.sender_callsign, None);
+        assert_eq!(e.sender_source, "none");
+        // Agreement still badges: alias and pick name the same station.
+        let e = enrich_profiled(
+            "VE2LHA, à vous",
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            Some("VE2LHA"),
+            &|_| false,
+            false,
+        );
+        assert_eq!(e.sender_source, "heard");
+        // Explicit self-ID outranks a stale alias.
+        let e = enrich_profiled(
+            "ici VE2LHA",
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            Some("VE2TNP"),
+            &|_| false,
+            false,
+        );
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2LHA"));
         assert_eq!(e.sender_source, "heard");
     }
 
@@ -1653,15 +1922,58 @@ delete_audio_on_drop = false
         // Confident alias → suggestion (never a silent auto-link: the
         // source says suggested, awaiting confirm).
         pipe.store.set_alias("K1", "VE2DEM", 0.9, 1000).unwrap();
-        let e = pipe.suggest_from_voice("K1").expect("suggestion");
+        let e = pipe.suggest_from_voice("K1", None).expect("suggestion");
         assert_eq!(e.sender_callsign.as_deref(), Some("VE2DEM"));
         assert_eq!(e.sender_source, "suggested");
         assert_eq!(e.speaker_key.as_deref(), Some("K1"));
         // Below the suggestion confidence: silence.
         pipe.store.set_alias("K2", "VE3MA", 0.3, 1000).unwrap();
-        assert!(pipe.suggest_from_voice("K2").is_none());
+        assert!(pipe.suggest_from_voice("K2", None).is_none());
         // Unknown key: silence.
-        assert!(pipe.suggest_from_voice("K9").is_none());
+        assert!(pipe.suggest_from_voice("K9", None).is_none());
+    }
+
+    #[test]
+    fn restart_suggests_via_persisted_voiceprint() {
+        // The confirm-survives-restart case: an alias taught on
+        // yesterday's key plus its voiceprint still suggests the same
+        // voice under a fresh key (new process, new day), while a
+        // distant voice stays silent. Embeddings here are synthetic
+        // 256-d unit-ish vectors (EXPECTED_DIM), not model output.
+        let dir = test_dir("voicepersist");
+        let pipe = Pipeline::open_with(test_config(&dir, &test_model())).unwrap();
+        let dim = hamfeed_speaker::EXPECTED_DIM;
+        let mut a = vec![0.01f32; dim];
+        a[0] = 1.0;
+        let norm = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let a: Vec<f32> = a.iter().map(|x| x / norm).collect();
+        let mut b = vec![0.01f32; dim];
+        b[1] = 1.0;
+        let norm = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let b: Vec<f32> = b.iter().map(|x| x / norm).collect();
+        // Yesterday: voiceprint + operator confirm on the old key.
+        // Fresh timestamps — startup_recovery purges retention-aged
+        // rows, and this test is about restart survival, not expiry.
+        let now = now_ms();
+        pipe.store
+            .upsert_voiceprint("Unknown-7|20716", &a, now)
+            .unwrap();
+        pipe.store
+            .overwrite_alias("Unknown-7|20716", "VE2DEM", 1.0, now)
+            .unwrap();
+        // Simulated restart: fresh voice state reloaded from the store.
+        pipe.startup_recovery().unwrap();
+        // Same voice, new key: suggested via the persisted print.
+        let e = pipe
+            .suggest_from_voice("Unknown-3|20717", Some(&a))
+            .expect("persistent suggestion");
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2DEM"));
+        assert_eq!(e.sender_source, "suggested");
+        assert_eq!(e.speaker_key.as_deref(), Some("Unknown-3|20717"));
+        // A different voice under another fresh key: silence.
+        assert!(pipe
+            .suggest_from_voice("Unknown-4|20717", Some(&b))
+            .is_none());
     }
 
     #[test]
@@ -1742,7 +2054,7 @@ delete_audio_on_drop = false
         // m4: a taught voice returns past the window → suggested, then
         // the operator confirms it.
         pipe.store.set_alias("KX", "VE2DEM", 0.9, t3).unwrap();
-        let e4 = pipe.suggest_from_voice("KX").expect("suggestion");
+        let e4 = pipe.suggest_from_voice("KX", None).expect("suggestion");
         let mut m4 = new_msg("m4");
         m4.ts_start_ms = t3 + 1000;
         m4.sender_callsign = e4.sender_callsign;
@@ -1834,6 +2146,7 @@ delete_audio_on_drop = false
             &disaster,
             None,
             &|_| false,
+            false,
         );
         assert_eq!(e.alert & ALERT_DISASTER, ALERT_DISASTER);
         assert_eq!(e.alert & ALERT_EMERGENCY, 0);
@@ -1865,9 +2178,18 @@ delete_audio_on_drop = false
         ];
         for tx in cases {
             let a = enrich(tx, "fr", None, &|_| None, None, &cues());
-            let b = enrich_profiled(tx, "fr", None, &|_| None, None, &cues(), &[], None, &|_| {
-                false
-            });
+            let b = enrich_profiled(
+                tx,
+                "fr",
+                None,
+                &|_| None,
+                None,
+                &cues(),
+                &[],
+                None,
+                &|_| false,
+                false,
+            );
             assert_eq!(a, b, "divergence on {tx:?}");
         }
     }
