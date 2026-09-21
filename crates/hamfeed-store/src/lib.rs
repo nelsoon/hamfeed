@@ -42,13 +42,57 @@ const NOISE_BOILER: &[&str] = &[
     "soirée",
 ];
 
-/// True when a transcript holds no speech content: only bracketed
-/// non-speech tags, sign-off boilerplate, filler, and punctuation.
-/// Conservative by construction — a single content word keeps the row,
-/// so weak-signal fragments and hallucinations with word-shape stay
-/// visible (indistinguishable from real speech, honestly shown).
-pub fn transcript_is_noise_text(text: &str) -> bool {
-    let mut stripped = String::with_capacity(text.len());
+/// Whisper's French subtitle hallucinations (`Sous-titrage Société
+/// Radio-Canada`, variants, and the truncated repeater-ID form
+/// `Sous-titrage ST' 501`): emitted over silence/beeps/noise, never
+/// spoken. Matching is accent/case/separator-insensitive; the
+/// `sous-titr*` prefix is required so a real mention of the broadcaster
+/// stays content.
+fn flatten_tags(text: &str) -> String {
+    let folded = hamfeed_callsign::fold(text);
+    let sep_free: String = folded
+        .chars()
+        .map(|c| {
+            if c == '-' || c == '\'' || c == '’' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    sep_free.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Hallucination phrases, flattened (see `flatten_tags`).
+const HALLUCINATION_PHRASES: &[&str] = &[
+    "sous titrage societe radio canada",
+    "sous titres societe radio canada",
+    "sous titrage st 501",
+    "sous titres st 501",
+];
+
+pub fn has_hallucination_tag(text: &str) -> bool {
+    let flat = flatten_tags(text);
+    HALLUCINATION_PHRASES.iter().any(|p| flat.contains(p))
+}
+
+/// Hallucination phrases as token runs (matches `flatten_tags` output
+/// token-for-token: folding lowercases and separators already split).
+fn hallucination_runs() -> Vec<Vec<&'static str>> {
+    HALLUCINATION_PHRASES
+        .iter()
+        .map(|p| p.split(' ').collect())
+        .collect()
+}
+
+/// Content tokens in original case: bracketed spans removed, then any
+/// token run matching a hallucination phrase skipped. Case is
+/// preserved (not folded) because the salad check needs original
+/// case — folding everything first is what would let `ABCXY` pass
+/// as a lowercase word.
+fn content_tokens(text: &str) -> Vec<String> {
+    // Bracket spans out (original case kept).
+    let mut debracket = String::with_capacity(text.len());
     let mut depth = 0u32;
     for c in text.chars() {
         if c == '[' {
@@ -56,24 +100,95 @@ pub fn transcript_is_noise_text(text: &str) -> bool {
         } else if c == ']' {
             depth = depth.saturating_sub(1);
         } else if depth == 0 {
-            stripped.push(c);
+            debracket.push(c);
         }
     }
-    let mut any_content = false;
-    let mut any_token = false;
-    for tok in stripped.split(|c: char| !c.is_alphanumeric()) {
-        if tok.is_empty() {
-            continue;
+    let toks: Vec<&str> = debracket
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let folded: Vec<String> = toks.iter().map(|t| hamfeed_callsign::fold(t)).collect();
+    let runs = hallucination_runs();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let mut skip = 0;
+        for run in &runs {
+            if run
+                .iter()
+                .enumerate()
+                .all(|(k, w)| folded.get(i + k).is_some_and(|f| f == w))
+            {
+                skip = run.len();
+                break;
+            }
         }
-        any_token = true;
+        if skip > 0 {
+            i += skip;
+        } else {
+            out.push(toks[i].to_string());
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Tone-junk token: whisper rendering a beep/CW-ID/squelch crash as
+/// 2–6 uppercase letters (`ABCXY`, `GHI`). Real words are never
+/// all-caps in transcripts; callsigns, Q-codes, and CQ/QRZ are
+/// procedure content and exempt. Letters-only on purpose: mixed
+/// letter-digit runs (`V12CRS`) are garbled-but-real callsign shapes
+/// and stay visible for attribution.
+fn is_salad_token(tok: &str) -> bool {
+    let len = tok.chars().count();
+    if !(2..=6).contains(&len) {
+        return false;
+    }
+    if !tok.chars().all(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    let norm = hamfeed_callsign::normalize(tok);
+    if hamfeed_callsign::is_valid(&norm) || hamfeed_callsign::is_qcode(&norm) {
+        return false;
+    }
+    !matches!(norm.as_str(), "CQ" | "QRZ")
+}
+
+/// True when a transcript holds no speech content: only bracketed
+/// non-speech tags, subtitle hallucinations, sign-off boilerplate,
+/// filler, digits, tone-junk salad, and punctuation.
+/// Conservative by construction — a single lowercase content word keeps
+/// the row, so weak-signal fragments and name-like hallucinations stay
+/// visible (indistinguishable from real speech, honestly shown). What
+/// the salad rule catches is narrower: every content token all-caps
+/// with no callsign among them, the shape whisper emits for beeps,
+/// CW-IDs, and crashes (`ABCXY`), never for speech.
+pub fn transcript_is_noise_text(text: &str) -> bool {
+    let mut any_letter = false;
+    let mut content: Vec<String> = Vec::new();
+    for tok in content_tokens(text) {
         let w = tok.to_lowercase();
         if NOISE_FILLER.contains(&w.as_str()) || NOISE_BOILER.contains(&w.as_str()) {
             continue;
         }
-        any_content = true;
-        break;
+        if tok.chars().any(|c| c.is_alphabetic()) {
+            any_letter = true;
+        }
+        content.push(tok);
     }
-    !any_token || !any_content
+    if content.is_empty() {
+        return true;
+    }
+    // Digit runs alone (`12. 13. 13.`, `00`): DTMF/countdown echoes,
+    // never speech content.
+    if !any_letter {
+        return true;
+    }
+    // Letter salad with no callsign: tone-junk shape, never speech.
+    if content.iter().all(|t| is_salad_token(t)) {
+        return true;
+    }
+    false
 }
 
 /// A stored message row (plan data model, Slice 1).
@@ -82,7 +197,6 @@ pub struct Message {
     pub id: String,
     pub ts_start_ms: u64,
     pub ts_end_ms: u64,
-    pub freq_label: String,
     pub lang: String,
     pub lang_conf: f64,
     pub transcript: String,
@@ -107,7 +221,7 @@ pub struct Message {
     pub sender_source: String,
     /// Bitmask: 1 = for-you, 2 = emergency (Slice 2).
     pub alert: i32,
-    /// Per-segment voice key (`Unknown-N|label|day`), if any (Slice 2).
+    /// Per-segment voice key (`Unknown-N|day`), if any (Slice 2).
     pub speaker_key: Option<String>,
     /// Operator correction of the transcript, if any (004). The model's
     /// original stays in `transcript`; this is the label, never a wipe.
@@ -120,7 +234,6 @@ pub struct NewMessage {
     pub id: String,
     pub ts_start_ms: u64,
     pub ts_end_ms: u64,
-    pub freq_label: String,
     pub lang: String,
     pub lang_conf: f64,
     pub transcript: String,
@@ -195,7 +308,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messages(
   id TEXT PRIMARY KEY,
   ts_start INT NOT NULL, ts_end INT NOT NULL,
-  freq_label TEXT NOT NULL, lang TEXT NOT NULL, lang_conf REAL NOT NULL,
+  lang TEXT NOT NULL, lang_conf REAL NOT NULL,
   transcript TEXT NOT NULL, stt_conf REAL NOT NULL,
   conf_flag TEXT NOT NULL, status TEXT NOT NULL,
   fail_reason TEXT NULL, audio_path TEXT NULL,
@@ -214,6 +327,14 @@ CREATE TABLE IF NOT EXISTS messages(
 CREATE TABLE IF NOT EXISTS speaker_alias(
   key TEXT PRIMARY KEY, callsign TEXT NOT NULL,
   confidence REAL NOT NULL, updated_ts INT NOT NULL
+);
+-- Persistent voice memory: the latest embedding per voice key, so a
+-- confirm taught on one key still matches the same voice after a
+-- pipeline restart or a UTC-day rollover (keys are day-scoped and the
+-- live clusterer is memory-only). Tiny rows; never pruned for now.
+CREATE TABLE IF NOT EXISTS voiceprints(
+  key TEXT PRIMARY KEY, embedding BLOB NOT NULL,
+  dim INT NOT NULL, updated_ts INT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS profiles(name TEXT PRIMARY KEY, cues TEXT NOT NULL DEFAULT '[]');
@@ -248,6 +369,18 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF transcript, corrected_t
     VALUES (new.rowid, new.transcript, new.corrected_text);
 END;
 ";
+
+/// `Unknown-N|label|day` → `Unknown-N|day`. Anything else (already
+/// short, or a foreign shape) is left alone — returns `None`.
+fn short_speaker_key(key: &str) -> Option<String> {
+    let mut parts = key.split('|');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(n), Some(_label), Some(day), None) if n.starts_with("Unknown-") => {
+            Some(format!("{n}|{day}"))
+        }
+        _ => None,
+    }
+}
 
 /// Escape user input for a LIKE pattern: an unescaped `%` matches
 /// everything, `_` matches any char, and a bare `\` escapes the next
@@ -377,6 +510,15 @@ impl Store {
                     .with_context(|| format!("cannot migrate column {col}"))?;
             }
         }
+        // Label deletion: a pre-deletion file still carries `freq_label`
+        // on messages, `Unknown-N|label|day` speaker keys, label
+        // namespaced sequence counters, and possibly junk aliases
+        // learned before the national gate. All of it goes here, once.
+        if cols.iter().any(|c| c == "freq_label") {
+            conn.execute_batch("ALTER TABLE messages DROP COLUMN freq_label")
+                .context("cannot drop freq_label")?;
+        }
+        Self::strip_speaker_key_labels(conn)?;
         // FTS index: virtual tables cannot be ALTERed, so an older
         // single-column index is dropped outright (its content lives in
         // `messages`; the schema batch recreates the two-column index and
@@ -459,17 +601,16 @@ impl Store {
     pub fn insert(&self, m: &NewMessage) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex");
         conn.execute(
-            "INSERT INTO messages(id,ts_start,ts_end,freq_label,lang,lang_conf,
+            "INSERT INTO messages(id,ts_start,ts_end,lang,lang_conf,
               transcript,stt_conf,conf_flag,status,fail_reason,audio_path,
               duration_ms,size_bytes,short_flag,group_id,seq,
               sender_callsign,sender_name,sender_source,alert,speaker_key,
               corrected_text)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             rusqlite::params![
                 m.id,
                 m.ts_start_ms as i64,
                 m.ts_end_ms as i64,
-                m.freq_label,
                 m.lang,
                 m.lang_conf,
                 m.transcript,
@@ -509,12 +650,12 @@ impl Store {
     pub fn upsert(&self, m: &NewMessage) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex");
         conn.execute(
-            "INSERT INTO messages(id,ts_start,ts_end,freq_label,lang,lang_conf,
+            "INSERT INTO messages(id,ts_start,ts_end,lang,lang_conf,
               transcript,stt_conf,conf_flag,status,fail_reason,audio_path,
               duration_ms,size_bytes,short_flag,group_id,seq,
               sender_callsign,sender_name,sender_source,alert,speaker_key,
               corrected_text)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(id) DO UPDATE SET
               ts_end=excluded.ts_end, lang=excluded.lang,
               lang_conf=excluded.lang_conf, transcript=excluded.transcript,
@@ -540,7 +681,6 @@ impl Store {
                 m.id,
                 m.ts_start_ms as i64,
                 m.ts_end_ms as i64,
-                m.freq_label,
                 m.lang,
                 m.lang_conf,
                 m.transcript,
@@ -744,6 +884,50 @@ impl Store {
         Ok(())
     }
 
+    /// Persist a voice key's latest embedding (little-endian f32 blob).
+    /// Overwrites unconditionally: the newest sample best tracks voice
+    /// drift, and rows are tiny.
+    pub fn upsert_voiceprint(&self, key: &str, emb: &[f32], updated_ts_ms: u64) -> Result<()> {
+        let mut bytes = Vec::with_capacity(emb.len() * 4);
+        for v in emb {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let conn = self.conn.lock().expect("store mutex");
+        conn.execute(
+            "INSERT INTO voiceprints(key,embedding,dim,updated_ts)
+             VALUES(?,?,?,?)
+             ON CONFLICT(key) DO UPDATE SET
+              embedding=excluded.embedding, dim=excluded.dim,
+              updated_ts=excluded.updated_ts",
+            rusqlite::params![key, bytes, emb.len() as i64, updated_ts_ms as i64],
+        )
+        .with_context(|| format!("cannot upsert voiceprint {key}"))?;
+        Ok(())
+    }
+
+    /// All stored voiceprints: `(key, embedding)`. Corrupt rows
+    /// (byte length not a multiple of 4) are skipped, never fatal.
+    pub fn all_voiceprints(&self) -> Result<Vec<(String, Vec<f32>)>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let mut stmt = conn.prepare("SELECT key, embedding FROM voiceprints")?;
+        let rows = stmt.query_map([], |r| {
+            let key: String = r.get(0)?;
+            let bytes: Vec<u8> = r.get(1)?;
+            Ok((key, bytes))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, bytes) = row?;
+            if bytes.len() % 4 != 0 {
+                continue;
+            }
+            let (chunks, _) = bytes.as_chunks::<4>();
+            let emb: Vec<f32> = chunks.iter().map(|c| f32::from_le_bytes(*c)).collect();
+            out.push((key, emb));
+        }
+        Ok(out)
+    }
+
     /// Look up a voice key's linked callsign, if any.
     pub fn get_alias(&self, key: &str) -> Result<Option<(String, f32)>> {
         let conn = self.conn.lock().expect("store mutex");
@@ -773,11 +957,104 @@ impl Store {
             .context("cannot read regulars")
     }
 
-    /// Allocate the next per-day speaker number for a label
-    /// (`speaker_seq_{label}_{day}`); never reused within the store.
-    pub fn alloc_speaker_n(&self, label: &str, day: &str) -> Result<u32> {
+    /// One-shot label cleanup for pre-deletion files. `Unknown-N|label|day`
+    /// keys become `Unknown-N|day` on messages and aliases; label
+    /// sequence counters go away; aliases no administration could have
+    /// issued (junk learned before the national gate) are purged.
+    /// Idempotent: reruns find no three-segment keys, no label counters
+    /// (new counters are day-digits only), and no junk aliases left.
+    fn strip_speaker_key_labels(conn: &Connection) -> Result<()> {
+        // Very old files predate the alias/settings tables entirely.
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let has = |t: &str| tables.iter().any(|x| x == t);
+        if !has("messages") {
+            return Ok(());
+        }
+        let mut msgs = conn
+            .prepare("SELECT id, speaker_key FROM messages WHERE speaker_key LIKE 'Unknown-%'")?;
+        let rewrites: Vec<(String, String)> = msgs
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<(String, String)>, _>>()?
+            .into_iter()
+            .filter_map(|(id, key)| short_speaker_key(&key).map(|short| (id, short)))
+            .collect();
+        for (id, short) in &rewrites {
+            conn.execute("UPDATE messages SET speaker_key=? WHERE id=?", [short, id])?;
+        }
+        if !has("speaker_alias") {
+            return Ok(());
+        }
+        let mut aliases = conn.prepare("SELECT key FROM speaker_alias")?;
+        let alias_rewrites: Vec<(String, String)> = aliases
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<String>, _>>()?
+            .into_iter()
+            .filter_map(|key| short_speaker_key(&key).map(|short| (key, short)))
+            .collect();
+        for (old, short) in &alias_rewrites {
+            // Two labels could share a number on one day
+            // (`Unknown-1|A|d` + `Unknown-1|B|d`): keep the more
+            // confident row, never fail the migration on a key clash.
+            let incumbent: Option<f32> = conn
+                .query_row(
+                    "SELECT confidence FROM speaker_alias WHERE key=?",
+                    [short],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let incoming: f32 = conn.query_row(
+                "SELECT confidence FROM speaker_alias WHERE key=?",
+                [old],
+                |r| r.get(0),
+            )?;
+            if incumbent.is_some_and(|c| c >= incoming) {
+                conn.execute("DELETE FROM speaker_alias WHERE key=?", [old])?;
+            } else {
+                if incumbent.is_some() {
+                    conn.execute("DELETE FROM speaker_alias WHERE key=?", [short])?;
+                }
+                conn.execute("UPDATE speaker_alias SET key=? WHERE key=?", [short, old])?;
+            }
+        }
+        // Label counters (`speaker_seq_WX-MARINE_20716`) die; day counters
+        // (`speaker_seq_20716`) survive — the GLOB tells them apart so a
+        // rerun can never reset a live counter and reuse a number.
+        if has("settings") {
+            conn.execute(
+                "DELETE FROM settings WHERE key LIKE 'speaker_seq!_%' ESCAPE '!'\n             AND key NOT GLOB 'speaker_seq_[0-9]*'",
+                [],
+            )
+            .context("cannot drop label sequence counters")?;
+        }
+        // Junk aliases predate the national gate and would otherwise live
+        // forever (nothing revalidates them).
+        let junk: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT key, callsign FROM speaker_alias")?;
+            let rows = stmt.query_map([], |r| {
+                let k: String = r.get(0)?;
+                let cs: String = r.get(1)?;
+                Ok((k, cs))
+            })?;
+            rows.collect::<std::result::Result<Vec<(String, String)>, _>>()?
+                .into_iter()
+                .filter(|(_, cs)| !hamfeed_callsign::national_ok(cs))
+                .map(|(k, _)| k)
+                .collect()
+        };
+        for key in &junk {
+            conn.execute("DELETE FROM speaker_alias WHERE key=?", [key])?;
+        }
+        Ok(())
+    }
+
+    /// Allocate the next per-day speaker number
+    /// (`speaker_seq_{day}`); never reused within the store.
+    pub fn alloc_speaker_n(&self, day: &str) -> Result<u32> {
         let conn = self.conn.lock().expect("store mutex");
-        let key = format!("speaker_seq_{label}_{day}");
+        let key = format!("speaker_seq_{day}");
         let cur: Option<String> = conn
             .query_row("SELECT value FROM settings WHERE key=?", [&key], |r| {
                 r.get(0)
@@ -902,6 +1179,17 @@ impl Store {
         let cutoff = now_ms.saturating_sub(retention_days * 86_400_000) as i64;
         let conn = self.conn.lock().expect("store mutex");
         let n = conn.execute("DELETE FROM speaker_alias WHERE updated_ts < ?", [cutoff])?;
+        Ok(n)
+    }
+
+    /// Drop voiceprints silent longer than the alias retention bound.
+    /// Live voices re-persist on every assignment, so only truly gone
+    /// voices lose rows — and their aliases expired under the same
+    /// bound. Same cutoff, same boot call, no second bound to skew.
+    pub fn purge_voiceprints(&self, retention_days: u64, now_ms: u64) -> Result<usize> {
+        let cutoff = now_ms.saturating_sub(retention_days * 86_400_000) as i64;
+        let conn = self.conn.lock().expect("store mutex");
+        let n = conn.execute("DELETE FROM voiceprints WHERE updated_ts < ?", [cutoff])?;
         Ok(n)
     }
 
@@ -1169,7 +1457,6 @@ fn row_to_msg(r: &rusqlite::Row) -> rusqlite::Result<Message> {
         id: r.get("id")?,
         ts_start_ms: r.get::<_, i64>("ts_start")? as u64,
         ts_end_ms: r.get::<_, i64>("ts_end")? as u64,
-        freq_label: r.get("freq_label")?,
         lang: r.get("lang")?,
         lang_conf: r.get("lang_conf")?,
         transcript: r.get("transcript")?,
@@ -1231,7 +1518,6 @@ pub mod testutil {
                     id: id.into(),
                     ts_start_ms: ts,
                     ts_end_ms: ts + 500,
-                    freq_label: "TEST".into(),
                     lang: lang.into(),
                     lang_conf: 0.9,
                     transcript: text.into(),
@@ -1373,6 +1659,68 @@ mod tests {
     }
 
     #[test]
+    fn subtitle_hallucination_hides_and_flags() {
+        // Whisper's French subtitle boilerplate over silence/noise: the
+        // tag alone is wordless, and its presence marks the decode
+        // unreliable for attribution even beside real words.
+        for t in [
+            "Sous-titrage Société Radio-Canada",
+            "SOUS-TITRES SOCIÉTÉ RADIO-CANADA",
+            "Sous titrage Societe Radio Canada",
+            // Truncated repeater-ID form (prod: bare, with Merci, with
+            // the full tag appended) — same hallucination family.
+            "Sous-titrage ST' 501",
+            "Sous-titrage ST' 501 Merci.",
+            "Sous-titrage ST' 501 Sous-titrage Société Radio-Canada",
+            "00 Sous-titrage Société Radio-Canada",
+        ] {
+            assert!(transcript_is_noise_text(t), "{t:?} must read as noise");
+            assert!(has_hallucination_tag(t), "{t:?} must flag");
+        }
+        // Real speech beside the tag stays visible (tag stripped, words
+        // remain) — but still flags unreliable.
+        let mixed = "Bonjour à tous, sous-titrage Société Radio-Canada";
+        assert!(!transcript_is_noise_text(mixed));
+        assert!(has_hallucination_tag(mixed));
+        // A genuine mention of the broadcaster without the subtitle
+        // prefix is content, not a hallucination.
+        assert!(!has_hallucination_tag("entendu à Radio-Canada hier"));
+        assert!(!has_hallucination_tag("ici VE2DEM, à vous"));
+    }
+
+    /// Tone-junk shapes from prod (beeps/CW-IDs/crashes whisper renders
+    /// as letter salad or digit runs): every content token all-caps
+    /// with no callsign among them is never speech. Single lowercase
+    /// words, garbled callsign shapes, procedure tokens, and names
+    /// stay visible.
+    #[test]
+    fn tone_junk_salad_hides() {
+        // Observed junk: hide.
+        for t in ["ABCXY", "ABCX", "12. 13. 13.", "GHI KLL"] {
+            assert!(transcript_is_noise_text(t), "{t:?} must read as noise");
+        }
+        // Known residual: salad beside a real word stays visible rather
+        // than risk hiding speech (`California` could be spoken).
+        assert!(!transcript_is_noise_text("ABCXY California"));
+        // Real content that shares fragments with junk: visible.
+        for t in [
+            "VE2ABC",              // bare callsign self-ID
+            "V12CRS",              // garbled callsign shape (letters+digits)
+            "E2KSV en fréquence.", // malformed suggestion + real words
+            "CQ",                  // procedure call
+            "QRZ?",                // procedure call
+            "QTH",                 // Q-code
+            "Victor, on a bien l'arrivée.",
+            "What? What?",
+            "Et ça va ! Merci.",
+            "VA2K Juliette Golf. Merci.",
+            "VE2DBA LSA", // real callsign beside salad keeps the row
+        ] {
+            assert!(!transcript_is_noise_text(t), "{t:?} must stay visible");
+        }
+    }
+
+    #[test]
     fn hide_noise_drops_wordless_shorts() {
         let store = Store::open_memory().unwrap();
         let put = |id: &str,
@@ -1387,7 +1735,6 @@ mod tests {
                     id: id.into(),
                     ts_start_ms: 1_000,
                     ts_end_ms: 1_000 + dur_ms,
-                    freq_label: "TEST".into(),
                     lang: "fr".into(),
                     lang_conf: 0.9,
                     transcript: text.into(),
@@ -1503,7 +1850,6 @@ mod tests {
                     id: id.into(),
                     ts_start_ms: 1_000,
                     ts_end_ms: 2_000,
-                    freq_label: "TEST".into(),
                     lang: "fr".into(),
                     lang_conf: 0.9,
                     transcript: text.into(),
@@ -1552,7 +1898,6 @@ mod tests {
                 id: msg.id.clone(),
                 ts_start_ms: msg.ts_start_ms,
                 ts_end_ms: msg.ts_end_ms,
-                freq_label: msg.freq_label.clone(),
                 lang: "en".into(),
                 lang_conf: 1.0,
                 transcript: "late re-transcription".into(),
@@ -1634,7 +1979,6 @@ mod tests {
             id: id.into(),
             ts_start_ms: ts,
             ts_end_ms: ts + 500,
-            freq_label: "TEST".into(),
             lang: "fr".into(),
             lang_conf: 0.9,
             transcript: "ici VE2DEM".into(),
@@ -1861,6 +2205,26 @@ mod tests {
     }
 
     #[test]
+    fn voiceprint_roundtrip_latest_wins() {
+        let store = Store::open_memory().unwrap();
+        assert!(store.all_voiceprints().unwrap().is_empty());
+        store
+            .upsert_voiceprint("K1", &[0.1, 0.2, 0.3], 1000)
+            .unwrap();
+        store.upsert_voiceprint("K2", &[0.4, 0.5], 2000).unwrap();
+        // Newest sample overwrites: drift tracking, not history.
+        store
+            .upsert_voiceprint("K1", &[0.7, 0.8, 0.9], 3000)
+            .unwrap();
+        let mut got = store.all_voiceprints().unwrap();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "K1");
+        assert_eq!(got[0].1, vec![0.7f32, 0.8, 0.9]);
+        assert_eq!(got[1].1, vec![0.4f32, 0.5]);
+    }
+
+    #[test]
     fn overwrite_alias_forces() {
         let store = Store::open_memory().unwrap();
         store.set_alias("k", "VE2DEM", 1.0, 1000).unwrap();
@@ -1881,11 +2245,112 @@ mod tests {
     #[test]
     fn alloc_never_reuses() {
         let store = Store::open_memory().unwrap();
-        assert_eq!(store.alloc_speaker_n("TEST", "2026-09-16").unwrap(), 1);
-        assert_eq!(store.alloc_speaker_n("TEST", "2026-09-16").unwrap(), 2);
+        assert_eq!(store.alloc_speaker_n("2026-09-16").unwrap(), 1);
+        assert_eq!(store.alloc_speaker_n("2026-09-16").unwrap(), 2);
         // A new day starts over; the old day's numbers are never re-minted.
-        assert_eq!(store.alloc_speaker_n("TEST", "2026-09-17").unwrap(), 1);
-        assert_eq!(store.alloc_speaker_n("TEST", "2026-09-16").unwrap(), 3);
+        assert_eq!(store.alloc_speaker_n("2026-09-17").unwrap(), 1);
+        assert_eq!(store.alloc_speaker_n("2026-09-16").unwrap(), 3);
+    }
+
+    #[test]
+    fn migrate_drops_label_and_rewrites_keys() {
+        // A pre-deletion file: freq_label column, three-segment speaker
+        // keys, label sequence counters, one junk alias, and a key
+        // collision across labels. Open must delete every trace.
+        let dir = std::env::temp_dir().join(format!("hamfeed-miglabel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages(
+                   id TEXT PRIMARY KEY, ts_start INT NOT NULL, ts_end INT NOT NULL,
+                   freq_label TEXT NOT NULL, lang TEXT NOT NULL, lang_conf REAL NOT NULL,
+                   transcript TEXT NOT NULL, stt_conf REAL NOT NULL,
+                   conf_flag TEXT NOT NULL, status TEXT NOT NULL,
+                   fail_reason TEXT NULL, audio_path TEXT NULL,
+                   audio_purged BOOL NOT NULL DEFAULT 0,
+                   duration_ms INT NULL, size_bytes INT NULL,
+                   short_flag BOOL NOT NULL DEFAULT 0,
+                   group_id TEXT NOT NULL, seq INT NOT NULL,
+                   review_flag TEXT NOT NULL DEFAULT 'none', flag_reason TEXT NULL,
+                   sender_callsign TEXT NULL, sender_name TEXT NULL,
+                   sender_source TEXT NOT NULL DEFAULT 'none',
+                   alert INT NOT NULL DEFAULT 0,
+                   speaker_key TEXT NULL, corrected_text TEXT NULL);
+                 CREATE TABLE speaker_alias(
+                   key TEXT PRIMARY KEY, callsign TEXT NOT NULL,
+                   confidence REAL NOT NULL, updated_ts INT NOT NULL);
+                 CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages(id,ts_start,ts_end,freq_label,lang,lang_conf,
+                 transcript,stt_conf,conf_flag,status,group_id,seq,speaker_key)
+                 VALUES('m1',1000,1500,'WX-MARINE','fr',0.9,'bonjour',0.8,'ok','ok',
+                 'g',0,'Unknown-7|WX-MARINE|20716')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO speaker_alias(key,callsign,confidence,updated_ts)
+                 VALUES('Unknown-7|WX-MARINE|20716','VE2DEM',1.0,1000),
+                        ('Unknown-1|A|20716','VE2DEM',0.6,1000),
+                        ('Unknown-1|B|20716','VE2ABC',0.9,1000),
+                        ('Unknown-9|WX-MARINE|20716','V2CSQ',1.0,1000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO settings(key,value)
+                 VALUES('speaker_seq_WX-MARINE_20716','44'),('active_profile','Normal')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        // Column gone.
+        let cols: Vec<String> = store
+            .conn
+            .lock()
+            .expect("store mutex")
+            .prepare("PRAGMA table_info(messages)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(!cols.iter().any(|c| c == "freq_label"));
+        // Keys shortened on messages and aliases.
+        let m = store.get("m1").unwrap().expect("old row readable");
+        assert_eq!(m.speaker_key.as_deref(), Some("Unknown-7|20716"));
+        assert_eq!(
+            store.get_alias("Unknown-7|20716").unwrap(),
+            Some(("VE2DEM".to_string(), 1.0))
+        );
+        // Collision keeps the more confident row.
+        assert_eq!(
+            store.get_alias("Unknown-1|20716").unwrap(),
+            Some(("VE2ABC".to_string(), 0.9))
+        );
+        // Junk alias purged (V2CSQ was never issuable).
+        assert_eq!(store.get_alias("Unknown-9|20716").unwrap(), None);
+        // Label counter gone, unrelated settings survive, and the live
+        // day counter still allocates from 1 (no stale state).
+        let left: Vec<String> = store
+            .conn
+            .lock()
+            .expect("store mutex")
+            .prepare("SELECT key FROM settings ORDER BY key")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, vec!["active_profile".to_string()]);
+        assert_eq!(store.alloc_speaker_n("20716").unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2123,7 +2588,6 @@ mod tests {
             id: id.into(),
             ts_start_ms: 1000,
             ts_end_ms: 1500,
-            freq_label: "TEST".into(),
             lang: "en".into(),
             lang_conf: 0.9,
             transcript: transcript.into(),

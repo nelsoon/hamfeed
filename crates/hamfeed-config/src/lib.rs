@@ -128,7 +128,6 @@ pub struct Storage {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Station {
-    pub freq_label: String,
     #[serde(default)]
     pub my_callsign: Option<String>,
 }
@@ -325,7 +324,6 @@ impl Config {
                 self.storage.retention_days
             );
         }
-        non_empty("[station] freq_label", &self.station.freq_label)?;
         if !(1..=240).contains(&self.identity.link_window_min) {
             anyhow::bail!(
                 "[identity] link_window_min = {} out of range (want 1..=240)",
@@ -580,7 +578,6 @@ dir = "./data/audio"
 db_path = "./data/hamfeed.db"
 retention_days = 90
 [station]
-freq_label = "TEST"
 "#;
         let cfg = parse(text).expect("pre-slice-2 config must still parse");
         assert_eq!(cfg.identity.link_window_min, 30);

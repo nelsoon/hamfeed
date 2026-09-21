@@ -43,7 +43,6 @@ dir = "{}"
 db_path = "{}"
 retention_days = 90
 [station]
-freq_label = "E2E"
 "#,
         test_model().display(),
         dir.join("audio").display(),
