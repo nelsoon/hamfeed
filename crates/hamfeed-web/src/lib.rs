@@ -66,10 +66,38 @@ pub struct ApiMessage {
     pub sender_source: String,
     /// Alert bitmask: 1 = for-you, 2 = emergency.
     pub alert: i32,
+    /// Noise kind for the UI badge (`short`|`no-words`|`repeat`), so a
+    /// revealed junk row advertises why it hides. `None` on traffic.
+    pub noise: Option<String>,
+}
+
+/// Noise kind: exactly the hide-noise verdict (badge ⟺ hidden when the
+/// checkbox is on), so the two can never disagree. Heard senders and
+/// failed rows are never noise — same exemptions as the predicate.
+pub fn noise_kind(
+    short: bool,
+    transcript: &str,
+    sender_source: &str,
+    status: &str,
+    dups: &std::collections::HashSet<String>,
+) -> Option<&'static str> {
+    if sender_source == "heard" || status == "failed" {
+        return None;
+    }
+    if short {
+        return Some("short");
+    }
+    if hamfeed_store::transcript_is_noise_text(transcript) {
+        return Some("no-words");
+    }
+    if dups.contains(transcript) {
+        return Some("repeat");
+    }
+    None
 }
 
 impl ApiMessage {
-    fn from(m: &Message) -> Self {
+    fn from(m: &Message, dups: &std::collections::HashSet<String>) -> Self {
         Self {
             id: m.id.clone(),
             ts_start_ms: m.ts_start_ms,
@@ -93,6 +121,14 @@ impl ApiMessage {
             sender_name: m.sender_name.clone(),
             sender_source: m.sender_source.clone(),
             alert: m.alert,
+            noise: noise_kind(
+                m.short_flag,
+                &m.transcript,
+                &m.sender_source,
+                &m.status,
+                dups,
+            )
+            .map(str::to_string),
         }
     }
 }
@@ -216,8 +252,9 @@ async fn api_messages(
             ..Default::default()
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let dups = pipe.store().duplicate_transcripts().unwrap_or_default();
     Ok(Json(serde_json::json!({
-        "messages": page.messages.iter().map(ApiMessage::from).collect::<Vec<_>>(),
+        "messages": page.messages.iter().map(|m| ApiMessage::from(m, &dups)).collect::<Vec<_>>(),
         "next_cursor": page.next_cursor,
     })))
 }
@@ -240,8 +277,9 @@ async fn api_search(
             cursor: q.cursor,
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let dups = pipe.store().duplicate_transcripts().unwrap_or_default();
     Ok(Json(serde_json::json!({
-        "messages": page.messages.iter().map(ApiMessage::from).collect::<Vec<_>>(),
+        "messages": page.messages.iter().map(|m| ApiMessage::from(m, &dups)).collect::<Vec<_>>(),
         "next_cursor": page.next_cursor,
     })))
 }
@@ -283,10 +321,11 @@ async fn api_triage(
             let pipe = state2.pipeline.blocking_lock();
             if pipe.drain().is_ok() {
                 if let Ok(latest) = pipe.latest(64) {
+                    let dups = pipe.store().duplicate_transcripts().unwrap_or_default();
                     for m in &latest {
                         let _ = state2
                             .tx
-                            .send(serde_json::to_value(ApiMessage::from(m)).unwrap());
+                            .send(serde_json::to_value(ApiMessage::from(m, &dups)).unwrap());
                     }
                 }
             }
@@ -298,7 +337,8 @@ async fn api_triage(
         .get(&id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "no such message".into()))?;
-    let api = ApiMessage::from(&msg);
+    let dups = pipe.store().duplicate_transcripts().unwrap_or_default();
+    let api = ApiMessage::from(&msg, &dups);
     let _ = state.tx.send(serde_json::to_value(&api).unwrap());
     Ok(Json(api))
 }
@@ -466,7 +506,8 @@ async fn api_confirm_sender(
         .get(&id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "no such message".into()))?;
-    let api = ApiMessage::from(&msg);
+    let dups = pipe.store().duplicate_transcripts().unwrap_or_default();
+    let api = ApiMessage::from(&msg, &dups);
     let _ = state.tx.send(serde_json::to_value(&api).unwrap());
     Ok(Json(api))
 }
@@ -506,7 +547,8 @@ async fn api_correct(
         .get(&id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "no such message".into()))?;
-    let api = ApiMessage::from(&msg);
+    let dups = pipe.store().duplicate_transcripts().unwrap_or_default();
+    let api = ApiMessage::from(&msg, &dups);
     let _ = state.tx.send(serde_json::to_value(&api).unwrap());
     Ok(Json(api))
 }
@@ -1597,5 +1639,41 @@ freq_label = "TEST"
         let mut s = String::new();
         f.read_to_string(&mut s).unwrap();
         s
+    }
+
+    #[test]
+    fn noise_kind_mirrors_hide_verdict() {
+        use std::collections::HashSet;
+        let dups: HashSet<String> = ["canned".into()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        // Exemptions first: heard and failed are never noise.
+        assert_eq!(noise_kind(true, "", "heard", "ok", &empty), None);
+        assert_eq!(noise_kind(true, "", "none", "failed", &empty), None);
+        assert_eq!(
+            noise_kind(false, "Bye. Thank you.", "heard", "ok", &empty),
+            None
+        );
+        // Kinds in priority order: short, no-words, repeat.
+        assert_eq!(
+            noise_kind(true, "VE2ABC!", "none", "ok", &empty),
+            Some("short")
+        );
+        assert_eq!(
+            noise_kind(false, "[BLANK_AUDIO]", "none", "ok", &empty),
+            Some("no-words")
+        );
+        assert_eq!(
+            noise_kind(false, "Bye. Thank you.", "carried", "ok", &empty),
+            Some("no-words")
+        );
+        assert_eq!(
+            noise_kind(false, "canned", "none", "ok", &dups),
+            Some("repeat")
+        );
+        // Traffic: no badge.
+        assert_eq!(
+            noise_kind(false, "bonjour les amis", "none", "ok", &empty),
+            None
+        );
     }
 }

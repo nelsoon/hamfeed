@@ -227,6 +227,7 @@ audio { flex: 1; min-width: 0; height: 34px; }
 .badge.low { color: var(--low); border-color: var(--low); }
 .badge.failed { color: var(--failed); border-color: var(--failed); }
 .badge.lang { color: var(--muted); border-color: var(--card-edge); }
+.badge.noise { color: var(--muted); border-color: var(--card-edge); border-style: dashed; }
 .badge.corrected { color: var(--ok); border-color: var(--ok); }
 .badge.sender { color: var(--text); border-color: var(--muted); }
 .sender-edit input[type="text"] {

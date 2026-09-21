@@ -14,6 +14,68 @@ use rusqlite::{Connection, OptionalExtension};
 /// Seconds of audio below which a row counts as noise (`short_flag`).
 pub const SHORT_MS: u64 = 1500;
 
+/// Whisper non-speech tags (`[BLANK_AUDIO]`, `[BELL RINGING]`, …) carry
+/// no words; sign-off boilerplate carries no loop-usable information.
+/// Filler glue (`you` in "thank you", articles) doesn't count as
+/// content either. Anything else — names, places, reports, NATO words,
+/// spelled-out or digit callsigns — is content and keeps the row.
+const NOISE_FILLER: &[&str] = &[
+    "you", "tu", "toi", "vous", "a", "à", "la", "le", "les", "the", "et", "and", "un", "une",
+    "des", "du", "au", "ok",
+];
+const NOISE_BOILER: &[&str] = &[
+    "thank",
+    "thanks",
+    "merci",
+    "bye",
+    "goodbye",
+    "goodnight",
+    "night",
+    "ciao",
+    "73",
+    "73s",
+    "over",
+    "prochaine",
+    "qsl",
+    "soir",
+    "soiree",
+    "soirée",
+];
+
+/// True when a transcript holds no speech content: only bracketed
+/// non-speech tags, sign-off boilerplate, filler, and punctuation.
+/// Conservative by construction — a single content word keeps the row,
+/// so weak-signal fragments and hallucinations with word-shape stay
+/// visible (indistinguishable from real speech, honestly shown).
+pub fn transcript_is_noise_text(text: &str) -> bool {
+    let mut stripped = String::with_capacity(text.len());
+    let mut depth = 0u32;
+    for c in text.chars() {
+        if c == '[' {
+            depth += 1;
+        } else if c == ']' {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 {
+            stripped.push(c);
+        }
+    }
+    let mut any_content = false;
+    let mut any_token = false;
+    for tok in stripped.split(|c: char| !c.is_alphanumeric()) {
+        if tok.is_empty() {
+            continue;
+        }
+        any_token = true;
+        let w = tok.to_lowercase();
+        if NOISE_FILLER.contains(&w.as_str()) || NOISE_BOILER.contains(&w.as_str()) {
+            continue;
+        }
+        any_content = true;
+        break;
+    }
+    !any_token || !any_content
+}
+
 /// A stored message row (plan data model, Slice 1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
@@ -219,6 +281,20 @@ impl std::error::Error for UnknownProfile {}
 
 impl Store {
     fn init(conn: &Connection) -> Result<()> {
+        // Query-time text gate for hide-noise (no schema change, so old
+        // databases gain it on open): Rust tokenizer power inside SQL,
+        // registered on every connection including :memory: test DBs.
+        conn.create_scalar_function(
+            "hamfeed_noise_text",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let t: Option<String> = ctx.get(0)?;
+                Ok(transcript_is_noise_text(t.as_deref().unwrap_or("")))
+            },
+        )
+        .context("cannot register hamfeed_noise_text")?;
         // Migrate BEFORE the schema batch: old files lack the newer
         // columns, and the new indices fail to create without them.
         // (On a fresh file the table is absent and migrate is a no-op.)
@@ -786,6 +862,23 @@ impl Store {
         Ok(())
     }
 
+    /// Transcripts occurring more than once (canned repeats). The
+    /// hide-noise dup rule and the UI noise badge share this set; NULL
+    /// transcripts are excluded (they never match `IN`, and wordless
+    /// rows are already covered by the text gate).
+    pub fn duplicate_transcripts(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let mut stmt = conn.prepare(
+            "SELECT transcript FROM messages WHERE transcript IS NOT NULL \
+             GROUP BY transcript HAVING COUNT(*) > 1",
+        )?;
+        let mut out = std::collections::HashSet::new();
+        for t in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            out.insert(t?);
+        }
+        Ok(out)
+    }
+
     /// Drop voice aliases last touched before the retention bound (Slice 2
     /// library purge). Returns removed row count.
     pub fn purge_aliases(&self, retention_days: u64, now_ms: u64) -> Result<usize> {
@@ -824,17 +917,28 @@ impl Store {
             sql.push_str(" AND rowid IN (SELECT value FROM json_each(?))");
         }
         if q.hide_noise {
-            sql.push_str(" AND short_flag = 0");
-            // Beep/noise shorts: sub-5s rows where whisper found no words
-            // and no callsign was actually heard. Carried/suggested badges
-            // on beep slivers are carry artifacts, not traffic — only a
-            // heard self-ID keeps a wordless short visible. Failed rows
-            // stay visible: an honest error is not noise.
+            // Heard senders and failed rows are always traffic, however
+            // short: a 1.2 s self-ID is loop-valuable, and error cards
+            // are honest states (the pipeline marks failures short, so
+            // the exemption must be explicit here, not just below).
             sql.push_str(
-                " AND NOT (duration_ms < 5000 \
-                 AND (transcript IS NULL OR transcript = '') \
-                 AND sender_source != 'heard' \
-                 AND status != 'failed')",
+                " AND (short_flag = 0 \
+                 OR sender_source = 'heard' OR status = 'failed')",
+            );
+            // Noise hide, query-time (nothing deleted, uncheck reveals):
+            // non-heard, non-failed rows whose transcript holds no speech
+            // content — wordless shorts, whisper bracket tags
+            // (`[BLANK_AUDIO]`, `[BELL RINGING]`), sign-off boilerplate —
+            // or verbatim repeats beyond de-duplication (canned network
+            // IDs; every copy hides, the text stays searchable). A heard
+            // self-ID always keeps its row; failed rows stay visible as
+            // honest errors; hallucinations with word-shape stay shown
+            // (indistinguishable from weak speech).
+            sql.push_str(
+                " AND NOT (sender_source != 'heard' AND status != 'failed' \
+                 AND (hamfeed_noise_text(transcript) \
+                 OR transcript IN (SELECT transcript FROM messages \
+                 GROUP BY transcript HAVING COUNT(*) > 1)))",
             );
         }
         // Exact callsign match (Slice 2): callsigns are compact tokens, so
@@ -1210,9 +1314,57 @@ mod tests {
     }
 
     #[test]
+    fn noise_text_gate_cases() {
+        // Bracket tags: whisper telling us there was no speech.
+        for t in [
+            "[BLANK_AUDIO]",
+            "[Music] [BLANK_AUDIO]",
+            ". [BELL RINGING].",
+            "[BEEP]",
+            "[inaudible]",
+            "",
+            ". . .",
+        ] {
+            assert!(transcript_is_noise_text(t), "{t:?} must read as noise");
+        }
+        // Sign-off boilerplate (FR+EN) with filler glue.
+        for t in [
+            "Bye. Thank you.",
+            "Thank you. Thank you.",
+            "Merci.",
+            "73, à la prochaine, over.",
+            "QSL, 73.",
+            "ok.",
+        ] {
+            assert!(transcript_is_noise_text(t), "{t:?} must read as noise");
+        }
+        // A single content word keeps the row: names, places, reports,
+        // digits, NATO/number words (spelled callsigns), weak fragments.
+        for t in [
+            "QTH Montréal, QTH Montréal, 74, à la prochaine, over.",
+            "Vous êtes à l'écoute du réseau RTQ.",
+            "Minimum Wake and Whitebird requested. [BLANK_AUDIO]",
+            "ici VE2DEM",
+            "victor echo deux",
+            "V12CRS",
+            "Yeah.",
+            "il pleut",
+            "Merci VE2ABC",
+        ] {
+            assert!(!transcript_is_noise_text(t), "{t:?} must stay visible");
+        }
+    }
+
+    #[test]
     fn hide_noise_drops_wordless_shorts() {
         let store = Store::open_memory().unwrap();
-        let put = |id: &str, dur_ms: u64, text: &str, status: &str, cs: Option<&str>, src: &str| {
+        let put = |id: &str,
+                   dur_ms: u64,
+                   text: &str,
+                   status: &str,
+                   cs: Option<&str>,
+                   src: &str,
+                   short: bool| {
             store
                 .insert(&NewMessage {
                     id: id.into(),
@@ -1229,7 +1381,7 @@ mod tests {
                     audio_path: Some(format!("/tmp/{id}.ogg")),
                     duration_ms: Some(dur_ms),
                     size_bytes: Some(100),
-                    short_flag: false,
+                    short_flag: short,
                     group_id: "g".into(),
                     seq: 0,
                     sender_callsign: cs.map(str::to_string),
@@ -1242,8 +1394,9 @@ mod tests {
                 .expect("seed insert");
         };
         // Beep sliver: wordless, carried badge = carry artifact → hidden.
-        put("beep", 128, "", "ok", Some("VE2CRS"), "carried");
-        // Real quick self-ID: heard sender keeps it, whatever the size.
+        put("beep", 128, "", "ok", Some("VE2CRS"), "carried", true);
+        // Real quick self-ID: heard sender keeps it, whatever the size —
+        // including a genuine sub-1.5 s self-ID the short flag catches.
         put(
             "quick",
             2_500,
@@ -1251,10 +1404,51 @@ mod tests {
             "ok",
             Some("VE2ABC"),
             "heard",
+            false,
         );
-        // Honest error states stay visible: failed short, long wordless.
-        put("fail", 2_500, "", "failed", None, "none");
-        put("long", 9_000, "", "ok", None, "none");
+        put(
+            "quickshort",
+            1_200,
+            "VE2ABC!",
+            "ok",
+            Some("VE2ABC"),
+            "heard",
+            true,
+        );
+        // Honest error states stay visible: the pipeline marks failures
+        // short, so the failed exemption must hold with short_flag set.
+        put("fail", 2_500, "", "failed", None, "none", true);
+        put(
+            "long",
+            9_000,
+            "un oiseau sur l'antenne",
+            "ok",
+            None,
+            "none",
+            false,
+        );
+        // Whisper non-speech tags and sign-off tails hide.
+        put("tag", 3_000, "[BLANK_AUDIO]", "ok", None, "none", false);
+        put("tail", 4_000, "Bye. Thank you.", "ok", None, "none", false);
+        // Canned repeats hide (every copy; the text stays searchable).
+        put(
+            "canned1",
+            6_500,
+            "RTQ network ID.",
+            "ok",
+            None,
+            "none",
+            false,
+        );
+        put(
+            "canned2",
+            6_600,
+            "RTQ network ID.",
+            "ok",
+            None,
+            "none",
+            false,
+        );
         let ids = |hide_noise: bool| {
             store
                 .search(&SearchQuery {
@@ -1269,12 +1463,55 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let hidden = ids(true);
-        assert!(!hidden.contains(&"beep".to_string()));
-        for keep in ["quick", "fail", "long"] {
+        for gone in ["beep", "tag", "tail", "canned1", "canned2"] {
+            assert!(!hidden.contains(&gone.to_string()), "{gone} must hide");
+        }
+        for keep in ["quick", "quickshort", "fail", "long"] {
             assert!(hidden.contains(&keep.to_string()), "{keep} must stay");
         }
         // Off: everything shows (reveal on demand).
-        assert_eq!(ids(false).len(), 4);
+        assert_eq!(ids(false).len(), 9);
+    }
+
+    #[test]
+    fn duplicate_transcripts_lists_repeats() {
+        let store = Store::open_memory().unwrap();
+        for (id, text) in [
+            ("a", "same canned text"),
+            ("b", "same canned text"),
+            ("c", "unique line"),
+        ] {
+            store
+                .insert(&NewMessage {
+                    id: id.into(),
+                    ts_start_ms: 1_000,
+                    ts_end_ms: 2_000,
+                    freq_label: "TEST".into(),
+                    lang: "fr".into(),
+                    lang_conf: 0.9,
+                    transcript: text.into(),
+                    stt_conf: 0.8,
+                    conf_flag: "ok".into(),
+                    status: "ok".into(),
+                    fail_reason: None,
+                    audio_path: None,
+                    duration_ms: Some(2_000),
+                    size_bytes: None,
+                    short_flag: false,
+                    group_id: "g".into(),
+                    seq: 0,
+                    sender_callsign: None,
+                    sender_name: None,
+                    sender_source: "none".into(),
+                    alert: 0,
+                    speaker_key: None,
+                    corrected_text: None,
+                })
+                .expect("seed insert");
+        }
+        let dups = store.duplicate_transcripts().unwrap();
+        assert!(dups.contains("same canned text"));
+        assert!(!dups.contains("unique line"));
     }
 
     #[test]
