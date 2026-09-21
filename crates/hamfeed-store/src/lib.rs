@@ -43,64 +43,152 @@ const NOISE_BOILER: &[&str] = &[
 ];
 
 /// Whisper's French subtitle hallucinations (`Sous-titrage Société
-/// Radio-Canada`, variants): emitted over silence/noise, never spoken.
-/// Matching is accent/case/separator-insensitive; the `sous-titr*`
-/// prefix is required so a real mention of the broadcaster stays content.
+/// Radio-Canada`, variants, and the truncated repeater-ID form
+/// `Sous-titrage ST' 501`): emitted over silence/beeps/noise, never
+/// spoken. Matching is accent/case/separator-insensitive; the
+/// `sous-titr*` prefix is required so a real mention of the broadcaster
+/// stays content.
+fn flatten_tags(text: &str) -> String {
+    let folded = hamfeed_callsign::fold(text);
+    let sep_free: String = folded
+        .chars()
+        .map(|c| {
+            if c == '-' || c == '\'' || c == '’' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    sep_free.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Hallucination phrases, flattened (see `flatten_tags`).
+const HALLUCINATION_PHRASES: &[&str] = &[
+    "sous titrage societe radio canada",
+    "sous titres societe radio canada",
+    "sous titrage st 501",
+    "sous titres st 501",
+];
+
 pub fn has_hallucination_tag(text: &str) -> bool {
-    let folded = hamfeed_callsign::fold(text).replace('-', " ");
-    let flat: String = folded.split_whitespace().collect::<Vec<_>>().join(" ");
-    flat.contains("sous titrage societe radio canada")
-        || flat.contains("sous titres societe radio canada")
+    let flat = flatten_tags(text);
+    HALLUCINATION_PHRASES.iter().any(|p| flat.contains(p))
 }
 
-/// The hallucination phrases above, for stripping before the content
-/// check (a tag alone is wordless; a tag after real speech keeps the row).
-fn strip_hallucination_tags(text: &str) -> String {
-    // Fold first so one pass covers accents, case, and separators.
-    let mut out = hamfeed_callsign::fold(text).replace('-', " ");
-    for phrase in [
-        "sous titrage societe radio canada",
-        "sous titres societe radio canada",
-    ] {
-        out = out.replace(phrase, " ");
-    }
-    out
+/// Hallucination phrases as token runs (matches `flatten_tags` output
+/// token-for-token: folding lowercases and separators already split).
+fn hallucination_runs() -> Vec<Vec<&'static str>> {
+    HALLUCINATION_PHRASES
+        .iter()
+        .map(|p| p.split(' ').collect())
+        .collect()
 }
 
-/// True when a transcript holds no speech content: only bracketed
-/// non-speech tags, subtitle hallucinations, sign-off boilerplate,
-/// filler, and punctuation.
-/// Conservative by construction — a single content word keeps the row,
-/// so weak-signal fragments and hallucinations with word-shape stay
-/// visible (indistinguishable from real speech, honestly shown).
-pub fn transcript_is_noise_text(text: &str) -> bool {
-    let destrip = strip_hallucination_tags(text);
-    let mut stripped = String::with_capacity(destrip.len());
+/// Content tokens in original case: bracketed spans removed, then any
+/// token run matching a hallucination phrase skipped. Case is
+/// preserved (not folded) because the salad check needs original
+/// case — folding everything first is what would let `ABCXY` pass
+/// as a lowercase word.
+fn content_tokens(text: &str) -> Vec<String> {
+    // Bracket spans out (original case kept).
+    let mut debracket = String::with_capacity(text.len());
     let mut depth = 0u32;
-    for c in destrip.chars() {
+    for c in text.chars() {
         if c == '[' {
             depth += 1;
         } else if c == ']' {
             depth = depth.saturating_sub(1);
         } else if depth == 0 {
-            stripped.push(c);
+            debracket.push(c);
         }
     }
-    let mut any_content = false;
-    let mut any_token = false;
-    for tok in stripped.split(|c: char| !c.is_alphanumeric()) {
-        if tok.is_empty() {
-            continue;
+    let toks: Vec<&str> = debracket
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let folded: Vec<String> = toks.iter().map(|t| hamfeed_callsign::fold(t)).collect();
+    let runs = hallucination_runs();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let mut skip = 0;
+        for run in &runs {
+            if run
+                .iter()
+                .enumerate()
+                .all(|(k, w)| folded.get(i + k).is_some_and(|f| f == w))
+            {
+                skip = run.len();
+                break;
+            }
         }
-        any_token = true;
+        if skip > 0 {
+            i += skip;
+        } else {
+            out.push(toks[i].to_string());
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Tone-junk token: whisper rendering a beep/CW-ID/squelch crash as
+/// 2–6 uppercase letters (`ABCXY`, `GHI`). Real words are never
+/// all-caps in transcripts; callsigns, Q-codes, and CQ/QRZ are
+/// procedure content and exempt. Letters-only on purpose: mixed
+/// letter-digit runs (`V12CRS`) are garbled-but-real callsign shapes
+/// and stay visible for attribution.
+fn is_salad_token(tok: &str) -> bool {
+    let len = tok.chars().count();
+    if !(2..=6).contains(&len) {
+        return false;
+    }
+    if !tok.chars().all(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    let norm = hamfeed_callsign::normalize(tok);
+    if hamfeed_callsign::is_valid(&norm) || hamfeed_callsign::is_qcode(&norm) {
+        return false;
+    }
+    !matches!(norm.as_str(), "CQ" | "QRZ")
+}
+
+/// True when a transcript holds no speech content: only bracketed
+/// non-speech tags, subtitle hallucinations, sign-off boilerplate,
+/// filler, digits, tone-junk salad, and punctuation.
+/// Conservative by construction — a single lowercase content word keeps
+/// the row, so weak-signal fragments and name-like hallucinations stay
+/// visible (indistinguishable from real speech, honestly shown). What
+/// the salad rule catches is narrower: every content token all-caps
+/// with no callsign among them, the shape whisper emits for beeps,
+/// CW-IDs, and crashes (`ABCXY`), never for speech.
+pub fn transcript_is_noise_text(text: &str) -> bool {
+    let mut any_letter = false;
+    let mut content: Vec<String> = Vec::new();
+    for tok in content_tokens(text) {
         let w = tok.to_lowercase();
         if NOISE_FILLER.contains(&w.as_str()) || NOISE_BOILER.contains(&w.as_str()) {
             continue;
         }
-        any_content = true;
-        break;
+        if tok.chars().any(|c| c.is_alphabetic()) {
+            any_letter = true;
+        }
+        content.push(tok);
     }
-    !any_token || !any_content
+    if content.is_empty() {
+        return true;
+    }
+    // Digit runs alone (`12. 13. 13.`, `00`): DTMF/countdown echoes,
+    // never speech content.
+    if !any_letter {
+        return true;
+    }
+    // Letter salad with no callsign: tone-junk shape, never speech.
+    if content.iter().all(|t| is_salad_token(t)) {
+        return true;
+    }
+    false
 }
 
 /// A stored message row (plan data model, Slice 1).
@@ -1516,6 +1604,12 @@ mod tests {
             "Sous-titrage Société Radio-Canada",
             "SOUS-TITRES SOCIÉTÉ RADIO-CANADA",
             "Sous titrage Societe Radio Canada",
+            // Truncated repeater-ID form (prod: bare, with Merci, with
+            // the full tag appended) — same hallucination family.
+            "Sous-titrage ST' 501",
+            "Sous-titrage ST' 501 Merci.",
+            "Sous-titrage ST' 501 Sous-titrage Société Radio-Canada",
+            "00 Sous-titrage Société Radio-Canada",
         ] {
             assert!(transcript_is_noise_text(t), "{t:?} must read as noise");
             assert!(has_hallucination_tag(t), "{t:?} must flag");
@@ -1529,6 +1623,38 @@ mod tests {
         // prefix is content, not a hallucination.
         assert!(!has_hallucination_tag("entendu à Radio-Canada hier"));
         assert!(!has_hallucination_tag("ici VE2DEM, à vous"));
+    }
+
+    /// Tone-junk shapes from prod (beeps/CW-IDs/crashes whisper renders
+    /// as letter salad or digit runs): every content token all-caps
+    /// with no callsign among them is never speech. Single lowercase
+    /// words, garbled callsign shapes, procedure tokens, and names
+    /// stay visible.
+    #[test]
+    fn tone_junk_salad_hides() {
+        // Observed junk: hide.
+        for t in ["ABCXY", "ABCX", "12. 13. 13.", "GHI KLL"] {
+            assert!(transcript_is_noise_text(t), "{t:?} must read as noise");
+        }
+        // Known residual: salad beside a real word stays visible rather
+        // than risk hiding speech (`California` could be spoken).
+        assert!(!transcript_is_noise_text("ABCXY California"));
+        // Real content that shares fragments with junk: visible.
+        for t in [
+            "VE2ABC",              // bare callsign self-ID
+            "V12CRS",              // garbled callsign shape (letters+digits)
+            "E2KSV en fréquence.", // malformed suggestion + real words
+            "CQ",                  // procedure call
+            "QRZ?",                // procedure call
+            "QTH",                 // Q-code
+            "Victor, on a bien l'arrivée.",
+            "What? What?",
+            "Et ça va ! Merci.",
+            "VA2K Juliette Golf. Merci.",
+            "VE2DBA LSA", // real callsign beside salad keeps the row
+        ] {
+            assert!(!transcript_is_noise_text(t), "{t:?} must stay visible");
+        }
     }
 
     #[test]
