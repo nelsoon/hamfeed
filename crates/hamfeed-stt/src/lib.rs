@@ -60,7 +60,10 @@ impl std::fmt::Display for SttErr {
 pub const DEFAULT_INITIAL_PROMPT: &str = "VE2DEM, Victor Echo Two Delta \
     Echo Mike, bonsoir, je vous reçois cinq neuf, QTH Montréal, 73, à la \
     prochaine, over. Yeah, good evening, thanks for the call, QSB tonight, \
-    seventy-three.";
+    seventy-three. Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India \
+    Juliett Kilo Lima Mike November Oscar Papa Quebec Romeo Sierra Tango \
+    Uniform Victor Whiskey X-ray Yankee Zulu, un deux trois quatre cinq \
+    six sept huit neuf, ici VE2LHA, Lima Hotel Alpha.";
 
 /// Local transcriber bound to one model file + language whitelist.
 pub struct Transcriber {
@@ -68,6 +71,40 @@ pub struct Transcriber {
     whitelist: Vec<String>,
     threads: usize,
     prompt: String,
+    lang_min_conf: f64,
+    lang_fallback: Option<String>,
+}
+
+/// Decoder thread budget: an explicit cap wins; otherwise all cores
+/// minus one (never 0, never more than 4 — whisper scales poorly
+/// past that on small boxes). Taking every core starves capture and
+/// the live relay, which is worse than a slower transcript.
+pub fn resolve_threads(available: usize, explicit: Option<usize>) -> usize {
+    if let Some(t) = explicit {
+        return t.clamp(1, 4);
+    }
+    available.saturating_sub(1).clamp(1, 4)
+}
+
+/// Decode language: the detection stands at or above `min_conf`;
+/// below it a whitelisted `fallback` wins over a low-confidence
+/// guess (short/noisy clips misdetect most). No fallback configured
+/// (or not whitelisted) → detection stands regardless.
+pub fn decode_lang(
+    detected: &str,
+    conf: f64,
+    whitelist: &[String],
+    min_conf: f64,
+    fallback: Option<&str>,
+) -> String {
+    if conf < min_conf {
+        if let Some(fb) = fallback {
+            if whitelist.iter().any(|w| w == fb) && fb != detected {
+                return fb.to_string();
+            }
+        }
+    }
+    detected.to_string()
 }
 
 impl Transcriber {
@@ -75,10 +112,12 @@ impl Transcriber {
     /// [`SttErr::ModelMissing`] with download + drop-in instructions —
     /// the pipeline turns this into a loud startup refusal (S11).
     /// `prompt` overrides [`DEFAULT_INITIAL_PROMPT`] (`None` keeps it).
+    /// `threads` caps decoder threads (`None` → all cores minus one).
     pub fn open(
         model_path: &Path,
         whitelist: &[String],
         prompt: Option<&str>,
+        threads: Option<usize>,
     ) -> Result<Self, SttErr> {
         if !model_path.exists() {
             return Err(SttErr::ModelMissing(hamfeed_config::missing_model_hint(
@@ -88,15 +127,25 @@ impl Transcriber {
         let path = model_path.to_string_lossy().into_owned();
         let ctx = WhisperContext::new_with_params(&path, WhisperContextParameters::default())
             .map_err(|e| SttErr::Backend(format!("cannot load {path}: {e:?}")))?;
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 4))
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
             .unwrap_or(1);
+        let threads = resolve_threads(available, threads);
         Ok(Self {
             ctx,
             whitelist: whitelist.to_vec(),
             threads,
             prompt: prompt.unwrap_or(DEFAULT_INITIAL_PROMPT).to_string(),
+            lang_min_conf: 0.0,
+            lang_fallback: None,
         })
+    }
+
+    /// Set the language-confidence fallback after open (config-wired by
+    /// the pipeline; tests use it directly).
+    pub fn set_lang_fallback(&mut self, min_conf: f64, fallback: Option<String>) {
+        self.lang_min_conf = min_conf;
+        self.lang_fallback = fallback;
     }
 
     /// Transcribe one stored Opus clip.
@@ -133,8 +182,16 @@ impl Transcriber {
             });
         }
 
-        // Constrained decode in the detected language; never translate. The
-        // initial prompt biases vocabulary toward repeater traffic.
+        // Constrained decode in the detection language (or the
+        // configured fallback when detection is weak); never translate.
+        // The initial prompt biases vocabulary toward repeater traffic.
+        let lang = decode_lang(
+            &lang,
+            lang_conf,
+            &self.whitelist,
+            self.lang_min_conf,
+            self.lang_fallback.as_deref(),
+        );
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_initial_prompt(&self.prompt);
         params.set_n_threads(self.threads as std::ffi::c_int);
@@ -331,7 +388,7 @@ pub(crate) fn test_transcriber() -> Transcriber {
             path.display()
         );
     }
-    Transcriber::open(&path, &["fr".to_string(), "en".to_string()], None)
+    Transcriber::open(&path, &["fr".to_string(), "en".to_string()], None, None)
         .expect("test model must load")
 }
 
@@ -374,7 +431,7 @@ mod tests {
         let fallback =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/ggml-tiny.bin");
         let path = from_env.map(std::path::PathBuf::from).unwrap_or(fallback);
-        let t = Transcriber::open(&path, &["en".to_string()], Some("VE2ABC net, over"))
+        let t = Transcriber::open(&path, &["en".to_string()], Some("VE2ABC net, over"), None)
             .expect("prompted model must load");
         let out = t.transcribe(&fixture("en.ogg")).expect("en transcribes");
         assert_eq!(out.lang, "en", "lang must be en, got {}", out.lang);
@@ -413,10 +470,50 @@ mod tests {
     }
 
     #[test]
+    fn threads_leave_a_core_free() {
+        // Explicit cap wins (clamped); otherwise all cores minus one,
+        // never 0 — a saturated box starves capture + live relay.
+        assert_eq!(resolve_threads(4, Some(2)), 2);
+        assert_eq!(resolve_threads(4, Some(99)), 4);
+        assert_eq!(resolve_threads(4, Some(0)), 1);
+        assert_eq!(resolve_threads(4, None), 3);
+        assert_eq!(resolve_threads(16, None), 4);
+        assert_eq!(resolve_threads(1, None), 1);
+        assert_eq!(resolve_threads(2, None), 1);
+    }
+
+    #[test]
+    fn weak_detection_falls_back() {
+        let wl = vec!["fr".to_string(), "en".to_string()];
+        // Confident detection stands, even for the non-fallback language.
+        assert_eq!(decode_lang("en", 0.97, &wl, 0.85, Some("fr")), "en");
+        // Weak detection yields to a whitelisted fallback…
+        assert_eq!(decode_lang("en", 0.71, &wl, 0.85, Some("fr")), "fr");
+        // …but never to a language outside the whitelist…
+        assert_eq!(decode_lang("en", 0.71, &wl, 0.85, Some("es")), "en");
+        // …and 0.0 floor (default) keeps pure detection.
+        assert_eq!(decode_lang("en", 0.01, &wl, 0.0, Some("fr")), "en");
+        // Fallback equal to detection is a no-op.
+        assert_eq!(decode_lang("fr", 0.5, &wl, 0.85, Some("fr")), "fr");
+    }
+
+    #[test]
+    fn prompt_carries_nato_table() {
+        // The decoder can only reach for words the prompt offers:
+        // full NATO alphabet + French digits + a spelled callsign.
+        for w in [
+            "Lima", "Juliett", "X-ray", "Yankee", "Zulu", "sept", "VE2LHA",
+        ] {
+            assert!(DEFAULT_INITIAL_PROMPT.contains(w), "prompt must offer {w}");
+        }
+    }
+
+    #[test]
     fn missing_model_is_loud() {
         let err = match Transcriber::open(
             Path::new("/nonexistent/ggml-tiny.bin"),
             &["fr".to_string()],
+            None,
             None,
         ) {
             Ok(_) => panic!("must refuse a missing model"),

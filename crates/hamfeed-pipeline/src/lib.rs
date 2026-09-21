@@ -164,6 +164,11 @@ pub fn link_alias(
     if window_ms == 0 {
         return;
     }
+    // Never learn junk: shape-only validation once admitted `V2CSQ`
+    // into the alias table. National blocks or nothing is stored.
+    if !hamfeed_callsign::national_ok(callsign) {
+        return;
+    }
     let now_ms = now_ms();
     for (key, ts) in group_keys {
         let dt = heard_ts_ms.abs_diff(*ts) as f64;
@@ -259,6 +264,8 @@ pub fn enrich(
     my_callsign: Option<&str>,
     emergency_cues: &[String],
 ) -> Enrichment {
+    // Unit-test path: no voice alias, no regulars — only markers and
+    // the callbook may corroborate.
     enrich_profiled(
         transcript,
         lang,
@@ -267,6 +274,8 @@ pub fn enrich(
         my_callsign,
         emergency_cues,
         &[],
+        None,
+        &|_| false,
     )
 }
 
@@ -282,10 +291,14 @@ pub fn enrich(
 /// Bare sign-off callsigns and bare `73` carry no role information and
 /// keep the legacy first-hit pick. When no marker fires and every hit
 /// is negated, returns `None` so the ambiguity stays visible.
+/// Pick the sender hit plus whether an explicit on-air marker chose it
+/// (`ici Y`, `X de Y`) as opposed to the legacy first-hit fallback.
+/// Markers are the only vote the transcript casts by itself; everything
+/// else needs corroboration before it may badge as `heard`.
 fn pick_sender<'h>(
     transcript: &str,
     hits: &'h [hamfeed_callsign::CallsignHit],
-) -> Option<&'h hamfeed_callsign::CallsignHit> {
+) -> Option<(&'h hamfeed_callsign::CallsignHit, bool)> {
     /// Last whitespace token, punctuation-trimmed (`merci,` → `merci`).
     fn word(s: &str) -> &str {
         s.split_whitespace()
@@ -331,14 +344,22 @@ fn pick_sender<'h>(
         }
     }
     if let Some((_, i)) = positive {
-        return Some(&hits[i]);
+        return Some((&hits[i], true));
     }
-    first_plain.map(|i| &hits[i])
+    first_plain.map(|i| (&hits[i], false))
 }
 
 /// Profile-aware enrichment (Slice 3): `disaster_cues` is the active
 /// profile's extra set (empty under Normal). A disaster hit sets ONLY
 /// ALERT_DISASTER (ADR-8), so baseline callers see bit-identical output.
+/// Agreement rule: a transcript hit badges as `heard` only with
+/// corroboration — an explicit on-air marker, a callbook entry, the
+/// voice alias for this clip, or repeater-regular membership. A lone
+/// fuzzy hit becomes `suggested` (one-tap confirm in the UI) instead
+/// of a confident wrong badge; silence (`none`) still beats a guess.
+/// `alias_cs` is the voice-alias callsign for this clip, if any;
+/// `is_regular` tests repeater-regular membership.
+#[allow(clippy::too_many_arguments)]
 pub fn enrich_profiled(
     transcript: &str,
     lang: &str,
@@ -347,6 +368,8 @@ pub fn enrich_profiled(
     my_callsign: Option<&str>,
     emergency_cues: &[String],
     disaster_cues: &[String],
+    alias_cs: Option<&str>,
+    is_regular: &dyn Fn(&str) -> bool,
 ) -> Enrichment {
     let mut alert = 0;
     if let Some(mine) = my_callsign {
@@ -361,16 +384,18 @@ pub fn enrich_profiled(
         alert |= ALERT_DISASTER;
     }
     let hits = hamfeed_callsign::extract(transcript, lang);
-    if let Some(hit) = pick_sender(transcript, &hits) {
+    if let Some((hit, marker)) = pick_sender(transcript, &hits) {
         let mut cs = hit.normalized.clone();
         // Québec repair: a bare-V shape is a dropped Echo/Alfa in fast
         // French. Trust the callbook first — repair only when the heard
-        // form is unknown AND off the Canadian blocks. Repair applies
-        // only when EXACTLY ONE candidate is known: if both VE and VA
-        // forms exist, choosing silently would be an invisible guess, so
-        // the heard form stays and the operator sees the ambiguity (the
-        // correction then feeds the finetune loop's human gate).
-        if lookup(&cs).is_none() && !hamfeed_callsign::canadian_prefix_ok(&cs) {
+        // form is unknown AND nationally unplannable (neither Canadian
+        // nor US blocks, so DX/US forms pass through untouched). Repair
+        // applies only when EXACTLY ONE candidate is known: if both VE
+        // and VA forms exist, choosing silently would be an invisible
+        // guess, so the heard form stays and the operator sees the
+        // ambiguity (the correction then feeds the finetune loop's
+        // human gate).
+        if lookup(&cs).is_none() && !hamfeed_callsign::national_ok(&cs) {
             let mut known: Option<String> = None;
             let mut ambiguous = false;
             for cand in hamfeed_callsign::bare_v_repair_candidates(&cs) {
@@ -389,10 +414,19 @@ pub fn enrich_profiled(
             }
         }
 
+        // Corroboration votes for the (possibly repaired) candidate.
+        let known = lookup(&cs).is_some();
+        let voice = alias_cs == Some(cs.as_str());
+        let source = if marker || known || voice || is_regular(&cs) {
+            "heard"
+        } else {
+            // Lone fuzzy hit: suggest for one-tap confirm, never badge.
+            "suggested"
+        };
         return Enrichment {
             sender_callsign: Some(cs.clone()),
             sender_name: lookup(&cs),
-            sender_source: "heard".into(),
+            sender_source: source.into(),
             alert,
             speaker_key: None,
         };
@@ -496,15 +530,17 @@ impl Pipeline {
     }
 
     pub fn open_with(cfg: Config) -> Result<Self> {
-        let transcriber = Transcriber::open(
+        let mut transcriber = Transcriber::open(
             Path::new(&cfg.stt.model_path),
             &cfg.stt.lang_whitelist,
             cfg.stt.initial_prompt.as_deref(),
+            cfg.stt.threads,
         )
         .map_err(|e| match e {
             SttErr::ModelMissing(hint) => anyhow::anyhow!("{hint}"),
             other => anyhow::anyhow!("stt backend: {other}"),
         })?;
+        transcriber.set_lang_fallback(cfg.stt.lang_min_conf, cfg.stt.lang_fallback.clone());
         let store = Store::open(Path::new(&cfg.storage.db_path))?;
         let storage_dir = PathBuf::from(&cfg.storage.dir);
         std::fs::create_dir_all(&storage_dir)
@@ -656,6 +692,11 @@ impl Pipeline {
         if conf < self.cfg.voiceprint.suggest_min_conf {
             return None;
         }
+        // Junk learned before the national gate (e.g. `V2CSQ`) must
+        // never surface as a suggestion.
+        if !hamfeed_callsign::national_ok(&callsign) {
+            return None;
+        }
         Some(Enrichment {
             sender_callsign: Some(callsign.clone()),
             sender_name: self
@@ -676,7 +717,9 @@ impl Pipeline {
     /// callsign — the library reassigns.
     pub fn confirm_sender(&self, id: &str, callsign: &str) -> Result<()> {
         let cs = hamfeed_callsign::normalize(callsign);
-        if !hamfeed_callsign::is_valid(&cs) {
+        // National blocks, not bare shape: `V2CSQ` passes the shape
+        // regex but no administration ever issued it.
+        if !hamfeed_callsign::national_ok(&cs) {
             anyhow::bail!("confirm_sender: {callsign} is not a callsign");
         }
         let name = self.callbook.lookup(&cs).ok().flatten().map(|c| c.name);
@@ -731,6 +774,15 @@ impl Pipeline {
                     .expect("carry mutex")
                     .carried(item.ts_start_ms)
                     .map(str::to_string);
+                // Voice-alias vote for the agreement rule: the stored
+                // callsign for this clip's speaker key, if any.
+                let alias_cs: Option<String> = speaker_key
+                    .as_ref()
+                    .and_then(|k| self.store.get_alias(k).ok().flatten())
+                    .map(|(cs, _)| cs);
+                // Repeater regulars: callsigns this receiver actually
+                // hears. A degraded query degrades to no vote, never louder.
+                let regulars = self.store.regulars(2).unwrap_or_default();
                 let mut e = enrich_profiled(
                     &transcript,
                     &out.lang,
@@ -739,6 +791,8 @@ impl Pipeline {
                     self.cfg.station.my_callsign.as_deref(),
                     &self.cfg.notify.emergency_cues,
                     &disaster_cues,
+                    alias_cs.as_deref(),
+                    &|cs| regulars.iter().any(|r| r == cs),
                 );
                 e.speaker_key = speaker_key.clone();
                 // A heard self-ID refreshes the carry window (R2) and
@@ -1421,7 +1475,7 @@ freq_label = "TEST"
     }
 
     #[test]
-    fn heard_bare_v_ambiguous_both_known_stays_heard() {
+    fn heard_bare_v_ambiguous_both_known_stays_suggested() {
         // Both VE2CRS and VA2CRS are in the book: silently picking VE
         // would be an invisible guess, so the
         // heard form stays and the operator sees the ambiguity.
@@ -1434,7 +1488,9 @@ freq_label = "TEST"
         };
         let e = enrich("V2CRS qui reprend", "fr", None, &book, None, &[]);
         assert_eq!(e.sender_callsign.as_deref(), Some("V2CRS"));
-        assert_eq!(e.sender_source, "heard");
+        // Structurally invalid and marker-less: visible for confirm,
+        // never badged — the ambiguity is real, the badge won't pretend.
+        assert_eq!(e.sender_source, "suggested");
     }
 
     #[test]
@@ -1454,6 +1510,48 @@ freq_label = "TEST"
         // No marker at all: legacy first-hit pick is unchanged.
         let e = enrich("bonsoir VE2CRS", "fr", None, nobook, None, &[]);
         assert_eq!(e.sender_callsign.as_deref(), Some("VE2CRS"));
+    }
+
+    #[test]
+    fn lone_fuzzy_hit_suggests_never_badges() {
+        // A confident-looking bare hit with no marker, no book entry,
+        // no voice alias and no regulars history is a suggestion for
+        // one-tap confirm — never a heard badge.
+        let nobook = &|_: &str| None;
+        let e = enrich("bonsoir VE2CRS", "fr", None, nobook, None, &[]);
+        assert_eq!(e.sender_callsign.as_deref(), Some("VE2CRS"));
+        assert_eq!(e.sender_source, "suggested");
+        // Each corroboration independently restores heard.
+        let e = enrich_profiled(
+            "bonsoir VE2CRS",
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            None,
+            &|cs| cs == "VE2CRS",
+        );
+        assert_eq!(e.sender_source, "heard");
+        let e = enrich_profiled(
+            "bonsoir VE2CRS",
+            "fr",
+            None,
+            nobook,
+            None,
+            &[],
+            &[],
+            Some("VE2CRS"),
+            &|_| false,
+        );
+        assert_eq!(e.sender_source, "heard");
+        let book = &|cs: &str| (cs == "VE2CRS").then(|| "Op".to_string());
+        let e = enrich("bonsoir VE2CRS", "fr", None, book, None, &[]);
+        assert_eq!(e.sender_source, "heard");
+        // And the marker path never needed corroboration.
+        let e = enrich("ici VE2CRS", "fr", None, nobook, None, &[]);
+        assert_eq!(e.sender_source, "heard");
     }
 
     #[test]
@@ -1764,6 +1862,8 @@ freq_label = "TEST"
             None,
             &[],
             &disaster,
+            None,
+            &|_| false,
         );
         assert_eq!(e.alert & ALERT_DISASTER, ALERT_DISASTER);
         assert_eq!(e.alert & ALERT_EMERGENCY, 0);
@@ -1795,7 +1895,9 @@ freq_label = "TEST"
         ];
         for tx in cases {
             let a = enrich(tx, "fr", None, &|_| None, None, &cues());
-            let b = enrich_profiled(tx, "fr", None, &|_| None, None, &cues(), &[]);
+            let b = enrich_profiled(tx, "fr", None, &|_| None, None, &cues(), &[], None, &|_| {
+                false
+            });
             assert_eq!(a, b, "divergence on {tx:?}");
         }
     }
