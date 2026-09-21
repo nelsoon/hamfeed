@@ -328,6 +328,14 @@ CREATE TABLE IF NOT EXISTS speaker_alias(
   key TEXT PRIMARY KEY, callsign TEXT NOT NULL,
   confidence REAL NOT NULL, updated_ts INT NOT NULL
 );
+-- Persistent voice memory: the latest embedding per voice key, so a
+-- confirm taught on one key still matches the same voice after a
+-- pipeline restart or a UTC-day rollover (keys are day-scoped and the
+-- live clusterer is memory-only). Tiny rows; never pruned for now.
+CREATE TABLE IF NOT EXISTS voiceprints(
+  key TEXT PRIMARY KEY, embedding BLOB NOT NULL,
+  dim INT NOT NULL, updated_ts INT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS profiles(name TEXT PRIMARY KEY, cues TEXT NOT NULL DEFAULT '[]');
 -- Seeded idempotently: fresh files get them from this batch, pre-existing
@@ -876,6 +884,50 @@ impl Store {
         Ok(())
     }
 
+    /// Persist a voice key's latest embedding (little-endian f32 blob).
+    /// Overwrites unconditionally: the newest sample best tracks voice
+    /// drift, and rows are tiny.
+    pub fn upsert_voiceprint(&self, key: &str, emb: &[f32], updated_ts_ms: u64) -> Result<()> {
+        let mut bytes = Vec::with_capacity(emb.len() * 4);
+        for v in emb {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let conn = self.conn.lock().expect("store mutex");
+        conn.execute(
+            "INSERT INTO voiceprints(key,embedding,dim,updated_ts)
+             VALUES(?,?,?,?)
+             ON CONFLICT(key) DO UPDATE SET
+              embedding=excluded.embedding, dim=excluded.dim,
+              updated_ts=excluded.updated_ts",
+            rusqlite::params![key, bytes, emb.len() as i64, updated_ts_ms as i64],
+        )
+        .with_context(|| format!("cannot upsert voiceprint {key}"))?;
+        Ok(())
+    }
+
+    /// All stored voiceprints: `(key, embedding)`. Corrupt rows
+    /// (byte length not a multiple of 4) are skipped, never fatal.
+    pub fn all_voiceprints(&self) -> Result<Vec<(String, Vec<f32>)>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let mut stmt = conn.prepare("SELECT key, embedding FROM voiceprints")?;
+        let rows = stmt.query_map([], |r| {
+            let key: String = r.get(0)?;
+            let bytes: Vec<u8> = r.get(1)?;
+            Ok((key, bytes))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (key, bytes) = row?;
+            if bytes.len() % 4 != 0 {
+                continue;
+            }
+            let (chunks, _) = bytes.as_chunks::<4>();
+            let emb: Vec<f32> = chunks.iter().map(|c| f32::from_le_bytes(*c)).collect();
+            out.push((key, emb));
+        }
+        Ok(out)
+    }
+
     /// Look up a voice key's linked callsign, if any.
     pub fn get_alias(&self, key: &str) -> Result<Option<(String, f32)>> {
         let conn = self.conn.lock().expect("store mutex");
@@ -1127,6 +1179,17 @@ impl Store {
         let cutoff = now_ms.saturating_sub(retention_days * 86_400_000) as i64;
         let conn = self.conn.lock().expect("store mutex");
         let n = conn.execute("DELETE FROM speaker_alias WHERE updated_ts < ?", [cutoff])?;
+        Ok(n)
+    }
+
+    /// Drop voiceprints silent longer than the alias retention bound.
+    /// Live voices re-persist on every assignment, so only truly gone
+    /// voices lose rows — and their aliases expired under the same
+    /// bound. Same cutoff, same boot call, no second bound to skew.
+    pub fn purge_voiceprints(&self, retention_days: u64, now_ms: u64) -> Result<usize> {
+        let cutoff = now_ms.saturating_sub(retention_days * 86_400_000) as i64;
+        let conn = self.conn.lock().expect("store mutex");
+        let n = conn.execute("DELETE FROM voiceprints WHERE updated_ts < ?", [cutoff])?;
         Ok(n)
     }
 
@@ -2139,6 +2202,26 @@ mod tests {
             store.get_alias("Unknown-1|x|d").unwrap(),
             Some(("VE3MA".to_string(), 1.0))
         );
+    }
+
+    #[test]
+    fn voiceprint_roundtrip_latest_wins() {
+        let store = Store::open_memory().unwrap();
+        assert!(store.all_voiceprints().unwrap().is_empty());
+        store
+            .upsert_voiceprint("K1", &[0.1, 0.2, 0.3], 1000)
+            .unwrap();
+        store.upsert_voiceprint("K2", &[0.4, 0.5], 2000).unwrap();
+        // Newest sample overwrites: drift tracking, not history.
+        store
+            .upsert_voiceprint("K1", &[0.7, 0.8, 0.9], 3000)
+            .unwrap();
+        let mut got = store.all_voiceprints().unwrap();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "K1");
+        assert_eq!(got[0].1, vec![0.7f32, 0.8, 0.9]);
+        assert_eq!(got[1].1, vec![0.4f32, 0.5]);
     }
 
     #[test]
