@@ -5,10 +5,13 @@ edition.workspace = true
 
 [features]
 # Deploy note: prod runs `cargo build --release -p hamfeed-pipeline
-# --features capture` (live mic). A build without `capture` starts and
-# exits 2 in a restart loop. `voice` needs wespeaker.onnx on the box.
+# --features capture,voice,sdr` (live mic + voiceprints + B210 shim).
+# A build without `capture` starts and exits 2 in a restart loop.
+# `voice` needs wespeaker.onnx on the box; `sdr` needs the UHD shim
+# (python3 + numpy + PyUHD) where it runs.
 capture = ["hamfeed-source/capture"]
 voice = ["hamfeed-speaker/voice"]
+sdr = ["hamfeed-source/sdr"]
 
 [dependencies]
 anyhow.workspace = true

@@ -233,6 +233,11 @@ mod mic {
 #[cfg(feature = "capture")]
 pub use mic::{list_input_devices, MicSource};
 
+#[cfg(feature = "sdr")]
+mod sdr;
+#[cfg(feature = "sdr")]
+pub use sdr::{sdr_probe, ChannelWatch, ProbeArgs, ProbeRow, SdrParams, SdrSource};
+
 #[cfg(test)]
 mod tests {
     use super::*;

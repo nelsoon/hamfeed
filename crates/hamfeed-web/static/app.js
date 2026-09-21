@@ -408,6 +408,49 @@
     setProfile(profileSel.value);
   });
 
+  // SDR channel selector (Slice 4): same shape as the profile control —
+  // server-owned preset list, switch posts and refreshes. Visible only
+  // when the input kind is sdr; mic setups never see it.
+  var channelSel = document.getElementById("channel");
+  var channelWrap = document.getElementById("channelWrap");
+
+  async function setChannel(name) {
+    var res = await fetch("/api/source/channel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name }),
+    });
+    refreshChannel();
+  }
+
+  function mhz(f) {
+    return (f / 1e6).toFixed(3) + " MHz";
+  }
+
+  async function refreshChannel() {
+    var res = await fetch("/api/source");
+    if (!res.ok) return;
+    var s = await res.json();
+    if (s.kind !== "sdr" || !s.channels || !s.channels.length) {
+      channelWrap.style.display = "none";
+      return;
+    }
+    channelWrap.style.display = "";
+    channelSel.innerHTML = "";
+    s.channels.forEach(function (ch) {
+      var o = document.createElement("option");
+      o.value = ch.name;
+      o.textContent = ch.name + " " + mhz(ch.freq_hz);
+      if (ch.name === s.active) o.selected = true;
+      channelSel.appendChild(o);
+    });
+  }
+
+  channelSel.addEventListener("change", function () {
+    setChannel(channelSel.value);
+  });
+  refreshChannel();
+
   // Listen to radio (Slice 3, R7): one press streams /api/live into the
   // audio element (the click is the autoplay gesture); a second press pauses
   // and drops src, which releases the server stream. Transient stalls and

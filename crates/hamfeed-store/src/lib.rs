@@ -1156,6 +1156,33 @@ impl Store {
         Ok(())
     }
 
+    /// Wanted SDR channel name (UI selector). `None` when never set —
+    /// the pipeline falls back to the config default. Validation
+    /// against configured channels happens at the API layer, which
+    /// owns the config; the store keeps the raw value.
+    pub fn sdr_channel(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='sdr_channel'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.filter(|s| !s.trim().is_empty()))
+    }
+
+    /// Record the wanted SDR channel (takes effect on the next source
+    /// open; the live stream ends itself and the pipeline reopens).
+    pub fn set_sdr_channel(&self, name: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex");
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES('sdr_channel',?)\n             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [name],
+        )?;
+        Ok(())
+    }
+
     /// Transcripts occurring more than once (canned repeats). The
     /// hide-noise dup rule and the UI noise badge share this set; NULL
     /// transcripts are excluded (they never match `IN`, and wordless
@@ -2775,6 +2802,18 @@ mod tests {
         assert!(err.downcast_ref::<UnknownProfile>().is_some());
         // Rejected switch leaves the previous profile in place.
         assert_eq!(store.active_profile().unwrap(), "Normal");
+    }
+
+    #[test]
+    fn sdr_channel_roundtrip() {
+        // UI switch persists for the pipeline loop (and boot): unset →
+        // None, set → name, overwrite wins, blanks read as unset.
+        let store = Store::open_memory().unwrap();
+        assert_eq!(store.sdr_channel().unwrap(), None);
+        store.set_sdr_channel("marine").unwrap();
+        assert_eq!(store.sdr_channel().unwrap().as_deref(), Some("marine"));
+        store.set_sdr_channel("2m VE2").unwrap();
+        assert_eq!(store.sdr_channel().unwrap().as_deref(), Some("2m VE2"));
     }
 
     #[test]

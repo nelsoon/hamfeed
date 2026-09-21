@@ -186,6 +186,8 @@ pub fn create_app(state: AppState) -> Router {
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
         .route("/api/profile", get(api_get_profile).post(api_set_profile))
+        .route("/api/source", get(api_get_source))
+        .route("/api/source/channel", post(api_set_source_channel))
         .route("/audio/:id", get(api_audio))
         .route("/audio/:id/play.wav", get(api_audio_wav))
         .fallback_service(tower_http::services::ServeDir::new(static_dir))
@@ -450,6 +452,59 @@ async fn api_get_profile(
             .map(|p| serde_json::json!({"name": p.name, "cues": p.cues}))
             .collect::<Vec<_>>(),
     })))
+}
+
+/// SDR source state: input kind, configured channels, and the wanted
+/// channel (settings override, else config default — same resolution
+/// the pipeline capture loop uses at open time).
+async fn api_get_source(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let pipe = state.pipeline.lock().await;
+    let cfg = pipe.config();
+    let active = cfg
+        .sdr
+        .channel(
+            &pipe
+                .store()
+                .sdr_channel()
+                .unwrap_or(None)
+                .unwrap_or_default(),
+        )
+        .map(|c| c.name.clone())
+        .or_else(|| cfg.sdr.active_channel().map(|c| c.name.clone()));
+    Json(serde_json::json!({
+        "kind": cfg.source.kind,
+        "active": active,
+        "channels": cfg.sdr.channels.iter().map(|c| serde_json::json!({
+            "name": c.name, "freq_hz": c.freq_hz, "mode": c.mode,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelBody {
+    name: String,
+}
+
+/// Switch the SDR channel (new traffic only; history untouched).
+/// Unknown names are 404, never a silent no-op; the live stream ends
+/// itself and the pipeline reopens on the new channel. Broadcasts like
+/// triage so the selector updates without reload.
+async fn api_set_source_channel(
+    State(state): State<AppState>,
+    Json(body): Json<ChannelBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let active = {
+        let pipe = state.pipeline.lock().await;
+        if pipe.config().sdr.channel(&body.name).is_none() {
+            return Err((StatusCode::NOT_FOUND, "unknown channel".into()));
+        }
+        if let Err(e) = pipe.store().set_sdr_channel(&body.name) {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+        body.name.clone()
+    };
+    let _ = state.tx.send(serde_json::json!({"channel": active}));
+    Ok(Json(serde_json::json!({"active": active})))
 }
 
 #[derive(Debug, Deserialize)]
@@ -813,6 +868,16 @@ dir = "{}"
 db_path = "{}"
 retention_days = 90
 [station]
+[source]
+kind = "mic"
+[sdr]
+active = "2m VE2"
+[[sdr.channels]]
+name = "2m VE2"
+freq_hz = 145110000.0
+[[sdr.channels]]
+name = "marine"
+freq_hz = 161750000.0
 "#,
             test_model().display(),
             dir.join("audio").display(),
@@ -1627,6 +1692,52 @@ retention_days = 90
             .await
             .expect("back json");
         assert_eq!(back["active"], "Normal");
+    }
+
+    #[tokio::test]
+    async fn channel_switch_roundtrip() {
+        // SDR selector: list (kind mic here, channels still served so
+        // the UI can preview), switch, unknown-name 404, switch back.
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        let got: serde_json::Value = client
+            .get(format!("{base}/api/source"))
+            .send()
+            .await
+            .expect("source gets")
+            .json()
+            .await
+            .expect("source json");
+        assert_eq!(got["kind"], "mic");
+        assert_eq!(got["channels"].as_array().unwrap().len(), 2);
+        assert_eq!(got["active"], "2m VE2");
+        let switched: serde_json::Value = client
+            .post(format!("{base}/api/source/channel"))
+            .json(&serde_json::json!({"name": "marine"}))
+            .send()
+            .await
+            .expect("channel posts")
+            .json()
+            .await
+            .expect("switch json");
+        assert_eq!(switched["active"], "marine");
+        let missing = client
+            .post(format!("{base}/api/source/channel"))
+            .json(&serde_json::json!({"name": "Nope"}))
+            .send()
+            .await
+            .expect("unknown posts");
+        assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+        let back: serde_json::Value = client
+            .post(format!("{base}/api/source/channel"))
+            .json(&serde_json::json!({"name": "2m VE2"}))
+            .send()
+            .await
+            .expect("back posts")
+            .json()
+            .await
+            .expect("back json");
+        assert_eq!(back["active"], "2m VE2");
     }
 
     fn read_zip(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> String {
