@@ -103,8 +103,9 @@ fn default_sdr_mode() -> String {
 /// blindly. Gain 20 (usable 10-30; past 30 the AD9361 table handoffs
 /// pull adjacent junk); 250 ksps with analog BW capped at 200 kHz
 /// (the chip's own anti-intermod filter against LTE/DVB-T); squelch
-/// gate ~13 dB with ~1.5 s hang (energy VAD alone stays open on
-/// noise). TX is never touched — the shim parks it at 0.
+/// gate 14.5 dB with ~1.5 s hang (DC-removed PSD plus a
+/// concentration test; the empty-channel median sits ~11 dB).
+/// TX is never touched — the shim parks it at 0.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Sdr {
     #[serde(default = "default_sdr_python")]
@@ -146,7 +147,7 @@ fn default_sdr_bandwidth() -> f64 {
     200_000.0
 }
 fn default_sdr_squelch() -> f64 {
-    13.0
+    14.5
 }
 fn default_sdr_hang() -> f64 {
     1.5
@@ -463,7 +464,7 @@ impl Config {
         }
         if !(0.0..=40.0).contains(&s.squelch_db) {
             anyhow::bail!(
-                "[sdr] squelch_db = {} out of range (want 0..=40; measured gate ~13)",
+                "[sdr] squelch_db = {} out of range (want 0..=40; calibrated gate >= 14, empty-channel median ~11)",
                 s.squelch_db
             );
         }
@@ -669,7 +670,7 @@ mod tests {
         assert!(cfg.sdr.channels.is_empty());
         assert_eq!(cfg.sdr.gain, 20.0);
         assert_eq!(cfg.sdr.rate_hz, 250_000.0);
-        assert_eq!(cfg.sdr.squelch_db, 13.0);
+        assert_eq!(cfg.sdr.squelch_db, 14.5);
         assert!(cfg.sdr.active_channel().is_none());
     }
 
