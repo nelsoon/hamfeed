@@ -169,9 +169,15 @@ audio { flex: 1; min-width: 0; height: 34px; }
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
   padding: 8px 0;
   font-size: 13px;
   color: var(--muted);
+}
+.modebar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .modebar select {
   background: var(--card);
@@ -180,6 +186,15 @@ audio { flex: 1; min-width: 0; height: 34px; }
   border-radius: 6px;
   padding: 6px 8px;
   font-size: 13px;
+}
+.modebar input {
+  background: var(--card);
+  border: 1px solid var(--card-edge);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  width: 9ch;
 }
 .modebar button.apply[aria-pressed="true"] {
   border-color: var(--disaster);

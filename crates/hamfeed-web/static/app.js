@@ -473,7 +473,15 @@
       }
       channelSel.appendChild(o);
     });
-    if (!matched) channelSel.selectedIndex = -1;
+    if (!matched) {
+      // Manual tune: show it in the dropdown too, so the presets
+      // never read blank. Selecting it again is a no-op.
+      var c = document.createElement("option");
+      c.value = "";
+      c.textContent = "custom " + mhz(s.freq_hz) + " " + s.mode;
+      c.selected = true;
+      channelSel.appendChild(c);
+    }
     demodSel.innerHTML = "";
     (s.modes || ["nbfm"]).forEach(function (m) {
       var o = document.createElement("option");
@@ -486,6 +494,10 @@
   }
 
   channelSel.addEventListener("change", function () {
+    if (!channelSel.value) {
+      refreshChannel();
+      return;
+    }
     setChannel(channelSel.value);
   });
   tuneBtn.addEventListener("click", tune);
