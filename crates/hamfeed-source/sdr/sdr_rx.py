@@ -17,7 +17,7 @@ TX chain is parked at gain 0 and never streamed (internal leakage).
 
 Usage (stream):
   sdr_rx.py --freq 145.11e6 --gain 20 --rate 250e3 --bw 200e3 \\
-      --squelch-db 14.5 --hang-s 1.5 [--chan 0] [--antenna RX2]
+      --squelch-db 14.5 --hang-s 1.5 [--mode nbfm|am] [--chan 0] [--antenna RX2]
 
 Probe (one JSON line on stdout, then exit):
   sdr_rx.py --freq 145.11e6 --probe [--probe-secs 2]
@@ -150,13 +150,22 @@ def gate_open(snr_db, conc_db, level_dbfs, thresh_db):
 
 
 class Demod:
-    """Streaming NBFM demod: discriminator -> smooth -> resample -> DC
-    block -> fixed scale. State (hang counter, DC estimate) persists
-    across blocks; no per-block normalization (no AGC pumping)."""
+    """Streaming demod (nbfm/am): detector -> smooth -> resample ->
+    DC block -> fixed scale. State (hang counter, DC estimate,
+    AM carrier follower) persists across blocks. NBFM uses a polar
+    discriminator against an absolute Hz scale; AM normalizes by a
+    slow carrier follower (attack per block, ~0.5 s release) since
+    modulation depth has no absolute reference."""
 
-    def __init__(self, rate, squelch_db, hang_s):
+    SUPPORTED_MODES = ("nbfm", "am")
+
+    def __init__(self, rate, squelch_db, hang_s, mode="nbfm"):
+        if mode not in self.SUPPORTED_MODES:
+            raise ValueError(f"unsupported mode {mode!r}")
         self.rate = rate
+        self.mode = mode
         self.squelch_db = effective_squelch(squelch_db)
+        self.am_carrier = None
         self.hang_blocks = max(1, int(round(hang_s / BLOCK_S)))
         self.hang_left = 0
         self.k = max(int(rate / 3000), 1)
@@ -180,6 +189,22 @@ class Demod:
             self.hang_left -= 1
         if self.hang_left == 0:
             return np.zeros(self.out_per_block, dtype=np.int16), False, snr
+        if self.mode == "am":
+            # Envelope detector: magnitude -> smooth -> resample ->
+            # normalize by the slow carrier follower -> fixed scale.
+            d = np.abs(x).astype(np.float64)
+            d = np.convolve(d, self.kernel, mode="same")
+            blk_mean = float(d.mean())
+            if self.am_carrier is None:
+                self.am_carrier = blk_mean
+            else:
+                self.am_carrier += 0.1 * (blk_mean - self.am_carrier)
+            t_in = np.arange(len(d), dtype=np.float64)
+            t_out = np.linspace(0, len(d) - 1, self.out_per_block)
+            a = np.interp(t_out, t_in, d)
+            m = a / max(self.am_carrier, 1e-9) - 1.0
+            pcm = np.clip(m * 20000.0, -32768, 32767).astype(np.int16)
+            return pcm, True, snr
         # Polar discriminator (probe formula).
         d = np.angle(x[1:] * np.conj(x[:-1])) * self.rate / (2 * np.pi)
         d = np.convolve(d, self.kernel, mode="same")
@@ -200,7 +225,7 @@ def run_stream(a):
     usrp = open_usrp(a.args, a.freq, a.rate, a.gain, a.bw, a.chan, a.antenna)
     streamer = start_stream(usrp, a.chan)
     n = int(a.rate * BLOCK_S)
-    demod = Demod(a.rate, a.squelch_db, a.hang_s)
+    demod = Demod(a.rate, a.squelch_db, a.hang_s, a.mode)
     out = sys.stdout.buffer
     try:
         while True:
@@ -257,6 +282,7 @@ def main():
     ap.add_argument("--bw", type=float, default=200e3)
     ap.add_argument("--squelch-db", type=float, default=14.5)
     ap.add_argument("--hang-s", type=float, default=1.5)
+    ap.add_argument("--mode", default="nbfm", choices=list(Demod.SUPPORTED_MODES))
     ap.add_argument("--chan", type=int, default=0)
     ap.add_argument("--antenna", default="RX2")
     ap.add_argument("--args", default="")

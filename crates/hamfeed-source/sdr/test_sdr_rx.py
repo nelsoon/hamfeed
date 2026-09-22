@@ -120,6 +120,67 @@ class TestPsdSnr(unittest.TestCase):
         self.assertFalse(opened)
         self.assertTrue((pcm == 0).all())
 
+    def test_bad_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            sdr_rx.Demod(rate=250000.0, squelch_db=14.5, hang_s=1.5,
+                         mode="ssb")
+
+    def test_nbfm_recovers_fm_tone(self):
+        # Carrier FM-modulated at 1 kHz, 2.5 kHz deviation: the
+        # discriminator output must track the modulating tone.
+        n = 12500
+        t = np.arange(n) / 250000.0
+        phase = 2 * np.pi * (3000 * t
+                             + 2500 / (2 * np.pi * 1000)
+                             * np.sin(2 * np.pi * 1000 * t))
+        rng = np.random.default_rng(23)
+        x = (2.0 * np.exp(1j * phase)
+             + 0.02 * (rng.standard_normal(n)
+                       + 1j * rng.standard_normal(n))).astype(np.complex64)
+        d = sdr_rx.Demod(rate=250000.0, squelch_db=1.0, hang_s=1.5,
+                         mode="nbfm")
+        pcm, opened, _snr = d.process(x)
+        self.assertTrue(opened)
+        # Discriminator recovers frequency: the cosine, not the sine.
+        ref = np.cos(2 * np.pi * 1000 * np.arange(800) / 16000.0)
+        corr = float(np.corrcoef(pcm.astype(float), ref)[0, 1])
+        self.assertGreater(abs(corr), 0.8,
+                           f"nbfm lost the tone: corr={corr:.2f}")
+
+    def test_nbfm_silent_on_dead_carrier(self):
+        # Unmodulated carrier = constant frequency offset = DC:
+        # blocked, near silence out.
+        n = 12500
+        t = np.arange(n) / 250000.0
+        rng = np.random.default_rng(24)
+        x = (2.0 * np.exp(2j * np.pi * 3000 * t)
+             + 0.02 * (rng.standard_normal(n)
+                       + 1j * rng.standard_normal(n))).astype(np.complex64)
+        d = sdr_rx.Demod(rate=250000.0, squelch_db=1.0, hang_s=1.5,
+                         mode="nbfm")
+        pcm, opened, _snr = d.process(x)
+        self.assertTrue(opened)  # carrier holds the gate...
+        # ...but carries no audio: second block, DC blocker settled.
+        pcm2, _, _ = d.process(x)
+        self.assertLess(np.abs(pcm2.astype(float)).mean(), 500,
+                        "...but carries no audio")
+
+    def test_am_recovers_envelope(self):
+        # Carrier AM-modulated at 100 Hz, 50% depth: envelope out
+        # must track the modulating tone.
+        n = 12500
+        t = np.arange(n) / 250000.0
+        env = 1.0 + 0.5 * np.sin(2 * np.pi * 100 * t)
+        x = (2.0 * env * np.exp(2j * np.pi * 3000 * t)).astype(np.complex64)
+        d = sdr_rx.Demod(rate=250000.0, squelch_db=1.0, hang_s=1.5,
+                         mode="am")
+        pcm, opened, _snr = d.process(x)
+        self.assertTrue(opened)
+        ref = np.sin(2 * np.pi * 100 * np.arange(800) / 16000.0)
+        corr = float(np.corrcoef(pcm.astype(float), ref)[0, 1])
+        self.assertGreater(abs(corr), 0.8,
+                           f"am lost the envelope: corr={corr:.2f}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

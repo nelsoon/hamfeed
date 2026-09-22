@@ -242,12 +242,28 @@ fn run_sdr_loop(pipe: &Pipeline, config: &std::path::Path, profile: &str) {
             std::process::exit(1);
         };
         let ch = cfg.sdr.channel(&name).expect("channel validated above");
+        // Manual UI tune wins over the preset when set and in range;
+        // the watch below retunes on any later change either way.
+        let manual = pipe
+            .store()
+            .sdr_freq()
+            .unwrap_or(None)
+            .filter(|f| hamfeed_source::FREQ_RANGE.contains(f))
+            .map(|f| {
+                let m = pipe.store().sdr_mode().unwrap_or_else(|_| "nbfm".into());
+                (f, m)
+            });
+        let (freq_hz, mode) = match manual {
+            Some((f, m)) => (f, m),
+            None => (ch.freq_hz, ch.mode.clone()),
+        };
         let params = hamfeed_source::SdrParams {
             python: cfg.sdr.python.clone(),
             script: cfg.sdr.script.clone(),
             db_path: cfg.storage.db_path.clone(),
             channel: name.clone(),
-            freq_hz: ch.freq_hz,
+            freq_hz,
+            mode: mode.clone(),
             gain: cfg.sdr.gain,
             rate_hz: cfg.sdr.rate_hz,
             bandwidth_hz: cfg.sdr.bandwidth_hz,
@@ -260,8 +276,8 @@ fn run_sdr_loop(pipe: &Pipeline, config: &std::path::Path, profile: &str) {
             std::process::exit(1);
         });
         eprintln!(
-            "hamfeed-pipeline: capturing SDR {name} ({:.3} MHz, profile {profile})",
-            ch.freq_hz / 1e6
+            "hamfeed-pipeline: capturing SDR {name} ({:.3} MHz, {mode}, profile {profile})",
+            freq_hz / 1e6
         );
         match pipe.run_source(
             &mut src,

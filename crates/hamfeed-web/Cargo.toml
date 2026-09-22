@@ -15,6 +15,7 @@ futures-util = "0.3"
 zip = "2"
 hamfeed-ingest = { path = "../hamfeed-ingest", features = ["opus"] }
 hamfeed-store = { path = "../hamfeed-store" }
+hamfeed-source = { path = "../hamfeed-source", features = ["sdr"] }
 hamfeed-pipeline = { path = "../hamfeed-pipeline" }
 hamfeed-callsign = { path = "../hamfeed-callsign" }
 

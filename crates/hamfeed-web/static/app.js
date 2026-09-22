@@ -408,11 +408,18 @@
     setProfile(profileSel.value);
   });
 
-  // SDR channel selector (Slice 4): same shape as the profile control —
-  // server-owned preset list, switch posts and refreshes. Visible only
-  // when the input kind is sdr; mic setups never see it.
+  // SDR tuning (Slice 4 + manual tune): preset dropdown plus a
+  // frequency (MHz) + demodulation entry. Server owns the preset
+  // list and the supported modes; tune posts {freq_hz, mode} and
+  // the pipeline retunes live. Visible only when the input kind is
+  // sdr; mic setups never see it.
   var channelSel = document.getElementById("channel");
   var channelWrap = document.getElementById("channelWrap");
+  var tuneWrap = document.getElementById("tuneWrap");
+  var freqInput = document.getElementById("freq");
+  var demodSel = document.getElementById("demod");
+  var tuneBtn = document.getElementById("tune");
+  var tuneErr = document.getElementById("tuneErr");
 
   async function setChannel(name) {
     var res = await fetch("/api/source/channel", {
@@ -427,27 +434,63 @@
     return (f / 1e6).toFixed(3) + " MHz";
   }
 
+  async function tune() {
+    tuneErr.textContent = "";
+    var mhzVal = parseFloat(freqInput.value);
+    if (!isFinite(mhzVal)) {
+      tuneErr.textContent = "enter MHz";
+      return;
+    }
+    var res = await fetch("/api/source/channel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ freq_hz: Math.round(mhzVal * 1e6), mode: demodSel.value }),
+    });
+    if (!res.ok) tuneErr.textContent = "rejected (" + res.status + ")";
+    refreshChannel();
+  }
+
   async function refreshChannel() {
     var res = await fetch("/api/source");
     if (!res.ok) return;
     var s = await res.json();
     if (s.kind !== "sdr" || !s.channels || !s.channels.length) {
       channelWrap.style.display = "none";
+      tuneWrap.style.display = "none";
       return;
     }
     channelWrap.style.display = "";
+    tuneWrap.style.display = "";
     channelSel.innerHTML = "";
+    var matched = false;
     s.channels.forEach(function (ch) {
       var o = document.createElement("option");
       o.value = ch.name;
       o.textContent = ch.name + " " + mhz(ch.freq_hz);
-      if (ch.name === s.active) o.selected = true;
+      if (ch.name === s.active) {
+        o.selected = true;
+        matched = true;
+      }
       channelSel.appendChild(o);
     });
+    if (!matched) channelSel.selectedIndex = -1;
+    demodSel.innerHTML = "";
+    (s.modes || ["nbfm"]).forEach(function (m) {
+      var o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      if (m === s.mode) o.selected = true;
+      demodSel.appendChild(o);
+    });
+    if (s.freq_hz) freqInput.value = (s.freq_hz / 1e6).toFixed(3);
   }
 
   channelSel.addEventListener("change", function () {
     setChannel(channelSel.value);
+  });
+  tuneBtn.addEventListener("click", tune);
+  freqInput.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter") tune();
   });
   refreshChannel();
 

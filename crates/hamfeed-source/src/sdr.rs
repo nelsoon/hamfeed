@@ -24,6 +24,14 @@ const WATCH_EVERY_FRAMES: u64 = 25;
 
 /// Settings-table key the UI writes and the stream watches.
 pub const SDR_CHANNEL_KEY: &str = "sdr_channel";
+/// Manual tune override (Hz, text) the UI frequency entry writes.
+pub const SDR_FREQ_KEY: &str = "sdr_freq_hz";
+/// Demod mode for a manual tune (`nbfm`/`am`).
+pub const SDR_MODE_KEY: &str = "sdr_mode";
+/// Demod modes the shim implements (mirrors `Demod.SUPPORTED_MODES`).
+pub const SUPPORTED_MODES: &[&str] = &["nbfm", "am"];
+/// Manual-tune range (Hz); mirrors the config channel validation.
+pub const FREQ_RANGE: std::ops::RangeInclusive<f64> = 1e6..=6e9;
 
 /// Open parameters, built from `[sdr]` config + the active channel.
 #[derive(Debug, Clone)]
@@ -33,6 +41,7 @@ pub struct SdrParams {
     pub db_path: String,
     pub channel: String,
     pub freq_hz: f64,
+    pub mode: String,
     pub gain: f64,
     pub rate_hz: f64,
     pub bandwidth_hz: f64,
@@ -49,6 +58,8 @@ impl SdrParams {
                 self.script.clone(),
                 "--freq".into(),
                 self.freq_hz.to_string(),
+                "--mode".into(),
+                self.mode.clone(),
                 "--gain".into(),
                 self.gain.to_string(),
                 "--rate".into(),
@@ -144,47 +155,83 @@ pub fn sdr_probe(args: &ProbeArgs) -> Result<ProbeRow> {
 
 /// Watches the wanted channel: the opened name until the settings
 /// table says otherwise. Pure + unit-tested; the stream consults it.
+/// Wanted tune: preset channel plus an optional manual frequency/
+/// mode override (the UI frequency entry). Equality drives retune.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tune {
+    pub channel: String,
+    pub freq_hz: Option<f64>,
+    pub mode: String,
+}
+
 pub struct ChannelWatch {
     db_path: String,
-    channel: String,
+    opened: Tune,
 }
 
 impl ChannelWatch {
-    pub fn new(db_path: &str, channel: &str) -> Self {
+    pub fn new(db_path: &str, channel: &str, freq_hz: f64, mode: &str) -> Self {
         Self {
             db_path: db_path.into(),
-            channel: channel.into(),
+            opened: Tune {
+                channel: channel.into(),
+                freq_hz: Some(freq_hz),
+                mode: mode.into(),
+            },
         }
     }
 
-    /// Current wanted channel: settings value when set and non-empty,
-    /// else the opened one. A missing DB degrades to "stay" — capture
-    /// never dies because the UI store is briefly locked.
-    pub fn wanted(&self) -> String {
-        match channel_from_db(&self.db_path) {
-            Ok(Some(name)) if !name.trim().is_empty() => name,
-            _ => self.channel.clone(),
+    /// Current wanted tune: manual override when set (freq) else the
+    /// opened values; blank/garbage reads as unset. A missing DB
+    /// degrades to "stay" — capture never dies because the UI store
+    /// is briefly locked.
+    pub fn wanted(&self) -> Tune {
+        let channel = setting_from_db(&self.db_path, SDR_CHANNEL_KEY)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.opened.channel.clone());
+        let override_hz = setting_from_db(&self.db_path, SDR_FREQ_KEY)
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|f| f.is_finite());
+        let freq_hz = override_hz.or(self.opened.freq_hz);
+        let mode = setting_from_db(&self.db_path, SDR_MODE_KEY)
+            .filter(|s| SUPPORTED_MODES.contains(&s.as_str()))
+            .unwrap_or_else(|| {
+                if override_hz.is_some() {
+                    "nbfm".into()
+                } else {
+                    self.opened.mode.clone()
+                }
+            });
+        Tune {
+            channel,
+            freq_hz,
+            mode,
         }
     }
 
-    /// True when the operator switched away from the opened channel.
+    /// True when the operator retuned away from the opened signal.
     pub fn changed(&self) -> bool {
-        self.wanted() != self.channel
+        self.wanted() != self.opened
+    }
+
+    /// Channel this instance was opened on (retune target bookkeeping).
+    pub fn channel(&self) -> &str {
+        &self.opened.channel
     }
 }
 
-/// Read the wanted channel straight from the settings table (same
+/// Read one settings value straight from the table (same
 /// `settings(key, value)` shape the store owns; this crate stays
 /// independent of hamfeed-store).
-fn channel_from_db(db_path: &str) -> Result<Option<String>> {
+fn setting_from_db(db_path: &str, key: &str) -> Option<String> {
     let conn =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?")?;
-    let mut rows = stmt.query([SDR_CHANNEL_KEY])?;
-    if let Some(row) = rows.next()? {
-        return Ok(Some(row.get(0)?));
-    }
-    Ok(None)
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let mut stmt = conn
+        .prepare("SELECT value FROM settings WHERE key = ?")
+        .ok()?;
+    let mut rows = stmt.query([key]).ok()?;
+    rows.next().ok()??.get(0).ok()
 }
 
 /// Read fixed-size S16LE records into frames. Short reads and EOF end
@@ -252,14 +299,19 @@ impl SdrSource {
         Ok(Self {
             child,
             out,
-            watch: ChannelWatch::new(&params.db_path, &params.channel),
+            watch: ChannelWatch::new(
+                &params.db_path,
+                &params.channel,
+                params.freq_hz,
+                &params.mode,
+            ),
             frames_since_poll: 0,
         })
     }
 
     /// Channel this instance was opened on (retune target bookkeeping).
     pub fn channel(&self) -> &str {
-        &self.watch.channel
+        self.watch.channel()
     }
 }
 
@@ -305,8 +357,12 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Temp settings DB with the wanted channel preset.
+    /// Temp settings DB with wanted channel/freq/mode preset.
     fn temp_db(wanted: Option<&str>) -> String {
+        temp_db_full(wanted, None, None)
+    }
+
+    fn temp_db_full(wanted: Option<&str>, freq: Option<&str>, mode: Option<&str>) -> String {
         let path = std::env::temp_dir().join(format!(
             "hamfeed-sdr-test-{}-{}.db",
             std::process::id(),
@@ -315,12 +371,15 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch("CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .unwrap();
-        if let Some(w) = wanted {
-            conn.execute(
-                "INSERT INTO settings(key, value) VALUES ('sdr_channel', ?)",
-                [w],
-            )
-            .unwrap();
+        for (k, v) in [
+            ("sdr_channel", wanted),
+            ("sdr_freq_hz", freq),
+            ("sdr_mode", mode),
+        ] {
+            if let Some(val) = v {
+                conn.execute("INSERT INTO settings(key, value) VALUES (?, ?)", [k, val])
+                    .unwrap();
+            }
         }
         path.to_string_lossy().into_owned()
     }
@@ -365,21 +424,45 @@ mod tests {
     fn watch_follows_settings_or_stays() {
         // Settings naming another channel: switched.
         let db = temp_db(Some("marine"));
-        let w = ChannelWatch::new(&db, "2m VE2");
-        assert_eq!(w.wanted(), "marine");
+        let w = ChannelWatch::new(&db, "2m VE2", 145110000.0, "nbfm");
+        assert_eq!(w.wanted().channel, "marine");
         assert!(w.changed());
         // Empty value: stay on the opened channel.
         let db = temp_db(Some(""));
-        let w = ChannelWatch::new(&db, "2m VE2");
-        assert_eq!(w.wanted(), "2m VE2");
+        let w = ChannelWatch::new(&db, "2m VE2", 145110000.0, "nbfm");
+        assert_eq!(w.wanted().channel, "2m VE2");
         assert!(!w.changed());
         // Missing key: stay.
         let db = temp_db(None);
-        let w = ChannelWatch::new(&db, "2m VE2");
+        let w = ChannelWatch::new(&db, "2m VE2", 145110000.0, "nbfm");
         assert!(!w.changed());
         // Missing DB file: stay (capture never dies on a locked store).
-        let w = ChannelWatch::new("/nonexistent/hamfeed-test.db", "2m VE2");
+        let w = ChannelWatch::new(
+            "/nonexistent/hamfeed-test.db",
+            "2m VE2",
+            145110000.0,
+            "nbfm",
+        );
         assert!(!w.changed());
+    }
+
+    #[test]
+    fn watch_follows_freq_and_mode_tune() {
+        // Manual UI tune (freq + mode): retune fires; same values stay.
+        let db = temp_db_full(None, Some("161775000"), Some("am"));
+        let w = ChannelWatch::new(&db, "marine", 161750000.0, "nbfm");
+        let t = w.wanted();
+        assert_eq!(t.freq_hz, Some(161775000.0));
+        assert_eq!(t.mode, "am");
+        assert!(w.changed());
+        let w2 = ChannelWatch::new(&db, "marine", 161775000.0, "am");
+        assert!(!w2.changed());
+        // Garbage freq reads as unset (stay); garbage mode falls back.
+        let db = temp_db_full(None, Some("junk"), Some("ssb"));
+        let w3 = ChannelWatch::new(&db, "marine", 161750000.0, "nbfm");
+        assert_eq!(w3.wanted().freq_hz, Some(161750000.0));
+        assert_eq!(w3.wanted().mode, "nbfm");
+        assert!(!w3.changed());
     }
 
     #[test]
@@ -445,6 +528,7 @@ mod tests {
             db_path: db,
             channel: "stub".into(),
             freq_hz: 145110000.0,
+            mode: "nbfm".into(),
             gain: 20.0,
             rate_hz: 250000.0,
             bandwidth_hz: 200000.0,

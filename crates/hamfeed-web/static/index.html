@@ -22,6 +22,7 @@
   <div class="modebar">
     <label>mode <select id="profile" aria-label="Operating profile"></select></label>
     <label id="channelWrap" style="display:none">channel <select id="channel" aria-label="SDR channel"></select></label>
+    <label id="tuneWrap" style="display:none">tune <input id="freq" aria-label="Frequency in MHz" inputmode="decimal" size="9" placeholder="145.110"> <select id="demod" aria-label="Demodulation"></select> <button class="apply" id="tune">tune</button> <span class="correction-err" id="tuneErr"></span></label>
     <button class="apply" id="listen" aria-pressed="false">Listen to radio</button>
     <audio id="liveAudio" preload="none"></audio>
   </div>
