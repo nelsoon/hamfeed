@@ -244,18 +244,21 @@ fn run_sdr_loop(pipe: &Pipeline, config: &std::path::Path, profile: &str) {
         let ch = cfg.sdr.channel(&name).expect("channel validated above");
         // Manual UI tune wins over the preset when set and in range;
         // the watch below retunes on any later change either way.
-        let manual = pipe
+        let freq_override = pipe
             .store()
             .sdr_freq()
             .unwrap_or(None)
-            .filter(|f| hamfeed_source::FREQ_RANGE.contains(f))
-            .map(|f| {
-                let m = pipe.store().sdr_mode().unwrap_or_else(|_| "nbfm".into());
-                (f, m)
-            });
-        let (freq_hz, mode) = match manual {
-            Some((f, m)) => (f, m),
-            None => (ch.freq_hz, ch.mode.clone()),
+            .filter(|f| hamfeed_source::FREQ_RANGE.contains(f));
+        let mode_override = freq_override.and_then(|_| {
+            pipe.store()
+                .sdr_mode()
+                .ok()
+                .filter(|m| hamfeed_source::SUPPORTED_MODES.contains(&m.as_str()))
+        });
+        let (freq_hz, mode) = match (freq_override, mode_override.clone()) {
+            (Some(f), Some(m)) => (f, m),
+            (Some(f), None) => (f, "nbfm".into()),
+            (None, _) => (ch.freq_hz, ch.mode.clone()),
         };
         let params = hamfeed_source::SdrParams {
             python: cfg.sdr.python.clone(),
@@ -264,6 +267,8 @@ fn run_sdr_loop(pipe: &Pipeline, config: &std::path::Path, profile: &str) {
             channel: name.clone(),
             freq_hz,
             mode: mode.clone(),
+            freq_override,
+            mode_override: mode_override.clone(),
             gain: cfg.sdr.gain,
             rate_hz: cfg.sdr.rate_hz,
             bandwidth_hz: cfg.sdr.bandwidth_hz,

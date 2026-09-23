@@ -538,7 +538,7 @@ async fn api_set_source_channel(
             if !freq_hz.is_finite() || !hamfeed_source::FREQ_RANGE.contains(&freq_hz) {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "freq_hz out of range (want 1 MHz..=6 GHz)".into(),
+                    "freq_hz out of range (want 70 MHz..=6 GHz, B210 tune range)".into(),
                 ));
             }
             let mode = body.mode.unwrap_or_else(|| "nbfm".into());
@@ -1852,7 +1852,7 @@ freq_hz = 161750000.0
         for bad in [
             serde_json::json!({}),
             serde_json::json!({"name": "marine", "freq_hz": 1.0}),
-            serde_json::json!({"freq_hz": 1.0}),
+            serde_json::json!({"freq_hz": 1670000.0}),
             serde_json::json!({"freq_hz": 161775000.0, "mode": "ssb"}),
         ] {
             assert_eq!(

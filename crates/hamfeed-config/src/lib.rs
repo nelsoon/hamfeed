@@ -422,9 +422,9 @@ impl Config {
             if !seen.insert(c.name.clone()) {
                 anyhow::bail!("[sdr] duplicate channel name {:?}", c.name);
             }
-            if !(1e6..=6e9).contains(&c.freq_hz) {
+            if !(70e6..=6e9).contains(&c.freq_hz) {
                 anyhow::bail!(
-                    "[sdr] channel {:?} freq {} out of range (want 1 MHz..=6 GHz)",
+                    "[sdr] channel {:?} freq {} out of range (want 70 MHz..=6 GHz, B210 tune range)",
                     c.name,
                     c.freq_hz
                 );
