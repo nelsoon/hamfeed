@@ -418,6 +418,7 @@
   var tuneWrap = document.getElementById("tuneWrap");
   var freqInput = document.getElementById("freq");
   var demodSel = document.getElementById("demod");
+  var gainInput = document.getElementById("gain");
   var tuneBtn = document.getElementById("tune");
   var tuneErr = document.getElementById("tuneErr");
 
@@ -441,10 +442,33 @@
       tuneErr.textContent = "enter MHz";
       return;
     }
+    var gainVal = gainInput.value.trim() === "" ? null : parseFloat(gainInput.value);
+    if (gainVal !== null && !isFinite(gainVal)) {
+      tuneErr.textContent = "gain 10-30 dB";
+      return;
+    }
+    var body = { freq_hz: Math.round(mhzVal * 1e6), mode: demodSel.value };
+    if (gainVal !== null) body.gain = gainVal;
     var res = await fetch("/api/source/channel", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ freq_hz: Math.round(mhzVal * 1e6), mode: demodSel.value }),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) tuneErr.textContent = "rejected (" + res.status + ")";
+    refreshChannel();
+  }
+
+  async function setGain() {
+    tuneErr.textContent = "";
+    var gainVal = parseFloat(gainInput.value);
+    if (!isFinite(gainVal)) {
+      tuneErr.textContent = "gain 10-30 dB";
+      return;
+    }
+    var res = await fetch("/api/source/channel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gain: gainVal }),
     });
     if (!res.ok) tuneErr.textContent = "rejected (" + res.status + ")";
     refreshChannel();
@@ -478,7 +502,7 @@
       // never read blank. Selecting it again is a no-op.
       var c = document.createElement("option");
       c.value = "";
-      c.textContent = "custom " + mhz(s.freq_hz) + " " + s.mode;
+      c.textContent = "custom " + mhz(s.freq_hz) + " " + String(s.mode).toUpperCase();
       c.selected = true;
       channelSel.appendChild(c);
     }
@@ -486,11 +510,12 @@
     (s.modes || ["nbfm"]).forEach(function (m) {
       var o = document.createElement("option");
       o.value = m;
-      o.textContent = m;
+      o.textContent = String(m).toUpperCase();
       if (m === s.mode) o.selected = true;
       demodSel.appendChild(o);
     });
     if (s.freq_hz) freqInput.value = (s.freq_hz / 1e6).toFixed(3);
+    if (s.gain !== undefined && s.gain !== null) gainInput.value = s.gain;
   }
 
   channelSel.addEventListener("change", function () {
@@ -504,6 +529,7 @@
   freqInput.addEventListener("keydown", function (ev) {
     if (ev.key === "Enter") tune();
   });
+  gainInput.addEventListener("change", setGain);
   refreshChannel();
 
   // Listen to radio (Slice 3, R7): one press streams /api/live into the

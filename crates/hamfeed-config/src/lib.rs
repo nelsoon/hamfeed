@@ -86,7 +86,8 @@ impl Default for Sdr {
 
 /// One listenable channel: a named frequency. Bandwidth and gain are
 /// station constants (measured), not per-channel knobs — the mode
-/// alone selects the demod path (`nbfm` or `am`; `ssb` later).
+/// alone selects the demod path (`nbfm`, `am` or broadcast-`wfm` mono;
+/// `ssb` later).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SdrChannel {
     pub name: String,
@@ -429,9 +430,9 @@ impl Config {
                     c.freq_hz
                 );
             }
-            if c.mode != "nbfm" && c.mode != "am" {
+            if !["nbfm", "am", "wfm"].contains(&c.mode.as_str()) {
                 anyhow::bail!(
-                    "[sdr] channel {:?} mode = {:?} unsupported (want \"nbfm\" or \"am\"; ssb later)",
+                    "[sdr] channel {:?} mode = {:?} unsupported (want \"nbfm\", \"am\" or \"wfm\"; ssb later)",
                     c.name,
                     c.mode
                 );

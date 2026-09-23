@@ -1228,7 +1228,7 @@ impl Store {
                 r.get(0)
             })
             .optional()?;
-        Ok(v.filter(|s| s == "nbfm" || s == "am")
+        Ok(v.filter(|s| ["nbfm", "am", "wfm"].contains(&s.as_str()))
             .unwrap_or_else(|| "nbfm".into()))
     }
 
@@ -1238,6 +1238,30 @@ impl Store {
         conn.execute(
             "INSERT INTO settings(key,value) VALUES('sdr_mode',?)\n             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [mode],
+        )?;
+        Ok(())
+    }
+
+    /// Manual RF gain override in dB (UI gain entry, 10..=30 usable).
+    /// `None` when unset or unparseable — the pipeline then uses the
+    /// configured station gain.
+    pub fn sdr_gain(&self) -> Result<Option<f64>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let v: Option<String> = conn
+            .query_row("SELECT value FROM settings WHERE key='sdr_gain'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(v.and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|g| g.is_finite()))
+    }
+
+    /// Record a manual gain (takes effect like a channel switch).
+    pub fn set_sdr_gain(&self, gain_db: f64) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex");
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES('sdr_gain',?)\n             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [gain_db.to_string()],
         )?;
         Ok(())
     }
@@ -2889,9 +2913,14 @@ mod tests {
         assert_eq!(store.sdr_mode().unwrap(), "am");
         store.set_sdr_mode("ssb").unwrap();
         assert_eq!(store.sdr_mode().unwrap(), "nbfm");
+        store.set_sdr_gain(25.0).unwrap();
+        assert_eq!(store.sdr_gain().unwrap(), Some(25.0));
         store.set_sdr_channel("marine").unwrap();
         assert_eq!(store.sdr_freq().unwrap(), None);
         assert_eq!(store.sdr_mode().unwrap(), "nbfm");
+        // Gain is a receiver knob, not part of the tune: presets
+        // leave it alone.
+        assert_eq!(store.sdr_gain().unwrap(), Some(25.0));
     }
 
     #[test]

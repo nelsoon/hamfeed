@@ -255,11 +255,17 @@ fn run_sdr_loop(pipe: &Pipeline, config: &std::path::Path, profile: &str) {
                 .ok()
                 .filter(|m| hamfeed_source::SUPPORTED_MODES.contains(&m.as_str()))
         });
+        let gain_override = pipe
+            .store()
+            .sdr_gain()
+            .unwrap_or(None)
+            .filter(|g| hamfeed_source::GAIN_RANGE.contains(g));
         let (freq_hz, mode) = match (freq_override, mode_override.clone()) {
             (Some(f), Some(m)) => (f, m),
             (Some(f), None) => (f, "nbfm".into()),
             (None, _) => (ch.freq_hz, ch.mode.clone()),
         };
+        let gain = gain_override.unwrap_or(cfg.sdr.gain);
         let params = hamfeed_source::SdrParams {
             python: cfg.sdr.python.clone(),
             script: cfg.sdr.script.clone(),
@@ -269,7 +275,8 @@ fn run_sdr_loop(pipe: &Pipeline, config: &std::path::Path, profile: &str) {
             mode: mode.clone(),
             freq_override,
             mode_override: mode_override.clone(),
-            gain: cfg.sdr.gain,
+            gain_override,
+            gain,
             rate_hz: cfg.sdr.rate_hz,
             bandwidth_hz: cfg.sdr.bandwidth_hz,
             squelch_db: cfg.sdr.squelch_db,
@@ -281,7 +288,7 @@ fn run_sdr_loop(pipe: &Pipeline, config: &std::path::Path, profile: &str) {
             std::process::exit(1);
         });
         eprintln!(
-            "hamfeed-pipeline: capturing SDR {name} ({:.3} MHz, {mode}, profile {profile})",
+            "hamfeed-pipeline: capturing SDR {name} ({:.3} MHz, {mode}, gain {gain}, profile {profile})",
             freq_hz / 1e6
         );
         match pipe.run_source(

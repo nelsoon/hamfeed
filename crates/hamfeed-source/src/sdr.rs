@@ -28,8 +28,12 @@ pub const SDR_CHANNEL_KEY: &str = "sdr_channel";
 pub const SDR_FREQ_KEY: &str = "sdr_freq_hz";
 /// Demod mode for a manual tune (`nbfm`/`am`).
 pub const SDR_MODE_KEY: &str = "sdr_mode";
+/// Manual RF gain override in dB (UI gain entry).
+pub const SDR_GAIN_KEY: &str = "sdr_gain";
+/// Usable B210 gain window (measured 10-30); the API rejects outside.
+pub const GAIN_RANGE: std::ops::RangeInclusive<f64> = 10.0..=30.0;
 /// Demod modes the shim implements (mirrors `Demod.SUPPORTED_MODES`).
-pub const SUPPORTED_MODES: &[&str] = &["nbfm", "am"];
+pub const SUPPORTED_MODES: &[&str] = &["nbfm", "am", "wfm"];
 /// Manual-tune range (Hz); mirrors the config channel validation
 /// (B210/AD9361 tunes 70 MHz..=6 GHz — AM broadcast band is out).
 pub const FREQ_RANGE: std::ops::RangeInclusive<f64> = 70e6..=6e9;
@@ -47,6 +51,7 @@ pub struct SdrParams {
     /// above drive the shim). Needed so clearing an override retunes.
     pub freq_override: Option<f64>,
     pub mode_override: Option<String>,
+    pub gain_override: Option<f64>,
     pub gain: f64,
     pub rate_hz: f64,
     pub bandwidth_hz: f64,
@@ -172,6 +177,7 @@ pub struct Tune {
     pub channel: String,
     pub freq_override: Option<f64>,
     pub mode_override: Option<String>,
+    pub gain_override: Option<f64>,
 }
 
 pub struct ChannelWatch {
@@ -185,6 +191,7 @@ impl ChannelWatch {
         channel: &str,
         freq_override: Option<f64>,
         mode_override: Option<String>,
+        gain_override: Option<f64>,
     ) -> Self {
         Self {
             db_path: db_path.into(),
@@ -192,6 +199,7 @@ impl ChannelWatch {
                 channel: channel.into(),
                 freq_override,
                 mode_override,
+                gain_override,
             },
         }
     }
@@ -217,10 +225,16 @@ impl ChannelWatch {
             setting_from_db(&self.db_path, SDR_MODE_KEY)
                 .filter(|s| SUPPORTED_MODES.contains(&s.as_str())),
         );
+        // Same range rule as loop/API: out-of-window gain reads as
+        // unset everywhere, so no flap on stale keys.
+        let gain_override = setting_from_db(&self.db_path, SDR_GAIN_KEY)
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|g| g.is_finite() && GAIN_RANGE.contains(g));
         Tune {
             channel,
             freq_override,
             mode_override,
+            gain_override,
         }
     }
 
@@ -319,6 +333,7 @@ impl SdrSource {
                 &params.channel,
                 params.freq_override,
                 params.mode_override.clone(),
+                params.gain_override,
             ),
             frames_since_poll: 0,
         })
@@ -374,10 +389,15 @@ mod tests {
 
     /// Temp settings DB with wanted channel/freq/mode preset.
     fn temp_db(wanted: Option<&str>) -> String {
-        temp_db_full(wanted, None, None)
+        temp_db_full(wanted, None, None, None)
     }
 
-    fn temp_db_full(wanted: Option<&str>, freq: Option<&str>, mode: Option<&str>) -> String {
+    fn temp_db_full(
+        wanted: Option<&str>,
+        freq: Option<&str>,
+        mode: Option<&str>,
+        gain: Option<&str>,
+    ) -> String {
         let path = std::env::temp_dir().join(format!(
             "hamfeed-sdr-test-{}-{}.db",
             std::process::id(),
@@ -390,6 +410,7 @@ mod tests {
             ("sdr_channel", wanted),
             ("sdr_freq_hz", freq),
             ("sdr_mode", mode),
+            ("sdr_gain", gain),
         ] {
             if let Some(val) = v {
                 conn.execute("INSERT INTO settings(key, value) VALUES (?, ?)", [k, val])
@@ -439,46 +460,62 @@ mod tests {
     fn watch_follows_settings_or_stays() {
         // Settings naming another channel: switched.
         let db = temp_db(Some("marine"));
-        let w = ChannelWatch::new(&db, "2m VE2", None, None);
+        let w = ChannelWatch::new(&db, "2m VE2", None, None, None);
         assert_eq!(w.wanted().channel, "marine");
         assert!(w.changed());
         // Empty value: stay on the opened channel.
         let db = temp_db(Some(""));
-        let w = ChannelWatch::new(&db, "2m VE2", None, None);
+        let w = ChannelWatch::new(&db, "2m VE2", None, None, None);
         assert_eq!(w.wanted().channel, "2m VE2");
         assert!(!w.changed());
         // Missing key: stay.
         let db = temp_db(None);
-        let w = ChannelWatch::new(&db, "2m VE2", None, None);
+        let w = ChannelWatch::new(&db, "2m VE2", None, None, None);
         assert!(!w.changed());
         // Missing DB file: stay (capture never dies on a locked store).
-        let w = ChannelWatch::new("/nonexistent/hamfeed-test.db", "2m VE2", None, None);
+        let w = ChannelWatch::new("/nonexistent/hamfeed-test.db", "2m VE2", None, None, None);
         assert!(!w.changed());
     }
 
     #[test]
     fn watch_follows_freq_and_mode_tune() {
         // Manual UI tune (freq + mode): retune fires; same values stay.
-        let db = temp_db_full(None, Some("161775000"), Some("am"));
-        let w = ChannelWatch::new(&db, "marine", None, None);
+        let db = temp_db_full(None, Some("161775000"), Some("am"), None);
+        let w = ChannelWatch::new(&db, "marine", None, None, None);
         let t = w.wanted();
         assert_eq!(t.freq_override, Some(161775000.0));
         assert_eq!(t.mode_override.as_deref(), Some("am"));
         assert!(w.changed());
-        let w2 = ChannelWatch::new(&db, "marine", Some(161775000.0), Some("am".into()));
+        let w2 = ChannelWatch::new(&db, "marine", Some(161775000.0), Some("am".into()), None);
         assert!(!w2.changed());
         // Garbage freq/mode reads as unset (stay).
-        let db = temp_db_full(None, Some("junk"), Some("ssb"));
-        let w3 = ChannelWatch::new(&db, "marine", None, None);
+        let db = temp_db_full(None, Some("junk"), Some("ssb"), None);
+        let w3 = ChannelWatch::new(&db, "marine", None, None, None);
         assert_eq!(w3.wanted().freq_override, None);
         assert_eq!(w3.wanted().mode_override, None);
         assert!(!w3.changed());
         // Out-of-range freq (below the B210 floor) also reads as
         // unset, matching the loop/API rule — no flap on stale keys.
-        let db = temp_db_full(None, Some("1670000"), Some("am"));
-        let w4 = ChannelWatch::new(&db, "marine", None, None);
+        let db = temp_db_full(None, Some("1670000"), Some("am"), None);
+        let w4 = ChannelWatch::new(&db, "marine", None, None, None);
         assert_eq!(w4.wanted().freq_override, None);
         assert!(!w4.changed());
+    }
+
+    #[test]
+    fn watch_follows_gain_knob() {
+        // Gain override retunes; same value stays; out-of-window
+        // reads as unset (same rule as loop/API).
+        let db = temp_db_full(None, None, None, Some("25"));
+        let w = ChannelWatch::new(&db, "marine", None, None, None);
+        assert_eq!(w.wanted().gain_override, Some(25.0));
+        assert!(w.changed());
+        let w2 = ChannelWatch::new(&db, "marine", None, None, Some(25.0));
+        assert!(!w2.changed());
+        let db = temp_db_full(None, None, None, Some("5"));
+        let w3 = ChannelWatch::new(&db, "marine", None, None, None);
+        assert_eq!(w3.wanted().gain_override, None);
+        assert!(!w3.changed());
     }
 
     #[test]
@@ -487,7 +524,7 @@ mod tests {
         // keys deleted): wanted differs from opened, so the loop
         // reopens instead of sticking on the old frequency.
         let db = temp_db(Some("marine"));
-        let w = ChannelWatch::new(&db, "marine", Some(161775000.0), Some("nbfm".into()));
+        let w = ChannelWatch::new(&db, "marine", Some(161775000.0), Some("nbfm".into()), None);
         assert_eq!(w.wanted().freq_override, None);
         assert!(w.changed());
     }
@@ -558,6 +595,7 @@ mod tests {
             mode: "nbfm".into(),
             freq_override: None,
             mode_override: None,
+            gain_override: None,
             gain: 20.0,
             rate_hz: 250000.0,
             bandwidth_hz: 200000.0,

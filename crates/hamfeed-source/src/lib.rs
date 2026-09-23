@@ -237,7 +237,8 @@ pub use mic::{list_input_devices, MicSource};
 mod sdr;
 #[cfg(feature = "sdr")]
 pub use sdr::{
-    sdr_probe, ChannelWatch, ProbeArgs, ProbeRow, SdrParams, SdrSource, FREQ_RANGE, SUPPORTED_MODES,
+    sdr_probe, ChannelWatch, ProbeArgs, ProbeRow, SdrParams, SdrSource, FREQ_RANGE, GAIN_RANGE,
+    SUPPORTED_MODES,
 };
 
 #[cfg(test)]

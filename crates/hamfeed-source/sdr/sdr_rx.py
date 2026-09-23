@@ -150,14 +150,19 @@ def gate_open(snr_db, conc_db, level_dbfs, thresh_db):
 
 
 class Demod:
-    """Streaming demod (nbfm/am): detector -> smooth -> resample ->
-    DC block -> fixed scale. State (hang counter, DC estimate,
+    """Streaming demod (nbfm/am/wfm): detector -> smooth -> resample
+    -> DC block -> fixed scale. State (hang counter, DC estimate,
     AM carrier follower) persists across blocks. NBFM uses a polar
     discriminator against an absolute Hz scale; AM normalizes by a
     slow carrier follower (attack per block, ~0.5 s release) since
-    modulation depth has no absolute reference."""
+    modulation depth has no absolute reference; WFM mono is the same
+    discriminator rescaled to 75 kHz deviation plus 75 us
+    de-emphasis (tuning broadcast FM with the NBFM scale clips ~30x
+    over — that distortion is demod mismatch, not RF gain)."""
 
-    SUPPORTED_MODES = ("nbfm", "am")
+    SUPPORTED_MODES = ("nbfm", "am", "wfm")
+    WFM_DEVIATION_HZ = 75000.0
+    WFM_TAU_S = 75e-6
 
     def __init__(self, rate, squelch_db, hang_s, mode="nbfm"):
         if mode not in self.SUPPORTED_MODES:
@@ -205,6 +210,8 @@ class Demod:
             m = a / max(self.am_carrier, 1e-9) - 1.0
             pcm = np.clip(m * 20000.0, -32768, 32767).astype(np.int16)
             return pcm, True, snr
+        if self.mode == "wfm":
+            return self._demod_wfm(x, snr)
         # Polar discriminator (probe formula).
         d = np.angle(x[1:] * np.conj(x[:-1])) * self.rate / (2 * np.pi)
         d = np.convolve(d, self.kernel, mode="same")
@@ -218,6 +225,30 @@ class Demod:
             self.dc += 0.005 * (v - self.dc)
             y[i] = v - self.dc
         pcm = np.clip(y * self.scale, -32768, 32767).astype(np.int16)
+        return pcm, True, snr
+
+    def _demod_wfm(self, x, snr):
+        """Broadcast FM mono: wide discriminator, no 3 kHz smoothing
+        (voice-grade lowpass would muffle it), linear-interp resample,
+        75 us de-emphasis, DC block, fixed 75 kHz-deviation scale."""
+        d = np.angle(x[1:] * np.conj(x[:-1])) * self.rate / (2 * np.pi)
+        t_in = np.arange(len(d), dtype=np.float64)
+        t_out = np.linspace(0, len(d) - 1, self.out_per_block)
+        a = np.interp(t_out, t_in, d)
+        # De-emphasis at OUT_RATE: one-pole lowpass, tau = 75 us.
+        alpha = (1.0 / OUT_RATE) / (self.WFM_TAU_S + 1.0 / OUT_RATE)
+        e = np.empty_like(a)
+        acc = a[0] if len(a) else 0.0
+        for i, v in enumerate(a):
+            acc += alpha * (v - acc)
+            e[i] = acc
+        # DC block (same streaming substitute as NBFM).
+        y = np.empty_like(e)
+        for i, v in enumerate(e):
+            self.dc += 0.005 * (v - self.dc)
+            y[i] = v - self.dc
+        scale = 0.8 * 32767 / self.WFM_DEVIATION_HZ
+        pcm = np.clip(y * scale, -32768, 32767).astype(np.int16)
         return pcm, True, snr
 
 

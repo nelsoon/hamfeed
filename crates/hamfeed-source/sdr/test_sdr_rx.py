@@ -165,6 +165,48 @@ class TestPsdSnr(unittest.TestCase):
         self.assertLess(np.abs(pcm2.astype(float)).mean(), 500,
                         "...but carries no audio")
 
+    def test_wfm_recovers_tone_without_clipping(self):
+        # Broadcast FM: 1 kHz tone at full 75 kHz deviation. NBFM
+        # scaling would clip this ~30x over; the WFM path must track
+        # it near full scale but unclipped.
+        n = 12500
+        t = np.arange(n) / 250000.0
+        phase = 2 * np.pi * (3000 * t
+                             + 75000 / (2 * np.pi * 1000)
+                             * np.sin(2 * np.pi * 1000 * t))
+        rng = np.random.default_rng(31)
+        x = (2.0 * np.exp(1j * phase)
+             + 0.02 * (rng.standard_normal(n)
+                       + 1j * rng.standard_normal(n))).astype(np.complex64)
+        d = sdr_rx.Demod(rate=250000.0, squelch_db=1.0, hang_s=1.5,
+                         mode="wfm")
+        pcm, opened, _snr = d.process(x)
+        self.assertTrue(opened)
+        ref = np.cos(2 * np.pi * 1000 * np.arange(800) / 16000.0)
+        corr = float(np.corrcoef(pcm.astype(float), ref)[0, 1])
+        self.assertGreater(abs(corr), 0.8,
+                           f"wfm lost the tone: corr={corr:.2f}")
+        self.assertLess(np.abs(pcm.astype(float)).max(), 32767,
+                        "wfm clipped at full deviation")
+
+    def test_wfm_deemphasis_rolls_off_highs(self):
+        # 75 us de-emphasis (-3 dB at ~2.1 kHz): a 5 kHz tone must
+        # come out weaker than a 1 kHz tone at equal deviation.
+        def level(f_hz):
+            n = 12500
+            t = np.arange(n) / 250000.0
+            phase = 2 * np.pi * (3000 * t
+                                 + 20000 / (2 * np.pi * f_hz)
+                                 * np.sin(2 * np.pi * f_hz * t))
+            x = (2.0 * np.exp(1j * phase)).astype(np.complex64)
+            d = sdr_rx.Demod(rate=250000.0, squelch_db=1.0, hang_s=1.5,
+                             mode="wfm")
+            d.process(x)  # settle DC blocker
+            pcm, _, _ = d.process(x)
+            return np.abs(pcm.astype(float)).mean()
+        self.assertGreater(level(1000), level(5000) * 1.5,
+                           "no de-emphasis rolloff measured")
+
     def test_am_recovers_envelope(self):
         # Carrier AM-modulated at 100 Hz, 50% depth: envelope out
         # must track the modulating tone.
