@@ -13,6 +13,13 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub audio: Audio,
+    /// Input selector (old configs omit it → `mic`, unchanged behavior).
+    #[serde(default)]
+    pub source: Source,
+    /// B210 station parameters (old configs omit them → measured
+    /// defaults, empty channel list).
+    #[serde(default)]
+    pub sdr: Sdr,
     #[serde(default)]
     pub ingest: Ingest,
     pub vad: Vad,
@@ -38,6 +45,137 @@ pub struct Config {
 pub struct Audio {
     pub device: String,
     pub sample_rate: u32,
+}
+
+/// Audio input selector. `mic` is the cpal path (unchanged default);
+/// `sdr` spawns the UHD capture shim and feeds gated 16 kHz frames.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Source {
+    #[serde(default = "default_source_kind")]
+    pub kind: String,
+}
+
+fn default_source_kind() -> String {
+    "mic".into()
+}
+
+impl Default for Source {
+    fn default() -> Self {
+        Self {
+            kind: default_source_kind(),
+        }
+    }
+}
+
+impl Default for Sdr {
+    fn default() -> Self {
+        Self {
+            python: default_sdr_python(),
+            script: default_sdr_script(),
+            gain: default_sdr_gain(),
+            rate_hz: default_sdr_rate(),
+            bandwidth_hz: default_sdr_bandwidth(),
+            squelch_db: default_sdr_squelch(),
+            hang_s: default_sdr_hang(),
+            antenna: default_sdr_antenna(),
+            active: String::new(),
+            channels: Vec::new(),
+        }
+    }
+}
+
+/// One listenable channel: a named frequency. Bandwidth and gain are
+/// station constants (measured), not per-channel knobs — the mode
+/// alone selects the demod path (`nbfm`, `am` or broadcast-`wfm` mono;
+/// `ssb` later).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SdrChannel {
+    pub name: String,
+    pub freq_hz: f64,
+    #[serde(default = "default_sdr_mode")]
+    pub mode: String,
+}
+
+fn default_sdr_mode() -> String {
+    "nbfm".into()
+}
+
+/// B210 station parameters, measured on 10.0.2.102 — do not re-tune
+/// blindly. Gain 20 (usable 10-30; past 30 the AD9361 table handoffs
+/// pull adjacent junk); 250 ksps with analog BW capped at 200 kHz
+/// (the chip's own anti-intermod filter against LTE/DVB-T); squelch
+/// gate 14.5 dB with ~1.5 s hang (DC-removed PSD plus a
+/// concentration test; the empty-channel median sits ~11 dB).
+/// TX is never touched — the shim parks it at 0.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Sdr {
+    #[serde(default = "default_sdr_python")]
+    pub python: String,
+    #[serde(default = "default_sdr_script")]
+    pub script: String,
+    #[serde(default = "default_sdr_gain")]
+    pub gain: f64,
+    #[serde(default = "default_sdr_rate")]
+    pub rate_hz: f64,
+    #[serde(default = "default_sdr_bandwidth")]
+    pub bandwidth_hz: f64,
+    #[serde(default = "default_sdr_squelch")]
+    pub squelch_db: f64,
+    #[serde(default = "default_sdr_hang")]
+    pub hang_s: f64,
+    #[serde(default = "default_sdr_antenna")]
+    pub antenna: String,
+    /// Active channel name; empty selects the first channel.
+    #[serde(default)]
+    pub active: String,
+    #[serde(default)]
+    pub channels: Vec<SdrChannel>,
+}
+
+fn default_sdr_python() -> String {
+    "python3".into()
+}
+fn default_sdr_script() -> String {
+    "sdr/sdr_rx.py".into()
+}
+fn default_sdr_gain() -> f64 {
+    20.0
+}
+fn default_sdr_rate() -> f64 {
+    250_000.0
+}
+fn default_sdr_bandwidth() -> f64 {
+    200_000.0
+}
+fn default_sdr_squelch() -> f64 {
+    14.5
+}
+fn default_sdr_hang() -> f64 {
+    1.5
+}
+fn default_sdr_antenna() -> String {
+    "RX2".into()
+}
+
+impl Sdr {
+    /// Active channel: the named one, else the first. `None` when no
+    /// channels are configured at all.
+    pub fn active_channel(&self) -> Option<&SdrChannel> {
+        if self.channels.is_empty() {
+            return None;
+        }
+        if !self.active.is_empty() {
+            if let Some(c) = self.channels.iter().find(|c| c.name == self.active) {
+                return Some(c);
+            }
+        }
+        self.channels.first()
+    }
+
+    /// Look up a channel by name (UI switching + validation).
+    pub fn channel(&self, name: &str) -> Option<&SdrChannel> {
+        self.channels.iter().find(|c| c.name == name)
+    }
 }
 
 fn default_beep_split() -> bool {
@@ -269,6 +407,77 @@ fn hang_in_range(what: &str, hang_ms: u64) -> Result<()> {
 }
 
 impl Config {
+    /// Station parameters are measured on 10.0.2.102 — ranges below
+    /// encode what was verified, not guesses. A value outside fails
+    /// loudly rather than capturing garbage.
+    fn validate_sdr(&self) -> Result<()> {
+        let s = &self.sdr;
+        if s.channels.is_empty() {
+            anyhow::bail!("[sdr] kind is \"sdr\" but no [[sdr.channels]] are configured");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for c in &s.channels {
+            if c.name.trim().is_empty() {
+                anyhow::bail!("[sdr] channel with empty name");
+            }
+            if !seen.insert(c.name.clone()) {
+                anyhow::bail!("[sdr] duplicate channel name {:?}", c.name);
+            }
+            if !(70e6..=6e9).contains(&c.freq_hz) {
+                anyhow::bail!(
+                    "[sdr] channel {:?} freq {} out of range (want 70 MHz..=6 GHz, B210 tune range)",
+                    c.name,
+                    c.freq_hz
+                );
+            }
+            if !["nbfm", "am", "wfm"].contains(&c.mode.as_str()) {
+                anyhow::bail!(
+                    "[sdr] channel {:?} mode = {:?} unsupported (want \"nbfm\", \"am\" or \"wfm\"; ssb later)",
+                    c.name,
+                    c.mode
+                );
+            }
+        }
+        if !s.active.is_empty() && s.channel(&s.active).is_none() {
+            anyhow::bail!("[sdr] active = {:?} names no configured channel", s.active);
+        }
+        if !(0.0..=40.0).contains(&s.gain) {
+            anyhow::bail!(
+                "[sdr] gain = {} out of range (want 0..=40; measured usable 10-30)",
+                s.gain
+            );
+        }
+        if !(50_000.0..=4_000_000.0).contains(&s.rate_hz) {
+            anyhow::bail!("[sdr] rate_hz = {} out of range (want 50k..=4M)", s.rate_hz);
+        }
+        if !(1_000.0..=200_000.0).contains(&s.bandwidth_hz) {
+            anyhow::bail!(
+                "[sdr] bandwidth_hz = {} out of range (want 1k..=200k: wider re-admits LTE/DVB-T)",
+                s.bandwidth_hz
+            );
+        }
+        if s.bandwidth_hz > s.rate_hz {
+            anyhow::bail!(
+                "[sdr] bandwidth_hz = {} exceeds rate_hz = {}",
+                s.bandwidth_hz,
+                s.rate_hz
+            );
+        }
+        if !(0.0..=40.0).contains(&s.squelch_db) {
+            anyhow::bail!(
+                "[sdr] squelch_db = {} out of range (want 0..=40; calibrated gate >= 14, empty-channel median ~11)",
+                s.squelch_db
+            );
+        }
+        if !(0.2..=5.0).contains(&s.hang_s) {
+            anyhow::bail!("[sdr] hang_s = {} out of range (want 0.2..=5)", s.hang_s);
+        }
+        non_empty("[sdr] python", &s.python)?;
+        non_empty("[sdr] script", &s.script)?;
+        non_empty("[sdr] antenna", &s.antenna)?;
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         non_empty("[audio] device", &self.audio.device)?;
         if !(8000..=48000).contains(&self.audio.sample_rate) {
@@ -276,6 +485,15 @@ impl Config {
                 "[audio] sample_rate = {} out of range (want 8000..=48000)",
                 self.audio.sample_rate
             );
+        }
+        if self.source.kind != "mic" && self.source.kind != "sdr" {
+            anyhow::bail!(
+                "[source] kind = \"{}\" unsupported (want \"mic\" or \"sdr\")",
+                self.source.kind
+            );
+        }
+        if self.source.kind == "sdr" {
+            self.validate_sdr()?;
         }
         if self.vad.engine.trim().is_empty() {
             anyhow::bail!("[vad] engine must not be empty (want \"energy\")");
@@ -442,6 +660,77 @@ mod tests {
         assert_eq!(cfg.stt.lang_min_conf, 0.0);
         assert_eq!(cfg.stt.lang_fallback, None);
         assert_eq!(cfg.storage.retention_days, 90);
+    }
+
+    #[test]
+    fn source_defaults_to_mic() {
+        // Old configs (and the example) omit [source]/[sdr]: capture
+        // behavior is unchanged, with measured SDR defaults waiting.
+        let cfg = parse(EXAMPLE).expect("example must parse");
+        assert_eq!(cfg.source.kind, "mic");
+        assert!(cfg.sdr.channels.is_empty());
+        assert_eq!(cfg.sdr.gain, 20.0);
+        assert_eq!(cfg.sdr.rate_hz, 250_000.0);
+        assert_eq!(cfg.sdr.squelch_db, 14.5);
+        assert!(cfg.sdr.active_channel().is_none());
+    }
+
+    const SDR_OK: &str = r#"
+[sdr]
+active = "marine"
+[[sdr.channels]]
+name = "2m VE2"
+freq_hz = 145110000.0
+[[sdr.channels]]
+name = "marine"
+freq_hz = 161750000.0
+mode = "nbfm"
+"#;
+
+    /// Example (mic default) plus the station channels, flipped to sdr.
+    fn sdr_example() -> String {
+        EXAMPLE.replace("kind = \"mic\"", "kind = \"sdr\"") + SDR_OK
+    }
+
+    #[test]
+    fn sdr_channels_parse_and_resolve() {
+        let text = sdr_example();
+        let cfg = parse(&text).expect("sdr config must parse");
+        assert_eq!(cfg.source.kind, "sdr");
+        assert_eq!(cfg.sdr.channels.len(), 2);
+        // Named active wins; unnamed falls back to the first channel.
+        assert_eq!(cfg.sdr.active_channel().unwrap().name, "marine");
+        let mut anon = cfg.sdr.clone();
+        anon.active.clear();
+        assert_eq!(anon.active_channel().unwrap().name, "2m VE2");
+        assert_eq!(anon.channel("marine").unwrap().freq_hz, 161750000.0);
+        assert!(anon.channel("nope").is_none());
+    }
+
+    #[test]
+    fn sdr_validation_rejects_garbage() {
+        // kind=sdr with no channels.
+        let bad = EXAMPLE.replace("kind = \"mic\"", "kind = \"sdr\"");
+        assert!(parse(&bad).is_err());
+        // Unknown kind.
+        let bad = EXAMPLE.replace("kind = \"mic\"", "kind = \"fm\"");
+        assert!(parse(&bad).is_err());
+        // Overrides splice into the [sdr] header (a second [sdr] table
+        // after the channels would be invalid TOML, not a validation
+        // failure — test the validator, not the parser).
+        let with =
+            |key: &str| sdr_example().replace("[sdr]\nactive", &format!("[sdr]\n{key}\nactive"));
+        // Gain past the measured-usable ceiling.
+        assert!(parse(&with("gain = 45.0")).is_err());
+        // Wide-open analog bandwidth re-admits the local giants.
+        assert!(parse(&with("bandwidth_hz = 1000000.0")).is_err());
+        // Active naming nothing (duplicate keys would fail in the
+        // parser instead — swap the value, don't add a second key).
+        let bad = sdr_example().replace("active = \"marine\"", "active = \"nope\"");
+        assert!(parse(&bad).is_err());
+        // Non-nbfm mode has no demod path yet.
+        let bad = sdr_example().replace("marine\"\nfreq_hz", "marine\"\nmode = \"ssb\"\nfreq_hz");
+        assert!(parse(&bad).is_err());
     }
 
     #[test]

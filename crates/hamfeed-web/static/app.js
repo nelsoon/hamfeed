@@ -408,6 +408,130 @@
     setProfile(profileSel.value);
   });
 
+  // SDR tuning (Slice 4 + manual tune): preset dropdown plus a
+  // frequency (MHz) + demodulation entry. Server owns the preset
+  // list and the supported modes; tune posts {freq_hz, mode} and
+  // the pipeline retunes live. Visible only when the input kind is
+  // sdr; mic setups never see it.
+  var channelSel = document.getElementById("channel");
+  var channelWrap = document.getElementById("channelWrap");
+  var tuneWrap = document.getElementById("tuneWrap");
+  var freqInput = document.getElementById("freq");
+  var demodSel = document.getElementById("demod");
+  var gainInput = document.getElementById("gain");
+  var tuneBtn = document.getElementById("tune");
+  var tuneErr = document.getElementById("tuneErr");
+
+  async function setChannel(name) {
+    var res = await fetch("/api/source/channel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name }),
+    });
+    refreshChannel();
+  }
+
+  function mhz(f) {
+    return (f / 1e6).toFixed(3) + " MHz";
+  }
+
+  async function tune() {
+    tuneErr.textContent = "";
+    var mhzVal = parseFloat(freqInput.value);
+    if (!isFinite(mhzVal)) {
+      tuneErr.textContent = "enter MHz";
+      return;
+    }
+    var gainVal = gainInput.value.trim() === "" ? null : parseFloat(gainInput.value);
+    if (gainVal !== null && !isFinite(gainVal)) {
+      tuneErr.textContent = "gain 10-30 dB";
+      return;
+    }
+    var body = { freq_hz: Math.round(mhzVal * 1e6), mode: demodSel.value };
+    if (gainVal !== null) body.gain = gainVal;
+    var res = await fetch("/api/source/channel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) tuneErr.textContent = "rejected (" + res.status + ")";
+    refreshChannel();
+  }
+
+  async function setGain() {
+    tuneErr.textContent = "";
+    var gainVal = parseFloat(gainInput.value);
+    if (!isFinite(gainVal)) {
+      tuneErr.textContent = "gain 10-30 dB";
+      return;
+    }
+    var res = await fetch("/api/source/channel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gain: gainVal }),
+    });
+    if (!res.ok) tuneErr.textContent = "rejected (" + res.status + ")";
+    refreshChannel();
+  }
+
+  async function refreshChannel() {
+    var res = await fetch("/api/source");
+    if (!res.ok) return;
+    var s = await res.json();
+    if (s.kind !== "sdr" || !s.channels || !s.channels.length) {
+      channelWrap.style.display = "none";
+      tuneWrap.style.display = "none";
+      return;
+    }
+    channelWrap.style.display = "";
+    tuneWrap.style.display = "";
+    channelSel.innerHTML = "";
+    var matched = false;
+    s.channels.forEach(function (ch) {
+      var o = document.createElement("option");
+      o.value = ch.name;
+      o.textContent = ch.name + " " + mhz(ch.freq_hz);
+      if (ch.name === s.active) {
+        o.selected = true;
+        matched = true;
+      }
+      channelSel.appendChild(o);
+    });
+    if (!matched) {
+      // Manual tune: show it in the dropdown too, so the presets
+      // never read blank. Selecting it again is a no-op.
+      var c = document.createElement("option");
+      c.value = "";
+      c.textContent = "custom " + mhz(s.freq_hz) + " " + String(s.mode).toUpperCase();
+      c.selected = true;
+      channelSel.appendChild(c);
+    }
+    demodSel.innerHTML = "";
+    (s.modes || ["nbfm"]).forEach(function (m) {
+      var o = document.createElement("option");
+      o.value = m;
+      o.textContent = String(m).toUpperCase();
+      if (m === s.mode) o.selected = true;
+      demodSel.appendChild(o);
+    });
+    if (s.freq_hz) freqInput.value = (s.freq_hz / 1e6).toFixed(3);
+    if (s.gain !== undefined && s.gain !== null) gainInput.value = s.gain;
+  }
+
+  channelSel.addEventListener("change", function () {
+    if (!channelSel.value) {
+      refreshChannel();
+      return;
+    }
+    setChannel(channelSel.value);
+  });
+  tuneBtn.addEventListener("click", tune);
+  freqInput.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter") tune();
+  });
+  gainInput.addEventListener("change", setGain);
+  refreshChannel();
+
   // Listen to radio (Slice 3, R7): one press streams /api/live into the
   // audio element (the click is the autoplay gesture); a second press pauses
   // and drops src, which releases the server stream. Transient stalls and

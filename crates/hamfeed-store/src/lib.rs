@@ -1156,6 +1156,116 @@ impl Store {
         Ok(())
     }
 
+    /// Wanted SDR channel name (UI selector). `None` when never set —
+    /// the pipeline falls back to the config default. Validation
+    /// against configured channels happens at the API layer, which
+    /// owns the config; the store keeps the raw value.
+    pub fn sdr_channel(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='sdr_channel'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.filter(|s| !s.trim().is_empty()))
+    }
+
+    /// Record the wanted SDR channel (takes effect on the next source
+    /// open; the live stream ends itself and the pipeline reopens).
+    /// Selecting a preset clears any manual frequency/mode tune.
+    pub fn set_sdr_channel(&self, name: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex");
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES('sdr_channel',?)\n             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [name],
+        )?;
+        conn.execute(
+            "DELETE FROM settings WHERE key IN ('sdr_freq_hz','sdr_mode')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Manual tune override in Hz (UI frequency entry). `None` when
+    /// never set, cleared, or unparseable — the pipeline then tunes
+    /// the active preset channel. Stored as text like its neighbors.
+    pub fn sdr_freq(&self) -> Result<Option<f64>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='sdr_freq_hz'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|f| f.is_finite()))
+    }
+
+    /// Record a manual tune (takes effect like a channel switch).
+    /// Non-finite values clear the override instead of storing junk.
+    pub fn set_sdr_freq(&self, freq_hz: f64) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex");
+        if freq_hz.is_finite() {
+            conn.execute(
+                "INSERT INTO settings(key,value) VALUES('sdr_freq_hz',?)\n                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [freq_hz.to_string()],
+            )?;
+        } else {
+            conn.execute("DELETE FROM settings WHERE key='sdr_freq_hz'", [])?;
+        }
+        Ok(())
+    }
+
+    /// Demod mode for a manual tune (`nbfm`/`am`; defaults to `nbfm`
+    /// when unset). Preset channels carry their own mode from config.
+    pub fn sdr_mode(&self) -> Result<String> {
+        let conn = self.conn.lock().expect("store mutex");
+        let v: Option<String> = conn
+            .query_row("SELECT value FROM settings WHERE key='sdr_mode'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(v.filter(|s| ["nbfm", "am", "wfm"].contains(&s.as_str()))
+            .unwrap_or_else(|| "nbfm".into()))
+    }
+
+    /// Record the demod mode for a manual tune.
+    pub fn set_sdr_mode(&self, mode: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex");
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES('sdr_mode',?)\n             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [mode],
+        )?;
+        Ok(())
+    }
+
+    /// Manual RF gain override in dB (UI gain entry, 10..=30 usable).
+    /// `None` when unset or unparseable — the pipeline then uses the
+    /// configured station gain.
+    pub fn sdr_gain(&self) -> Result<Option<f64>> {
+        let conn = self.conn.lock().expect("store mutex");
+        let v: Option<String> = conn
+            .query_row("SELECT value FROM settings WHERE key='sdr_gain'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(v.and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|g| g.is_finite()))
+    }
+
+    /// Record a manual gain (takes effect like a channel switch).
+    pub fn set_sdr_gain(&self, gain_db: f64) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex");
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES('sdr_gain',?)\n             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [gain_db.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Transcripts occurring more than once (canned repeats). The
     /// hide-noise dup rule and the UI noise badge share this set; NULL
     /// transcripts are excluded (they never match `IN`, and wordless
@@ -2775,6 +2885,42 @@ mod tests {
         assert!(err.downcast_ref::<UnknownProfile>().is_some());
         // Rejected switch leaves the previous profile in place.
         assert_eq!(store.active_profile().unwrap(), "Normal");
+    }
+
+    #[test]
+    fn sdr_channel_roundtrip() {
+        // UI switch persists for the pipeline loop (and boot): unset →
+        // None, set → name, overwrite wins, blanks read as unset.
+        let store = Store::open_memory().unwrap();
+        assert_eq!(store.sdr_channel().unwrap(), None);
+        store.set_sdr_channel("marine").unwrap();
+        assert_eq!(store.sdr_channel().unwrap().as_deref(), Some("marine"));
+        store.set_sdr_channel("2m VE2").unwrap();
+        assert_eq!(store.sdr_channel().unwrap().as_deref(), Some("2m VE2"));
+    }
+
+    #[test]
+    fn sdr_tune_roundtrip() {
+        // Manual UI tune: freq override + mode persist; unset reads
+        // as None/`nbfm`; garbage parses as unset; selecting a preset
+        // clears the override.
+        let store = Store::open_memory().unwrap();
+        assert_eq!(store.sdr_freq().unwrap(), None);
+        assert_eq!(store.sdr_mode().unwrap(), "nbfm");
+        store.set_sdr_freq(161_775_000.0).unwrap();
+        store.set_sdr_mode("am").unwrap();
+        assert_eq!(store.sdr_freq().unwrap(), Some(161_775_000.0));
+        assert_eq!(store.sdr_mode().unwrap(), "am");
+        store.set_sdr_mode("ssb").unwrap();
+        assert_eq!(store.sdr_mode().unwrap(), "nbfm");
+        store.set_sdr_gain(25.0).unwrap();
+        assert_eq!(store.sdr_gain().unwrap(), Some(25.0));
+        store.set_sdr_channel("marine").unwrap();
+        assert_eq!(store.sdr_freq().unwrap(), None);
+        assert_eq!(store.sdr_mode().unwrap(), "nbfm");
+        // Gain is a receiver knob, not part of the tune: presets
+        // leave it alone.
+        assert_eq!(store.sdr_gain().unwrap(), Some(25.0));
     }
 
     #[test]

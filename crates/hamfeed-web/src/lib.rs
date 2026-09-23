@@ -186,6 +186,8 @@ pub fn create_app(state: AppState) -> Router {
         .route("/api/events", get(api_events))
         .route("/api/live", get(api_live))
         .route("/api/profile", get(api_get_profile).post(api_set_profile))
+        .route("/api/source", get(api_get_source))
+        .route("/api/source/channel", post(api_set_source_channel))
         .route("/audio/:id", get(api_audio))
         .route("/audio/:id/play.wav", get(api_audio_wav))
         .fallback_service(tower_http::services::ServeDir::new(static_dir))
@@ -450,6 +452,163 @@ async fn api_get_profile(
             .map(|p| serde_json::json!({"name": p.name, "cues": p.cues}))
             .collect::<Vec<_>>(),
     })))
+}
+
+/// SDR source state: input kind, configured channels, and the wanted
+/// channel (settings override, else config default — same resolution
+/// the pipeline capture loop uses at open time).
+async fn api_get_source(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let pipe = state.pipeline.lock().await;
+    let cfg = pipe.config();
+    // Manual UI tune wins when set and in range (same rule as the
+    // pipeline loop); otherwise the active preset channel tunes.
+    // Gain follows the same pattern against its own window.
+    let gain = pipe
+        .store()
+        .sdr_gain()
+        .unwrap_or(None)
+        .filter(|g| hamfeed_source::GAIN_RANGE.contains(g))
+        .unwrap_or(cfg.sdr.gain);
+    let tune = pipe
+        .store()
+        .sdr_freq()
+        .unwrap_or(None)
+        .filter(|f| hamfeed_source::FREQ_RANGE.contains(f))
+        .map(|f| {
+            let m = pipe.store().sdr_mode().unwrap_or_else(|_| "nbfm".into());
+            (None::<String>, f, m)
+        });
+    let (active, freq_hz, mode) = match tune {
+        Some((_, f, m)) => (None::<String>, Some(f), m),
+        None => {
+            let ch = cfg
+                .sdr
+                .channel(
+                    &pipe
+                        .store()
+                        .sdr_channel()
+                        .unwrap_or(None)
+                        .unwrap_or_default(),
+                )
+                .or_else(|| cfg.sdr.active_channel());
+            (
+                ch.map(|c| c.name.clone()),
+                ch.map(|c| c.freq_hz),
+                ch.map(|c| c.mode.clone()).unwrap_or_else(|| "nbfm".into()),
+            )
+        }
+    };
+    Json(serde_json::json!({
+        "kind": cfg.source.kind,
+        "active": active,
+        "freq_hz": freq_hz,
+        "mode": mode,
+        "gain": gain,
+        "modes": hamfeed_source::SUPPORTED_MODES,
+        "channels": cfg.sdr.channels.iter().map(|c| serde_json::json!({
+            "name": c.name, "freq_hz": c.freq_hz, "mode": c.mode,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelBody {
+    name: Option<String>,
+    freq_hz: Option<f64>,
+    mode: Option<String>,
+    gain: Option<f64>,
+}
+
+/// Retune the SDR (new traffic only; history untouched): either a
+/// preset `name` or a manual `freq_hz` (Hz) with optional `mode`
+/// (`nbfm` default). Exactly one of name/freq_hz is required (400);
+/// unknown names are 404, never a silent no-op; out-of-range
+/// frequencies and unknown modes are 400. The live stream ends
+/// itself and the pipeline reopens on the new tune. Broadcasts like
+/// triage so the selector updates without reload.
+async fn api_set_source_channel(
+    State(state): State<AppState>,
+    Json(body): Json<ChannelBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pipe = state.pipeline.lock().await;
+    // Optional gain rides along with a freq tune or alone; out of
+    // window is 400. Presets clear freq/mode but leave gain (knob,
+    // not tune).
+    if let Some(gain) = body.gain {
+        if !gain.is_finite() || !hamfeed_source::GAIN_RANGE.contains(&gain) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "gain out of range (want 10..=30 dB)".into(),
+            ));
+        }
+    }
+    match (body.name, body.freq_hz) {
+        (Some(name), None) => {
+            if body.mode.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "mode only applies to freq_hz tunes (presets carry their own)".into(),
+                ));
+            }
+            if pipe.config().sdr.channel(&name).is_none() {
+                return Err((StatusCode::NOT_FOUND, "unknown channel".into()));
+            }
+            pipe.store()
+                .set_sdr_channel(&name)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if let Some(gain) = body.gain {
+                pipe.store()
+                    .set_sdr_gain(gain)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+            drop(pipe);
+            let _ = state.tx.send(serde_json::json!({"channel": name}));
+            Ok(Json(serde_json::json!({"active": name})))
+        }
+        (None, Some(freq_hz)) => {
+            if !freq_hz.is_finite() || !hamfeed_source::FREQ_RANGE.contains(&freq_hz) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "freq_hz out of range (want 70 MHz..=6 GHz, B210 tune range)".into(),
+                ));
+            }
+            let mode = body.mode.unwrap_or_else(|| "nbfm".into());
+            if !hamfeed_source::SUPPORTED_MODES.contains(&mode.as_str()) {
+                return Err((StatusCode::BAD_REQUEST, "unsupported mode".into()));
+            }
+            pipe.store()
+                .set_sdr_freq(freq_hz)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            pipe.store()
+                .set_sdr_mode(&mode)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if let Some(gain) = body.gain {
+                pipe.store()
+                    .set_sdr_gain(gain)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+            drop(pipe);
+            let _ = state
+                .tx
+                .send(serde_json::json!({"freq_hz": freq_hz, "mode": mode}));
+            Ok(Json(
+                serde_json::json!({"active": None::<String>, "freq_hz": freq_hz, "mode": mode}),
+            ))
+        }
+        (None, None) if body.gain.is_some() => {
+            let gain = body.gain.unwrap_or(20.0);
+            pipe.store()
+                .set_sdr_gain(gain)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            drop(pipe);
+            let _ = state.tx.send(serde_json::json!({"gain": gain}));
+            Ok(Json(serde_json::json!({"gain": gain})))
+        }
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "need exactly one of name, freq_hz, gain".into(),
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -813,6 +972,16 @@ dir = "{}"
 db_path = "{}"
 retention_days = 90
 [station]
+[source]
+kind = "mic"
+[sdr]
+active = "2m VE2"
+[[sdr.channels]]
+name = "2m VE2"
+freq_hz = 145110000.0
+[[sdr.channels]]
+name = "marine"
+freq_hz = 161750000.0
 "#,
             test_model().display(),
             dir.join("audio").display(),
@@ -1627,6 +1796,147 @@ retention_days = 90
             .await
             .expect("back json");
         assert_eq!(back["active"], "Normal");
+    }
+
+    #[tokio::test]
+    async fn channel_switch_roundtrip() {
+        // SDR selector: list (kind mic here, channels still served so
+        // the UI can preview), switch, unknown-name 404, switch back.
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        let got: serde_json::Value = client
+            .get(format!("{base}/api/source"))
+            .send()
+            .await
+            .expect("source gets")
+            .json()
+            .await
+            .expect("source json");
+        assert_eq!(got["kind"], "mic");
+        assert_eq!(got["channels"].as_array().unwrap().len(), 2);
+        assert_eq!(got["active"], "2m VE2");
+        let switched: serde_json::Value = client
+            .post(format!("{base}/api/source/channel"))
+            .json(&serde_json::json!({"name": "marine"}))
+            .send()
+            .await
+            .expect("channel posts")
+            .json()
+            .await
+            .expect("switch json");
+        assert_eq!(switched["active"], "marine");
+        let missing = client
+            .post(format!("{base}/api/source/channel"))
+            .json(&serde_json::json!({"name": "Nope"}))
+            .send()
+            .await
+            .expect("unknown posts");
+        assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+        let back: serde_json::Value = client
+            .post(format!("{base}/api/source/channel"))
+            .json(&serde_json::json!({"name": "2m VE2"}))
+            .send()
+            .await
+            .expect("back posts")
+            .json()
+            .await
+            .expect("back json");
+        assert_eq!(back["active"], "2m VE2");
+    }
+
+    #[tokio::test]
+    async fn freq_tune_roundtrip() {
+        // UI frequency + demod entry: GET serves the effective tune,
+        // POST tunes by Hz/mode, bad shapes are 400, and switching
+        // back to a preset clears the override.
+        async fn get(client: &reqwest::Client, base: &str) -> serde_json::Value {
+            client
+                .get(format!("{base}/api/source"))
+                .send()
+                .await
+                .expect("source gets")
+                .json::<serde_json::Value>()
+                .await
+                .expect("source json")
+        }
+        async fn post(
+            client: &reqwest::Client,
+            base: &str,
+            v: serde_json::Value,
+        ) -> reqwest::Response {
+            client
+                .post(format!("{base}/api/source/channel"))
+                .json(&v)
+                .send()
+                .await
+                .expect("tune posts")
+        }
+        let (base, _h) = test_server().await;
+        let client = reqwest::Client::new();
+        let got = get(&client, &base).await;
+        assert_eq!(got["active"], "2m VE2");
+        assert_eq!(got["freq_hz"], 145110000.0);
+        assert_eq!(got["mode"], "nbfm");
+        assert_eq!(got["modes"], serde_json::json!(["nbfm", "am", "wfm"]));
+        let tuned = post(
+            &client,
+            &base,
+            serde_json::json!({"freq_hz": 161775000.0, "mode": "am"}),
+        )
+        .await
+        .json::<serde_json::Value>()
+        .await
+        .expect("tune json");
+        assert!(tuned["active"].is_null());
+        assert_eq!(tuned["freq_hz"], 161775000.0);
+        assert_eq!(tuned["mode"], "am");
+        let got = get(&client, &base).await;
+        assert!(got["active"].is_null());
+        assert_eq!(got["freq_hz"], 161775000.0);
+        assert_eq!(got["mode"], "am");
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"name": "marine", "freq_hz": 1.0}),
+            serde_json::json!({"freq_hz": 1670000.0}),
+            serde_json::json!({"freq_hz": 161775000.0, "mode": "ssb"}),
+        ] {
+            assert_eq!(
+                post(&client, &base, bad).await.status(),
+                reqwest::StatusCode::BAD_REQUEST
+            );
+        }
+        let back = post(&client, &base, serde_json::json!({"name": "marine"}))
+            .await
+            .json::<serde_json::Value>()
+            .await
+            .expect("preset json");
+        assert_eq!(back["active"], "marine");
+        let got = get(&client, &base).await;
+        assert_eq!(got["active"], "marine");
+        assert_eq!(got["freq_hz"], 161750000.0);
+        assert_eq!(got["mode"], "nbfm");
+        assert_eq!(got["gain"], 20.0);
+        // Gain knob: standalone set, out-of-window 400, survives a
+        // preset switch (knob, not tune).
+        let g = post(&client, &base, serde_json::json!({"gain": 25.0}))
+            .await
+            .json::<serde_json::Value>()
+            .await
+            .expect("gain json");
+        assert_eq!(g["gain"], 25.0);
+        assert_eq!(get(&client, &base).await["gain"], 25.0);
+        for bad in [
+            serde_json::json!({"gain": 5.0}),
+            serde_json::json!({"gain": 40.0}),
+            serde_json::json!({"name": "marine", "mode": "am"}),
+        ] {
+            assert_eq!(
+                post(&client, &base, bad).await.status(),
+                reqwest::StatusCode::BAD_REQUEST
+            );
+        }
+        post(&client, &base, serde_json::json!({"name": "2m VE2"})).await;
+        assert_eq!(get(&client, &base).await["gain"], 25.0);
     }
 
     fn read_zip(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, name: &str) -> String {

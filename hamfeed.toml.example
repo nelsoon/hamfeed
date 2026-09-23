@@ -4,6 +4,33 @@
 device = "default"
 sample_rate = 16000
 
+# Audio input: "mic" (cpal device above) or "sdr" (B210 capture shim).
+[source]
+kind = "mic"
+
+# SDR station parameters, measured on 10.0.2.102 — do not re-tune
+# blindly. Only used when [source] kind = "sdr". A channel is a named
+# frequency; the mode alone selects the demod path (nbfm today).
+# [sdr]
+# python = "python3"
+# script = "sdr/sdr_rx.py"
+# gain = 20.0
+# rate_hz = 250000.0
+# bandwidth_hz = 200000.0
+# squelch_db = 14.5
+# hang_s = 1.5
+# antenna = "RX2"
+# active = "2m VE2"
+# [[sdr.channels]]
+# name = "2m VE2"
+# freq_hz = 145110000.0
+# [[sdr.channels]]
+# name = "2m RQG"
+# freq_hz = 146610000.0
+# [[sdr.channels]]
+# name = "marine"
+# freq_hz = 161750000.0
+
 [vad]
 engine = "energy"
 hang_ms = 800

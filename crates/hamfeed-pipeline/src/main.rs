@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use hamfeed_pipeline::Pipeline;
 
 fn usage() -> ! {
-    eprintln!("usage: hamfeed-pipeline [--config PATH] [--once] [--fake SECS] [--simplex] [--list-devices]");
+    eprintln!(
+        "usage: hamfeed-pipeline [--config PATH] [--once] [--fake SECS] [--simplex] [--list-devices] [--sdr-probe]"
+    );
     std::process::exit(2);
 }
 
@@ -14,10 +16,12 @@ fn main() {
     let mut once = false;
     let mut fake_secs: Option<u64> = None;
     let mut profile = "repeater";
+    let mut sdr_probe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" => config = PathBuf::from(args.next().unwrap_or_else(|| usage())),
+            "--sdr-probe" => sdr_probe = true,
             "--list-devices" => {
                 #[cfg(feature = "capture")]
                 {
@@ -104,6 +108,30 @@ fn main() {
         return;
     }
 
+    if sdr_probe {
+        run_sdr_probe(&config);
+        return;
+    }
+
+    #[cfg(feature = "sdr")]
+    {
+        let cfg = load_cfg(&config);
+        if cfg.source.kind == "sdr" {
+            run_sdr_loop(&pipe, &config, profile);
+            return;
+        }
+    }
+    #[cfg(not(feature = "sdr"))]
+    {
+        if load_cfg(&config).source.kind == "sdr" {
+            eprintln!(
+                "hamfeed-pipeline: sdr source needs the sdr feature \
+                 (rebuild with --features sdr); --fake SECS works without it"
+            );
+            std::process::exit(2);
+        }
+    }
+
     #[cfg(feature = "capture")]
     {
         let cfg = load_cfg(&config);
@@ -144,6 +172,137 @@ fn load_cfg(path: &std::path::Path) -> hamfeed_config::Config {
         eprintln!("hamfeed-pipeline: bad config: {e:?}");
         std::process::exit(1);
     })
+}
+
+/// Floor/SNR probe across the configured channels, mirroring
+/// `--list-devices`: one JSON row per channel from the shim.
+#[cfg(feature = "sdr")]
+fn run_sdr_probe(config: &std::path::Path) {
+    let cfg = load_cfg(config);
+    if cfg.sdr.channels.is_empty() {
+        eprintln!("hamfeed-pipeline: no [[sdr.channels]] configured");
+        std::process::exit(1);
+    }
+    for ch in &cfg.sdr.channels {
+        let args = hamfeed_source::ProbeArgs {
+            python: cfg.sdr.python.clone(),
+            script: cfg.sdr.script.clone(),
+            freq_hz: ch.freq_hz,
+            gain: cfg.sdr.gain,
+            rate_hz: cfg.sdr.rate_hz,
+            bandwidth_hz: cfg.sdr.bandwidth_hz,
+            squelch_db: cfg.sdr.squelch_db,
+            antenna: cfg.sdr.antenna.clone(),
+        };
+        match hamfeed_source::sdr_probe(&args) {
+            Ok(row) => println!(
+                "{} {:.3} MHz floor={} peak={} snr={} gate={}",
+                ch.name,
+                row.freq_hz / 1e6,
+                fmt_opt(row.floor_dbfs),
+                fmt_opt(row.peak_dbfs),
+                fmt_opt(row.snr_db),
+                if row.gate_open { "OPEN" } else { "closed" }
+            ),
+            Err(e) => {
+                eprintln!("hamfeed-pipeline: probe {} failed: {e:?}", ch.name);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "sdr"))]
+fn run_sdr_probe(_config: &std::path::Path) {
+    eprintln!("hamfeed-pipeline: --sdr-probe needs the sdr feature (rebuild with --features sdr)");
+    std::process::exit(2);
+}
+
+#[cfg(feature = "sdr")]
+fn fmt_opt(v: Option<f32>) -> String {
+    v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "-".into())
+}
+
+/// Live SDR capture: open the wanted channel, run it until the stream
+/// ends (UI switch or child exit), reopen on the new channel. A dead
+/// child costs a 1 s breath, never a hot loop; retune gaps are the
+/// documented price of single-tuner hopping.
+#[cfg(feature = "sdr")]
+fn run_sdr_loop(pipe: &Pipeline, config: &std::path::Path, profile: &str) {
+    loop {
+        let cfg = load_cfg(config);
+        let wanted = pipe
+            .store()
+            .sdr_channel()
+            .unwrap_or(None)
+            .filter(|n| cfg.sdr.channel(n).is_some())
+            .or_else(|| cfg.sdr.active_channel().map(|c| c.name.clone()));
+        let Some(name) = wanted else {
+            eprintln!("hamfeed-pipeline: no [[sdr.channels]] configured");
+            std::process::exit(1);
+        };
+        let ch = cfg.sdr.channel(&name).expect("channel validated above");
+        // Manual UI tune wins over the preset when set and in range;
+        // the watch below retunes on any later change either way.
+        let freq_override = pipe
+            .store()
+            .sdr_freq()
+            .unwrap_or(None)
+            .filter(|f| hamfeed_source::FREQ_RANGE.contains(f));
+        let mode_override = freq_override.and_then(|_| {
+            pipe.store()
+                .sdr_mode()
+                .ok()
+                .filter(|m| hamfeed_source::SUPPORTED_MODES.contains(&m.as_str()))
+        });
+        let gain_override = pipe
+            .store()
+            .sdr_gain()
+            .unwrap_or(None)
+            .filter(|g| hamfeed_source::GAIN_RANGE.contains(g));
+        let (freq_hz, mode) = match (freq_override, mode_override.clone()) {
+            (Some(f), Some(m)) => (f, m),
+            (Some(f), None) => (f, "nbfm".into()),
+            (None, _) => (ch.freq_hz, ch.mode.clone()),
+        };
+        let gain = gain_override.unwrap_or(cfg.sdr.gain);
+        let params = hamfeed_source::SdrParams {
+            python: cfg.sdr.python.clone(),
+            script: cfg.sdr.script.clone(),
+            db_path: cfg.storage.db_path.clone(),
+            channel: name.clone(),
+            freq_hz,
+            mode: mode.clone(),
+            freq_override,
+            mode_override: mode_override.clone(),
+            gain_override,
+            gain,
+            rate_hz: cfg.sdr.rate_hz,
+            bandwidth_hz: cfg.sdr.bandwidth_hz,
+            squelch_db: cfg.sdr.squelch_db,
+            hang_s: cfg.sdr.hang_s,
+            antenna: cfg.sdr.antenna.clone(),
+        };
+        let mut src = hamfeed_source::SdrSource::open(&params).unwrap_or_else(|e| {
+            eprintln!("hamfeed-pipeline: sdr open failed: {e:?}");
+            std::process::exit(1);
+        });
+        eprintln!(
+            "hamfeed-pipeline: capturing SDR {name} ({:.3} MHz, {mode}, gain {gain}, profile {profile})",
+            freq_hz / 1e6
+        );
+        match pipe.run_source(
+            &mut src,
+            cfg.hang_ms(profile),
+            cfg.segment.max_s,
+            cfg.vad.beep_split,
+            cfg.vad.beep_min_ms,
+        ) {
+            Ok(n) => eprintln!("hamfeed-pipeline: sdr source ended ({n} segment(s)); reopening…"),
+            Err(e) => eprintln!("hamfeed-pipeline: sdr run failed: {e:?}; reopening…"),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 /// Publish tap PCM as raw little-endian i16 over a Unix socket (Slice 3

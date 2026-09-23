@@ -5,8 +5,11 @@ edition.workspace = true
 
 [features]
 capture = ["dep:cpal"]
+sdr = ["dep:rusqlite", "dep:serde_json"]
 
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true
 cpal = { version = "0.15", optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+serde_json = { workspace = true, optional = true }
